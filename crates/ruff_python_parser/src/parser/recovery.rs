@@ -1,3 +1,4 @@
+use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, Expr, ExprContext, Pattern};
 use ruff_text_size::{Ranged, TextLen, TextRange};
 
@@ -51,24 +52,23 @@ pub(super) fn pattern_to_expr(pattern: Pattern) -> Expr {
             patterns,
             rest,
         }) => {
-            let mut keys = keys.into_iter().map(Option::Some).collect::<Vec<_>>();
-            let mut values = patterns
+            let mut items: Vec<ast::DictItem> = keys
                 .into_iter()
-                .map(pattern_to_expr)
-                .collect::<Vec<_>>();
+                .zip(patterns)
+                .map(|(key, pattern)| ast::DictItem {
+                    key: Some(key),
+                    value: pattern_to_expr(pattern),
+                })
+                .collect();
             if let Some(rest) = rest {
-                keys.push(None);
-                values.push(Expr::Name(ast::ExprName {
+                let value = Expr::Name(ast::ExprName {
                     range: rest.range,
                     id: rest.id,
                     ctx: ExprContext::Store,
-                }));
+                });
+                items.push(ast::DictItem { key: None, value });
             }
-            Expr::Dict(ast::ExprDict {
-                range,
-                keys,
-                values,
-            })
+            Expr::Dict(ast::ExprDict { range, items })
         }
         Pattern::MatchClass(ast::PatternMatchClass {
             range,
@@ -111,7 +111,7 @@ pub(super) fn pattern_to_expr(pattern: Pattern) -> Expr {
                     range,
                     value: Box::new(Expr::Name(ast::ExprName {
                         range: TextRange::new(range.end() - "_".text_len(), range.end()),
-                        id: "_".to_string(),
+                        id: Name::new_static("_"),
                         ctx: ExprContext::Store,
                     })),
                     ctx: ExprContext::Store,
@@ -125,7 +125,7 @@ pub(super) fn pattern_to_expr(pattern: Pattern) -> Expr {
         }) => match (pattern, name) {
             (Some(_), Some(_)) => Expr::Name(ast::ExprName {
                 range,
-                id: String::new(),
+                id: Name::empty(),
                 ctx: ExprContext::Invalid,
             }),
             (Some(pattern), None) => pattern_to_expr(*pattern),
@@ -136,7 +136,7 @@ pub(super) fn pattern_to_expr(pattern: Pattern) -> Expr {
             }),
             (None, None) => Expr::Name(ast::ExprName {
                 range,
-                id: "_".to_string(),
+                id: Name::new_static("_"),
                 ctx: ExprContext::Store,
             }),
         },

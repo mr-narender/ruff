@@ -240,7 +240,8 @@ impl FormatRule<Suite, PyFormatContext<'_>> for FormatSuite {
                                     preceding_stub.end(),
                                     f.context().source(),
                                 ) < 2
-                            });
+                            })
+                        && !preceding_comments.has_trailing_own_line();
 
                     if !is_preceding_stub_function_without_empty_line {
                         match self.kind {
@@ -829,7 +830,7 @@ impl Format<PyFormatContext<'_>> for SuiteChildStatement<'_> {
 #[cfg(test)]
 mod tests {
     use ruff_formatter::format;
-    use ruff_python_parser::parse_suite;
+    use ruff_python_parser::parse_module;
     use ruff_python_trivia::CommentRanges;
 
     use crate::comments::Comments;
@@ -859,17 +860,18 @@ def trailing_func():
     pass
 ";
 
-        let statements = parse_suite(source).unwrap();
+        let parsed = parse_module(source).unwrap();
+        let comment_ranges = CommentRanges::from(parsed.tokens());
 
-        let comment_ranges = CommentRanges::default();
         let context = PyFormatContext::new(
             PyFormatOptions::default(),
             source,
             Comments::from_ranges(&comment_ranges),
+            parsed.tokens(),
         );
 
         let test_formatter =
-            format_with(|f: &mut PyFormatter| statements.format().with_options(level).fmt(f));
+            format_with(|f: &mut PyFormatter| parsed.suite().format().with_options(level).fmt(f));
 
         let formatted = format!(context, [test_formatter]).unwrap();
         let printed = formatted.print().unwrap();

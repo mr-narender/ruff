@@ -1,4 +1,5 @@
 pub(crate) use ambiguous_unicode_character::*;
+pub(crate) use assert_with_print_message::*;
 pub(crate) use assignment_in_assert::*;
 pub(crate) use asyncio_dangling_task::*;
 pub(crate) use collection_literal_concatenation::*;
@@ -21,7 +22,7 @@ pub(crate) use redirected_noqa::*;
 pub(crate) use sort_dunder_all::*;
 pub(crate) use sort_dunder_slots::*;
 pub(crate) use static_key_dict_comprehension::*;
-#[cfg(feature = "test-rules")]
+#[cfg(any(feature = "test-rules", test))]
 pub(crate) use test_rules::*;
 pub(crate) use unnecessary_dict_comprehension_for_iterable::*;
 pub(crate) use unnecessary_iterable_allocation_for_first_element::*;
@@ -30,6 +31,7 @@ pub(crate) use unused_async::*;
 pub(crate) use unused_noqa::*;
 
 mod ambiguous_unicode_character;
+mod assert_with_print_message;
 mod assignment_in_assert;
 mod asyncio_dangling_task;
 mod collection_literal_concatenation;
@@ -56,7 +58,7 @@ mod sort_dunder_all;
 mod sort_dunder_slots;
 mod static_key_dict_comprehension;
 mod suppression_comment_visitor;
-#[cfg(feature = "test-rules")]
+#[cfg(any(feature = "test-rules", test))]
 pub(crate) mod test_rules;
 mod unnecessary_dict_comprehension_for_iterable;
 mod unnecessary_iterable_allocation_for_first_element;

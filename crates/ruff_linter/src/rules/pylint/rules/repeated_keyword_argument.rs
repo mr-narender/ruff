@@ -1,10 +1,8 @@
-use std::hash::BuildHasherDefault;
-
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{derive_message_formats, violation};
-use ruff_python_ast::{Expr, ExprCall, ExprDict, ExprStringLiteral};
+use ruff_python_ast::{Expr, ExprCall, ExprStringLiteral};
 use ruff_text_size::Ranged;
 
 use crate::checkers::ast::Checker;
@@ -40,10 +38,7 @@ impl Violation for RepeatedKeywordArgument {
 pub(crate) fn repeated_keyword_argument(checker: &mut Checker, call: &ExprCall) {
     let ExprCall { arguments, .. } = call;
 
-    let mut seen = FxHashSet::with_capacity_and_hasher(
-        arguments.keywords.len(),
-        BuildHasherDefault::default(),
-    );
+    let mut seen = FxHashSet::with_capacity_and_hasher(arguments.keywords.len(), FxBuildHasher);
 
     for keyword in arguments.keywords.iter() {
         if let Some(id) = &keyword.arg {
@@ -56,9 +51,9 @@ pub(crate) fn repeated_keyword_argument(checker: &mut Checker, call: &ExprCall) 
                     keyword.range(),
                 ));
             }
-        } else if let Expr::Dict(ExprDict { keys, .. }) = &keyword.value {
+        } else if let Expr::Dict(dict) = &keyword.value {
             // Ex) `func(**{"a": 1, "a": 2})`
-            for key in keys.iter().flatten() {
+            for key in dict.iter_keys().flatten() {
                 if let Expr::StringLiteral(ExprStringLiteral { value, .. }) = key {
                     if !seen.insert(value.to_str()) {
                         checker.diagnostics.push(Diagnostic::new(

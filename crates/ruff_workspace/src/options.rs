@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
-use std::hash::BuildHasherDefault;
 
 use regex::Regex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 
@@ -25,10 +24,11 @@ use ruff_linter::rules::{
     pycodestyle, pydocstyle, pyflakes, pylint, pyupgrade,
 };
 use ruff_linter::settings::types::{
-    IdentifierPattern, PythonVersion, RequiredVersion, SerializationFormat,
+    IdentifierPattern, OutputFormat, PreviewMode, PythonVersion, RequiredVersion,
 };
 use ruff_linter::{warn_user_once, RuleSelector};
 use ruff_macros::{CombineOptions, OptionsMetadata};
+use ruff_python_ast::name::Name;
 use ruff_python_formatter::{DocstringCodeLineWidth, QuoteStyle};
 
 use crate::options_base::{OptionsMetadata, Visit};
@@ -87,7 +87,7 @@ pub struct Options {
             output-format = "grouped"
         "#
     )]
-    pub output_format: Option<SerializationFormat>,
+    pub output_format: Option<OutputFormat>,
 
     /// Enable fix behavior by-default when running `ruff` (overridden
     /// by the `--fix` and `--no-fix` command-line flags).
@@ -108,21 +108,6 @@ pub struct Options {
     /// Like `fix`, but disables reporting on leftover violation. Implies `fix`.
     #[option(default = "false", value_type = "bool", example = "fix-only = true")]
     pub fix_only: Option<bool>,
-
-    /// Whether to show source code snippets when reporting lint violations
-    /// (overridden by the `--show-source` command-line flag).
-    #[option(
-        default = "false",
-        value_type = "bool",
-        example = r#"
-            # By default, always show source code snippets.
-            show-source = true
-        "#
-    )]
-    #[deprecated(
-        note = "`show-source` is deprecated and is now part of `output-format` in the form of `full` or `concise` options. Please update your configuration."
-    )]
-    pub show_source: Option<bool>,
 
     /// Whether to show an enumeration of all fixed lint violations
     /// (overridden by the `--show-fixes` command-line flag).
@@ -418,13 +403,6 @@ pub struct Options {
     ///
     /// This option changes the number of spaces inserted by the formatter when
     /// using soft-tabs (`indent-style = space`).
-    #[option(
-        default = "4",
-        value_type = "int",
-        example = r#"
-            tab-size = 2
-        "#
-    )]
     #[deprecated(
         since = "0.1.2",
         note = "The `tab-size` option has been renamed to `indent-width` to emphasize that it configures the indentation used by the formatter as well as the tab width. Please update your configuration to use `indent-width = <value>` instead."
@@ -702,6 +680,10 @@ pub struct LintCommonOptions {
         example = r#"
             ignore-init-module-imports = false
         "#
+    )]
+    #[deprecated(
+        since = "0.4.4",
+        note = "`ignore-init-module-imports` will be removed in a future version because F401 now recommends appropriate fixes for unused imports in `__init__.py` (currently in preview mode). See documentation for more information and please update your configuration."
     )]
     pub ignore_init_module_imports: Option<bool>,
 
@@ -1024,7 +1006,7 @@ pub struct Flake8BanditOptions {
     #[option(
         default = "[]",
         value_type = "list[str]",
-        example = "extend-hardcoded-tmp-directory = [\"/foo/bar\"]"
+        example = "hardcoded-tmp-directory-extend = [\"/foo/bar\"]"
     )]
     pub hardcoded_tmp_directory_extend: Option<Vec<String>>,
 
@@ -1242,7 +1224,7 @@ pub struct Flake8GetTextOptions {
         value_type = "list[str]",
         example = r#"function-names = ["_", "gettext", "ngettext", "ugettetxt"]"#
     )]
-    pub function_names: Option<Vec<String>>,
+    pub function_names: Option<Vec<Name>>,
 
     /// Additional function names to consider as internationalization calls, in addition to those
     /// included in `function-names`.
@@ -1251,7 +1233,7 @@ pub struct Flake8GetTextOptions {
         value_type = "list[str]",
         example = r#"extend-function-names = ["ugettetxt"]"#
     )]
-    pub extend_function_names: Option<Vec<String>>,
+    pub extend_function_names: Option<Vec<Name>>,
 }
 
 impl Flake8GetTextOptions {
@@ -1393,6 +1375,9 @@ pub struct Flake8PytestStyleOptions {
     /// default), `@pytest.fixture()` is valid and `@pytest.fixture` is
     /// invalid. If set to `false`, `@pytest.fixture` is valid and
     /// `@pytest.fixture()` is invalid.
+    ///
+    /// If [preview](https://docs.astral.sh/ruff/preview/) is enabled, defaults to
+    /// `false`.
     #[option(
         default = "true",
         value_type = "bool",
@@ -1476,6 +1461,9 @@ pub struct Flake8PytestStyleOptions {
     /// default), `@pytest.mark.foo()` is valid and `@pytest.mark.foo` is
     /// invalid. If set to `false`, `@pytest.fixture` is valid and
     /// `@pytest.mark.foo()` is invalid.
+    ///
+    /// If [preview](https://docs.astral.sh/ruff/preview/) is enabled, defaults to
+    /// `false`.
     #[option(
         default = "true",
         value_type = "bool",
@@ -1485,9 +1473,12 @@ pub struct Flake8PytestStyleOptions {
 }
 
 impl Flake8PytestStyleOptions {
-    pub fn try_into_settings(self) -> anyhow::Result<flake8_pytest_style::settings::Settings> {
+    pub fn try_into_settings(
+        self,
+        preview: PreviewMode,
+    ) -> anyhow::Result<flake8_pytest_style::settings::Settings> {
         Ok(flake8_pytest_style::settings::Settings {
-            fixture_parentheses: self.fixture_parentheses.unwrap_or(true),
+            fixture_parentheses: self.fixture_parentheses.unwrap_or(preview.is_disabled()),
             parametrize_names_type: self.parametrize_names_type.unwrap_or_default(),
             parametrize_values_type: self.parametrize_values_type.unwrap_or_default(),
             parametrize_values_row_type: self.parametrize_values_row_type.unwrap_or_default(),
@@ -1513,7 +1504,7 @@ impl Flake8PytestStyleOptions {
                 .transpose()
                 .map_err(SettingsError::InvalidRaisesExtendRequireMatchFor)?
                 .unwrap_or_default(),
-            mark_parentheses: self.mark_parentheses.unwrap_or(true),
+            mark_parentheses: self.mark_parentheses.unwrap_or(preview.is_disabled()),
         })
     }
 }
@@ -1604,7 +1595,7 @@ pub struct Flake8SelfOptions {
             ignore-names = ["_new"]
         "#
     )]
-    pub ignore_names: Option<Vec<String>>,
+    pub ignore_names: Option<Vec<Name>>,
 
     /// Additional names to ignore when considering `flake8-self` violations,
     /// in addition to those included in `ignore-names`.
@@ -1613,7 +1604,7 @@ pub struct Flake8SelfOptions {
         value_type = "list[str]",
         example = r#"extend-ignore-names = ["_base_manager", "_default_manager",  "_meta"]"#
     )]
-    pub extend_ignore_names: Option<Vec<String>>,
+    pub extend_ignore_names: Option<Vec<Name>>,
 }
 
 impl Flake8SelfOptions {
@@ -2267,6 +2258,12 @@ pub struct IsortOptions {
     /// testing = ["pytest", "hypothesis"]
     /// ```
     ///
+    /// The values in the list are treated as glob patterns. For example, to match all packages in
+    /// the LangChain ecosystem (`langchain-core`, `langchain-openai`, etc.):
+    /// ```toml
+    /// langchain = ["langchain-*"]
+    /// ```
+    ///
     /// Custom sections should typically be inserted into the `section-order` list to ensure that
     /// they're displayed as a standalone group and in the intended order, as in:
     /// ```toml
@@ -2396,8 +2393,7 @@ impl IsortOptions {
             .collect::<Result<_, _>>()?;
 
         // Verify that `section_order` doesn't contain any duplicates.
-        let mut seen =
-            FxHashSet::with_capacity_and_hasher(section_order.len(), BuildHasherDefault::default());
+        let mut seen = FxHashSet::with_capacity_and_hasher(section_order.len(), FxBuildHasher);
         for section in &section_order {
             if !seen.insert(section) {
                 warn_user_once!(
@@ -3249,9 +3245,9 @@ pub struct FormatOptions {
 
 #[cfg(test)]
 mod tests {
-    use ruff_linter::rules::flake8_self;
-
     use crate::options::Flake8SelfOptions;
+    use ruff_linter::rules::flake8_self;
+    use ruff_python_ast::name::Name;
 
     #[test]
     fn flake8_self_options() {
@@ -3267,16 +3263,16 @@ mod tests {
 
         // Uses ignore_names if specified.
         let options = Flake8SelfOptions {
-            ignore_names: Some(vec!["_foo".to_string()]),
+            ignore_names: Some(vec![Name::new_static("_foo")]),
             extend_ignore_names: None,
         };
         let settings = options.into_settings();
-        assert_eq!(settings.ignore_names, vec!["_foo".to_string()]);
+        assert_eq!(settings.ignore_names, vec![Name::new_static("_foo")]);
 
         // Appends extend_ignore_names to defaults if only extend_ignore_names is specified.
         let options = Flake8SelfOptions {
             ignore_names: None,
-            extend_ignore_names: Some(vec!["_bar".to_string()]),
+            extend_ignore_names: Some(vec![Name::new_static("_bar")]),
         };
         let settings = options.into_settings();
         assert_eq!(
@@ -3284,19 +3280,19 @@ mod tests {
             default_settings
                 .ignore_names
                 .into_iter()
-                .chain(["_bar".to_string()])
-                .collect::<Vec<String>>()
+                .chain([Name::new_static("_bar")])
+                .collect::<Vec<_>>()
         );
 
         // Appends extend_ignore_names to ignore_names if both are specified.
         let options = Flake8SelfOptions {
-            ignore_names: Some(vec!["_foo".to_string()]),
-            extend_ignore_names: Some(vec!["_bar".to_string()]),
+            ignore_names: Some(vec![Name::new_static("_foo")]),
+            extend_ignore_names: Some(vec![Name::new_static("_bar")]),
         };
         let settings = options.into_settings();
         assert_eq!(
             settings.ignore_names,
-            vec!["_foo".to_string(), "_bar".to_string()]
+            vec![Name::new_static("_foo"), Name::new_static("_bar")]
         );
     }
 }

@@ -14,12 +14,13 @@ use std::fmt::{Debug, Formatter};
 use std::iter::FusedIterator;
 
 use bitflags::bitflags;
-use ruff_python_parser::lexer::LexResult;
 use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 
-use ruff_python_parser::TokenKind;
+use ruff_python_parser::{TokenKind, Tokens};
 use ruff_python_trivia::is_python_whitespace;
 use ruff_source_file::Locator;
+
+use crate::rules::pycodestyle::helpers::is_non_logical_token;
 
 mod extraneous_whitespace;
 mod indentation;
@@ -60,17 +61,16 @@ pub(crate) struct LogicalLines<'a> {
 }
 
 impl<'a> LogicalLines<'a> {
-    pub(crate) fn from_tokens(tokens: &'a [LexResult], locator: &'a Locator<'a>) -> Self {
+    pub(crate) fn from_tokens(tokens: &Tokens, locator: &'a Locator<'a>) -> Self {
         assert!(u32::try_from(tokens.len()).is_ok());
 
         let mut builder = LogicalLinesBuilder::with_capacity(tokens.len());
         let mut parens = 0u32;
 
-        for (token, range) in tokens.iter().flatten() {
-            let token_kind = TokenKind::from_token(token);
-            builder.push_token(token_kind, *range);
+        for token in tokens.up_to_first_unknown() {
+            builder.push_token(token.kind(), token.range());
 
-            match token_kind {
+            match token.kind() {
                 TokenKind::Lbrace | TokenKind::Lpar | TokenKind::Lsqb => {
                     parens = parens.saturating_add(1);
                 }
@@ -169,32 +169,14 @@ impl<'a> LogicalLine<'a> {
 
         let start = tokens
             .iter()
-            .position(|t| {
-                !matches!(
-                    t.kind(),
-                    TokenKind::Newline
-                        | TokenKind::NonLogicalNewline
-                        | TokenKind::Indent
-                        | TokenKind::Dedent
-                        | TokenKind::Comment,
-                )
-            })
+            .position(|t| !is_non_logical_token(t.kind()))
             .unwrap_or(tokens.len());
 
         let tokens = &tokens[start..];
 
         let end = tokens
             .iter()
-            .rposition(|t| {
-                !matches!(
-                    t.kind(),
-                    TokenKind::Newline
-                        | TokenKind::NonLogicalNewline
-                        | TokenKind::Indent
-                        | TokenKind::Dedent
-                        | TokenKind::Comment,
-                )
-            })
+            .rposition(|t| !is_non_logical_token(t.kind()))
             .map_or(0, |pos| pos + 1);
 
         &tokens[..end]
@@ -449,14 +431,7 @@ impl LogicalLinesBuilder {
             line.flags.insert(TokenFlags::KEYWORD);
         }
 
-        if !matches!(
-            kind,
-            TokenKind::Comment
-                | TokenKind::Newline
-                | TokenKind::NonLogicalNewline
-                | TokenKind::Dedent
-                | TokenKind::Indent
-        ) {
+        if !is_non_logical_token(kind) {
             line.flags.insert(TokenFlags::NON_TRIVIA);
         }
 
@@ -470,7 +445,7 @@ impl LogicalLinesBuilder {
         if self.current_line.tokens_start < end {
             let is_empty = self.tokens[self.current_line.tokens_start as usize..end as usize]
                 .iter()
-                .all(|token| token.kind.is_newline());
+                .all(|token| token.kind.is_any_newline());
             if !is_empty {
                 self.lines.push(Line {
                     flags: self.current_line.flags,
@@ -506,9 +481,7 @@ struct Line {
 
 #[cfg(test)]
 mod tests {
-    use ruff_python_parser::lexer::LexResult;
-    use ruff_python_parser::{lexer, Mode};
-
+    use ruff_python_parser::parse_module;
     use ruff_source_file::Locator;
 
     use super::LogicalLines;
@@ -592,9 +565,9 @@ if False:
     }
 
     fn assert_logical_lines(contents: &str, expected: &[&str]) {
-        let lxr: Vec<LexResult> = lexer::lex(contents, Mode::Module).collect();
+        let parsed = parse_module(contents).unwrap();
         let locator = Locator::new(contents);
-        let actual: Vec<String> = LogicalLines::from_tokens(&lxr, &locator)
+        let actual: Vec<String> = LogicalLines::from_tokens(parsed.tokens(), &locator)
             .into_iter()
             .map(|line| line.text_trimmed())
             .map(ToString::to_string)

@@ -19,6 +19,7 @@ use ruff_text_size::TextSize;
 use crate::cell::CellOffsets;
 use crate::index::NotebookIndex;
 use crate::schema::{Cell, RawNotebook, SortAlphabetically, SourceValue};
+use crate::RawNotebookMetadata;
 
 /// Run round-trip source code generation on a given Jupyter notebook file path.
 pub fn round_trip(path: &Path) -> anyhow::Result<String> {
@@ -98,7 +99,7 @@ impl Notebook {
             reader.read_exact(&mut buf).is_ok_and(|()| buf[0] == b'\n')
         });
         reader.rewind()?;
-        let mut raw_notebook: RawNotebook = match serde_json::from_reader(reader.by_ref()) {
+        let raw_notebook: RawNotebook = match serde_json::from_reader(reader.by_ref()) {
             Ok(notebook) => notebook,
             Err(err) => {
                 // Translate the error into a diagnostic
@@ -113,7 +114,13 @@ impl Notebook {
                 });
             }
         };
+        Self::from_raw_notebook(raw_notebook, trailing_newline)
+    }
 
+    pub fn from_raw_notebook(
+        mut raw_notebook: RawNotebook,
+        trailing_newline: bool,
+    ) -> Result<Self, NotebookError> {
         // v4 is what everybody uses
         if raw_notebook.nbformat != 4 {
             // bail because we should have already failed at the json schema stage
@@ -375,6 +382,10 @@ impl Notebook {
     /// Return a slice of [`Cell`] in the Jupyter notebook.
     pub fn cells(&self) -> &[Cell] {
         &self.raw.cells
+    }
+
+    pub fn metadata(&self) -> &RawNotebookMetadata {
+        &self.raw.metadata
     }
 
     /// Return `true` if the notebook is a Python notebook, `false` otherwise.

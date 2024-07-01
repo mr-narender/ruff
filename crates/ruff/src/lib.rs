@@ -8,15 +8,15 @@ use std::process::ExitCode;
 use std::sync::mpsc::channel;
 
 use anyhow::Result;
-use args::{GlobalConfigArgs, ServerCommand};
 use clap::CommandFactory;
 use colored::Colorize;
 use log::warn;
 use notify::{recommended_watcher, RecursiveMode, Watcher};
 
+use args::{GlobalConfigArgs, ServerCommand};
 use ruff_linter::logging::{set_up_logging, LogLevel};
 use ruff_linter::settings::flags::FixMode;
-use ruff_linter::settings::types::SerializationFormat;
+use ruff_linter::settings::types::OutputFormat;
 use ruff_linter::{fs, warn_user, warn_user_once};
 use ruff_workspace::Settings;
 
@@ -121,7 +121,6 @@ pub fn run(
         command,
         global_options,
     }: Args,
-    deprecated_alias_warning: Option<&'static str>,
 ) -> Result<ExitStatus> {
     {
         let default_panic_hook = std::panic::take_hook();
@@ -145,22 +144,7 @@ pub fn run(
         }));
     }
 
-    // Enabled ANSI colors on Windows 10.
-    #[cfg(windows)]
-    assert!(colored::control::set_virtual_terminal(true).is_ok());
-
-    // support FORCE_COLOR env var
-    if let Some(force_color) = std::env::var_os("FORCE_COLOR") {
-        if force_color.len() > 0 {
-            colored::control::set_override(true);
-        }
-    }
-
     set_up_logging(global_options.log_level())?;
-
-    if let Some(deprecated_alias_warning) = deprecated_alias_warning {
-        warn_user!("{}", deprecated_alias_warning);
-    }
 
     match command {
         Command::Version { output_format } => {
@@ -180,8 +164,11 @@ pub fn run(
             }
             Ok(ExitStatus::Success)
         }
-        Command::Config { option } => {
-            commands::config::config(option.as_deref())?;
+        Command::Config {
+            option,
+            output_format,
+        } => {
+            commands::config::config(option.as_deref(), output_format)?;
             Ok(ExitStatus::Success)
         }
         Command::Linter { output_format } => {
@@ -198,7 +185,7 @@ pub fn run(
         }
         Command::Check(args) => check(args, global_options),
         Command::Format(args) => format(args, global_options),
-        Command::Server(args) => server(args, global_options.log_level()),
+        Command::Server(args) => server(args),
     }
 }
 
@@ -212,15 +199,16 @@ fn format(args: FormatCommand, global_options: GlobalConfigArgs) -> Result<ExitS
     }
 }
 
-fn server(args: ServerCommand, log_level: LogLevel) -> Result<ExitStatus> {
+fn server(args: ServerCommand) -> Result<ExitStatus> {
     let ServerCommand { preview } = args;
+
+    let four = NonZeroUsize::new(4).unwrap();
+
     // by default, we set the number of worker threads to `num_cpus`, with a maximum of 4.
-    let worker_threads = num_cpus::get().max(4);
-    commands::server::run_server(
-        preview,
-        NonZeroUsize::try_from(worker_threads).expect("a non-zero worker thread count"),
-        log_level,
-    )
+    let worker_threads = std::thread::available_parallelism()
+        .unwrap_or(four)
+        .max(four);
+    commands::server::run_server(preview, worker_threads)
 }
 
 pub fn check(args: CheckCommand, global_options: GlobalConfigArgs) -> Result<ExitStatus> {
@@ -233,6 +221,9 @@ pub fn check(args: CheckCommand, global_options: GlobalConfigArgs) -> Result<Exi
     let mut writer: Box<dyn Write> = match cli.output_file {
         Some(path) if !cli.watch => {
             colored::control::set_override(false);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let file = File::create(path)?;
             Box::new(BufWriter::new(file))
         }
@@ -344,10 +335,10 @@ pub fn check(args: CheckCommand, global_options: GlobalConfigArgs) -> Result<Exi
     let preview = pyproject_config.settings.linter.preview.is_enabled();
 
     if cli.watch {
-        if output_format != SerializationFormat::default(preview) {
+        if output_format != OutputFormat::default() {
             warn_user!(
                 "`--output-format {}` is always used in watch mode.",
-                SerializationFormat::default(preview)
+                OutputFormat::default()
             );
         }
 

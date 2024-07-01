@@ -1,9 +1,10 @@
-use std::{ffi::OsString, ops::Deref, path::PathBuf, str::FromStr};
+use std::{ops::Deref, path::PathBuf, str::FromStr};
 
 use lsp_types::Url;
-use ruff_linter::{line_width::LineLength, RuleSelector};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
+
+use ruff_linter::{line_width::LineLength, RuleSelector};
 
 /// Maps a workspace URI to its associated client settings. Used during server initialization.
 pub(crate) type WorkspaceSettingsMap = FxHashMap<Url, ClientSettings>;
@@ -18,10 +19,9 @@ pub(crate) struct ResolvedClientSettings {
     fix_all: bool,
     organize_imports: bool,
     lint_enable: bool,
-    // TODO(jane): Remove once noqa auto-fix is implemented
-    #[allow(dead_code)]
     disable_rule_comment_enable: bool,
     fix_violation_enable: bool,
+    show_syntax_errors: bool,
     editor_settings: ResolvedEditorSettings,
 }
 
@@ -61,7 +61,7 @@ pub(crate) enum ConfigurationPreference {
 #[derive(Debug, Deserialize, Default)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ClientSettings {
+pub struct ClientSettings {
     configuration: Option<String>,
     fix_all: Option<bool>,
     organize_imports: Option<bool>,
@@ -71,6 +71,28 @@ pub(crate) struct ClientSettings {
     exclude: Option<Vec<String>>,
     line_length: Option<LineLength>,
     configuration_preference: Option<ConfigurationPreference>,
+
+    /// If `true` or [`None`], show syntax errors as diagnostics.
+    ///
+    /// This is useful when using Ruff with other language servers, allowing the user to refer
+    /// to syntax errors from only one source.
+    show_syntax_errors: Option<bool>,
+
+    // These settings are only needed for tracing, and are only read from the global configuration.
+    // These will not be in the resolved settings.
+    #[serde(flatten)]
+    pub(crate) tracing: TracingSettings,
+}
+
+/// Settings needed to initialize tracing. These will only be
+/// read from the global configuration.
+#[derive(Debug, Deserialize, Default)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TracingSettings {
+    pub(crate) log_level: Option<crate::trace::LogLevel>,
+    /// Path to the log file - tildes and environment variables are supported.
+    pub(crate) log_file: Option<PathBuf>,
 }
 
 /// This is a direct representation of the workspace settings schema,
@@ -131,7 +153,8 @@ enum InitializationOptions {
         workspace_settings: Vec<WorkspaceSettings>,
     },
     GlobalOnly {
-        settings: Option<ClientSettings>,
+        #[serde(default)]
+        settings: ClientSettings,
     },
 }
 
@@ -158,7 +181,7 @@ impl AllSettings {
 
     fn from_init_options(options: InitializationOptions) -> Self {
         let (global_settings, workspace_settings) = match options {
-            InitializationOptions::GlobalOnly { settings } => (settings.unwrap_or_default(), None),
+            InitializationOptions::GlobalOnly { settings } => (settings, None),
             InitializationOptions::HasWorkspaces {
                 global_settings,
                 workspace_settings,
@@ -229,12 +252,18 @@ impl ResolvedClientSettings {
                 },
                 true,
             ),
+            show_syntax_errors: Self::resolve_or(
+                all_settings,
+                |settings| settings.show_syntax_errors,
+                true,
+            ),
             editor_settings: ResolvedEditorSettings {
                 configuration: Self::resolve_optional(all_settings, |settings| {
                     settings
                         .configuration
                         .as_ref()
-                        .map(|config_path| OsString::from(config_path.clone()).into())
+                        .and_then(|config_path| shellexpand::full(config_path).ok())
+                        .map(|config_path| PathBuf::from(config_path.as_ref()))
                 }),
                 lint_preview: Self::resolve_optional(all_settings, |settings| {
                     settings.lint.as_ref()?.preview
@@ -272,9 +301,7 @@ impl ResolvedClientSettings {
                         .map(|rule| RuleSelector::from_str(rule).ok())
                         .collect()
                 }),
-                exclude: Self::resolve_optional(all_settings, |settings| {
-                    Some(settings.exclude.as_ref()?.clone())
-                }),
+                exclude: Self::resolve_optional(all_settings, |settings| settings.exclude.clone()),
                 line_length: Self::resolve_optional(all_settings, |settings| settings.line_length),
                 configuration_preference: Self::resolve_or(
                     all_settings,
@@ -323,8 +350,16 @@ impl ResolvedClientSettings {
         self.lint_enable
     }
 
+    pub(crate) fn noqa_comments(&self) -> bool {
+        self.disable_rule_comment_enable
+    }
+
     pub(crate) fn fix_violation(&self) -> bool {
         self.fix_violation_enable
+    }
+
+    pub(crate) fn show_syntax_errors(&self) -> bool {
+        self.show_syntax_errors
     }
 
     pub(crate) fn editor_settings(&self) -> &ResolvedEditorSettings {
@@ -334,18 +369,23 @@ impl ResolvedClientSettings {
 
 impl Default for InitializationOptions {
     fn default() -> Self {
-        Self::GlobalOnly { settings: None }
+        Self::GlobalOnly {
+            settings: ClientSettings::default(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use insta::assert_debug_snapshot;
-    use ruff_linter::registry::Linter;
     use serde::de::DeserializeOwned;
+
+    #[cfg(not(windows))]
+    use ruff_linter::registry::Linter;
 
     use super::*;
 
+    #[cfg(not(windows))]
     const VS_CODE_INIT_OPTIONS_FIXTURE: &str =
         include_str!("../../resources/test/fixtures/settings/vs_code_initialization_options.json");
     const GLOBAL_ONLY_INIT_OPTIONS_FIXTURE: &str =
@@ -357,6 +397,7 @@ mod tests {
         serde_json::from_str(content).expect("test fixture JSON should deserialize")
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_vs_code_init_options_deserialize() {
         let options: InitializationOptions = deserialize_fixture(VS_CODE_INIT_OPTIONS_FIXTURE);
@@ -415,6 +456,11 @@ mod tests {
                 exclude: None,
                 line_length: None,
                 configuration_preference: None,
+                show_syntax_errors: None,
+                tracing: TracingSettings {
+                    log_level: None,
+                    log_file: None,
+                },
             },
             workspace_settings: [
                 WorkspaceSettings {
@@ -463,6 +509,11 @@ mod tests {
                         exclude: None,
                         line_length: None,
                         configuration_preference: None,
+                        show_syntax_errors: None,
+                        tracing: TracingSettings {
+                            log_level: None,
+                            log_file: None,
+                        },
                     },
                     workspace: Url {
                         scheme: "file",
@@ -524,6 +575,11 @@ mod tests {
                         exclude: None,
                         line_length: None,
                         configuration_preference: None,
+                        show_syntax_errors: None,
+                        tracing: TracingSettings {
+                            log_level: None,
+                            log_file: None,
+                        },
                     },
                     workspace: Url {
                         scheme: "file",
@@ -542,6 +598,7 @@ mod tests {
         "###);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_vs_code_workspace_settings_resolve() {
         let options = deserialize_fixture(VS_CODE_INIT_OPTIONS_FIXTURE);
@@ -549,12 +606,13 @@ mod tests {
             global_settings,
             workspace_settings,
         } = AllSettings::from_init_options(options);
-        let url = Url::parse("file:///Users/test/projects/pandas").expect("url should parse");
+        let path =
+            Url::from_str("file:///Users/test/projects/pandas").expect("path should be valid");
         let workspace_settings = workspace_settings.expect("workspace settings should exist");
         assert_eq!(
             ResolvedClientSettings::with_workspace(
                 workspace_settings
-                    .get(&url)
+                    .get(&path)
                     .expect("workspace setting should exist"),
                 &global_settings
             ),
@@ -564,6 +622,7 @@ mod tests {
                 lint_enable: true,
                 disable_rule_comment_enable: false,
                 fix_violation_enable: false,
+                show_syntax_errors: true,
                 editor_settings: ResolvedEditorSettings {
                     configuration: None,
                     lint_preview: Some(true),
@@ -577,14 +636,15 @@ mod tests {
                     exclude: None,
                     line_length: None,
                     configuration_preference: ConfigurationPreference::default(),
-                }
+                },
             }
         );
-        let url = Url::parse("file:///Users/test/projects/scipy").expect("url should parse");
+        let path =
+            Url::from_str("file:///Users/test/projects/scipy").expect("path should be valid");
         assert_eq!(
             ResolvedClientSettings::with_workspace(
                 workspace_settings
-                    .get(&url)
+                    .get(&path)
                     .expect("workspace setting should exist"),
                 &global_settings
             ),
@@ -594,6 +654,7 @@ mod tests {
                 lint_enable: true,
                 disable_rule_comment_enable: true,
                 fix_violation_enable: false,
+                show_syntax_errors: true,
                 editor_settings: ResolvedEditorSettings {
                     configuration: None,
                     lint_preview: Some(false),
@@ -607,7 +668,7 @@ mod tests {
                     exclude: None,
                     line_length: None,
                     configuration_preference: ConfigurationPreference::EditorFirst,
-                }
+                },
             }
         );
     }
@@ -618,52 +679,57 @@ mod tests {
 
         assert_debug_snapshot!(options, @r###"
         GlobalOnly {
-            settings: Some(
-                ClientSettings {
-                    configuration: None,
-                    fix_all: Some(
-                        false,
-                    ),
-                    organize_imports: None,
-                    lint: Some(
-                        LintOptions {
-                            enable: None,
-                            preview: None,
-                            select: None,
-                            extend_select: None,
-                            ignore: Some(
-                                [
-                                    "RUF001",
-                                ],
-                            ),
-                        },
-                    ),
-                    format: None,
-                    code_action: Some(
-                        CodeActionOptions {
-                            disable_rule_comment: Some(
-                                CodeActionParameters {
-                                    enable: Some(
-                                        false,
-                                    ),
-                                },
-                            ),
-                            fix_violation: None,
-                        },
-                    ),
-                    exclude: Some(
-                        [
-                            "third_party",
-                        ],
-                    ),
-                    line_length: Some(
-                        LineLength(
-                            80,
+            settings: ClientSettings {
+                configuration: None,
+                fix_all: Some(
+                    false,
+                ),
+                organize_imports: None,
+                lint: Some(
+                    LintOptions {
+                        enable: None,
+                        preview: None,
+                        select: None,
+                        extend_select: None,
+                        ignore: Some(
+                            [
+                                "RUF001",
+                            ],
                         ),
+                    },
+                ),
+                format: None,
+                code_action: Some(
+                    CodeActionOptions {
+                        disable_rule_comment: Some(
+                            CodeActionParameters {
+                                enable: Some(
+                                    false,
+                                ),
+                            },
+                        ),
+                        fix_violation: None,
+                    },
+                ),
+                exclude: Some(
+                    [
+                        "third_party",
+                    ],
+                ),
+                line_length: Some(
+                    LineLength(
+                        80,
                     ),
-                    configuration_preference: None,
+                ),
+                configuration_preference: None,
+                show_syntax_errors: None,
+                tracing: TracingSettings {
+                    log_level: Some(
+                        Warn,
+                    ),
+                    log_file: None,
                 },
-            ),
+            },
         }
         "###);
     }
@@ -683,6 +749,7 @@ mod tests {
                 lint_enable: true,
                 disable_rule_comment_enable: false,
                 fix_violation_enable: true,
+                show_syntax_errors: true,
                 editor_settings: ResolvedEditorSettings {
                     configuration: None,
                     lint_preview: None,
@@ -693,7 +760,7 @@ mod tests {
                     exclude: Some(vec!["third_party".into()]),
                     line_length: Some(LineLength::try_from(80).unwrap()),
                     configuration_preference: ConfigurationPreference::EditorFirst,
-                }
+                },
             }
         );
     }

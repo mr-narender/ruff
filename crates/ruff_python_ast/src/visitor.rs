@@ -1,6 +1,6 @@
 //! AST visitor trait and walk functions.
 
-pub mod preorder;
+pub mod source_order;
 pub mod transformer;
 
 use crate::{
@@ -16,8 +16,8 @@ use crate::{
 /// Prefer [`crate::statement_visitor::StatementVisitor`] for visitors that only need to visit
 /// statements.
 ///
-/// Use the [`PreorderVisitor`](preorder::PreorderVisitor) if you want to visit the nodes
-/// in pre-order rather than evaluation order.
+/// Use the [`PreorderVisitor`](source_order::SourceOrderVisitor) if you want to visit the nodes
+/// in source-order rather than evaluation order.
 ///
 /// Use the [`Transformer`](transformer::Transformer) if you want to modify the nodes.
 pub trait Visitor<'a> {
@@ -389,16 +389,12 @@ pub fn walk_expr<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, expr: &'a Expr) {
             visitor.visit_expr(body);
             visitor.visit_expr(orelse);
         }
-        Expr::Dict(ast::ExprDict {
-            keys,
-            values,
-            range: _,
-        }) => {
-            for expr in keys.iter().flatten() {
-                visitor.visit_expr(expr);
-            }
-            for expr in values {
-                visitor.visit_expr(expr);
+        Expr::Dict(ast::ExprDict { items, range: _ }) => {
+            for ast::DictItem { key, value } in items {
+                if let Some(key) = key {
+                    visitor.visit_expr(key);
+                }
+                visitor.visit_expr(value);
             }
         }
         Expr::Set(ast::ExprSet { elts, range: _ }) => {

@@ -1,5 +1,3 @@
-use std::usize;
-
 use ruff_formatter::{format_args, write, FormatRuleWithOptions};
 use ruff_python_ast::Parameters;
 use ruff_python_ast::{AnyNodeRef, AstNode};
@@ -276,15 +274,6 @@ impl FormatNodeRule<Parameters> for FormatParameters {
                 ]
             )
         }
-    }
-
-    fn fmt_dangling_comments(
-        &self,
-        _dangling_comments: &[SourceComment],
-        _f: &mut PyFormatter,
-    ) -> FormatResult<()> {
-        // Handled in `fmt_fields`
-        Ok(())
     }
 }
 

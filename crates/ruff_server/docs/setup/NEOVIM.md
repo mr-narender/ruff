@@ -19,7 +19,8 @@ on how to configure the server from there.
 
 #### Tips
 
-If you're using Ruff alongside another LSP (like Pyright), you may want to defer to that LSP for certain capabilities, like `textDocument/hover`:
+If you're using Ruff alongside another LSP (like Pyright), you may want to defer to that LSP for certain capabilities,
+like `textDocument/hover`:
 
 ```lua
 local on_attach = function(client, bufnr)
@@ -34,7 +35,8 @@ require('lspconfig').ruff.setup {
 }
 ```
 
-If you'd like to use Ruff exclusively for linting, formatting, and import organization, you can disable those capabilities for Pyright:
+If you'd like to use Ruff exclusively for linting, formatting, and import organization, you can disable those
+capabilities for Pyright:
 
 ```lua
 require('lspconfig').pyright.setup {
@@ -52,3 +54,41 @@ require('lspconfig').pyright.setup {
   },
 }
 ```
+
+By default, Ruff will not show any logs. To enable logging in Neovim, you'll need to set the `RUFF_TRACE` environment variable
+to either `messages` or `verbose`:
+
+```lua
+require('lspconfig').ruff.setup {
+  cmd_env = { RUFF_TRACE = "messages" }
+}
+```
+
+You can set the log level in `settings`:
+
+```lua
+require('lspconfig').ruff.setup {
+  cmd_env = { RUFF_TRACE = "messages" },
+  init_options = {
+    settings = {
+      logLevel = "debug",
+    }
+  }
+}
+```
+
+It's also possible to divert Ruff's logs to a separate file with the `logFile` setting:
+
+```lua
+require('lspconfig').ruff.setup {
+  cmd_env = { RUFF_TRACE = "messages" },
+  init_options = {
+    settings = {
+      logLevel = "debug",
+      logFile = "~/.local/state/nvim/ruff.log"
+    }
+  }
+}
+```
+
+The `logFile` path supports tildes and environment variables.

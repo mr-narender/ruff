@@ -270,8 +270,8 @@ There are a few exceptions to these rules:
 1. If no config file is found in the filesystem hierarchy, Ruff will fall back to using
     a default configuration. If a user-specific configuration file exists
     at `${config_dir}/ruff/pyproject.toml`, that file will be used instead of the default
-    configuration, with `${config_dir}` being determined via the [`dirs`](https://docs.rs/dirs/4.0.0/dirs/fn.config_dir.html)
-    crate, and all relative paths being again resolved relative to the _current working directory_.
+    configuration, with `${config_dir}` being determined via [`etcetera`'s native strategy](https://docs.rs/etcetera/latest/etcetera/#native-strategy),
+    and all relative paths being again resolved relative to the _current working directory_.
 1. Any config-file-supported settings that are provided on the command-line (e.g., via
     `--select`) will override the settings in _every_ resolved configuration file.
 
@@ -516,7 +516,7 @@ See `ruff help` for the full list of Ruff's top-level commands:
 <!-- Begin auto-generated command help. -->
 
 ```text
-Ruff: An extremely fast Python linter.
+Ruff: An extremely fast Python linter and code formatter.
 
 Usage: ruff [OPTIONS] <COMMAND>
 
@@ -576,22 +576,20 @@ Options:
       --unsafe-fixes
           Include fixes that may not retain the original intent of the code.
           Use `--no-unsafe-fixes` to disable
-      --show-source
-          Show violations with source code. Use `--no-show-source` to disable.
-          (Deprecated: use `--output-format=full` or `--output-format=concise`
-          instead of `--show-source` and `--no-show-source`, respectively)
       --show-fixes
           Show an enumeration of all fixed lint violations. Use
           `--no-show-fixes` to disable
       --diff
           Avoid writing any fixed files back; instead, output a diff for each
-          changed file to stdout. Implies `--fix-only`
+          changed file to stdout, and exit 0 if there are no diffs. Implies
+          `--fix-only`
   -w, --watch
           Run in watch mode by re-running whenever files change
       --fix-only
-          Apply fixes to resolve lint violations, but don't report on leftover
-          violations. Implies `--fix`. Use `--no-fix-only` to disable or
-          `--unsafe-fixes` to include unsafe fixes
+          Apply fixes to resolve lint violations, but don't report on, or exit
+          non-zero for, leftover violations. Implies `--fix`. Use
+          `--no-fix-only` to disable or `--unsafe-fixes` to include unsafe
+          fixes
       --ignore-noqa
           Ignore any `# noqa` comments
       --output-format <OUTPUT_FORMAT>
@@ -599,19 +597,19 @@ Options:
           format is "concise". In preview mode, the default serialization
           format is "full" [env: RUFF_OUTPUT_FORMAT=] [possible values: text,
           concise, full, json, json-lines, junit, grouped, github, gitlab,
-          pylint, azure, sarif]
+          pylint, rdjson, azure, sarif]
   -o, --output-file <OUTPUT_FILE>
           Specify file to write the linter output to (default: stdout) [env:
           RUFF_OUTPUT_FILE=]
       --target-version <TARGET_VERSION>
           The minimum Python version that should be supported [possible values:
-          py37, py38, py39, py310, py311, py312]
+          py37, py38, py39, py310, py311, py312, py313]
       --preview
           Enable preview mode; checks will include unstable rules and fixes.
           Use `--no-preview` to disable
       --extension <EXTENSION>
-          List of mappings from file extension to language (one of ["python",
-          "ipynb", "pyi"]). For example, to treat `.ipy` files as IPython
+          List of mappings from file extension to language (one of `python`,
+          `ipynb`, `pyi`). For example, to treat `.ipy` files as IPython
           notebooks, use `--extension ipy:ipynb`
       --statistics
           Show counts for every rule with at least one violation
@@ -715,12 +713,12 @@ Options:
           status code and the difference between the current file and how the
           formatted file would look like
       --extension <EXTENSION>
-          List of mappings from file extension to language (one of ["python",
-          "ipynb", "pyi"]). For example, to treat `.ipy` files as IPython
+          List of mappings from file extension to language (one of `python`,
+          `ipynb`, `pyi`). For example, to treat `.ipy` files as IPython
           notebooks, use `--extension ipy:ipynb`
       --target-version <TARGET_VERSION>
           The minimum Python version that should be supported [possible values:
-          py37, py38, py39, py310, py311, py312]
+          py37, py38, py39, py310, py311, py312, py313]
       --preview
           Enable preview mode; enables unstable formatting. Use `--no-preview`
           to disable

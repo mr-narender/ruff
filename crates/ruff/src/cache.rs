@@ -19,11 +19,10 @@ use tempfile::NamedTempFile;
 
 use ruff_cache::{CacheKey, CacheKeyHasher};
 use ruff_diagnostics::{DiagnosticKind, Fix};
-use ruff_linter::message::Message;
+use ruff_linter::message::{DiagnosticMessage, Message};
 use ruff_linter::{warn_user, VERSION};
 use ruff_macros::CacheKey;
 use ruff_notebook::NotebookIndex;
-use ruff_python_ast::imports::ImportMap;
 use ruff_source_file::SourceFileBuilder;
 use ruff_text_size::{TextRange, TextSize};
 use ruff_workspace::resolver::Resolver;
@@ -334,12 +333,14 @@ impl FileCache {
                 let file = SourceFileBuilder::new(path.to_string_lossy(), &*lint.source).finish();
                 lint.messages
                     .iter()
-                    .map(|msg| Message {
-                        kind: msg.kind.clone(),
-                        range: msg.range,
-                        fix: msg.fix.clone(),
-                        file: file.clone(),
-                        noqa_offset: msg.noqa_offset,
+                    .map(|msg| {
+                        Message::Diagnostic(DiagnosticMessage {
+                            kind: msg.kind.clone(),
+                            range: msg.range,
+                            fix: msg.fix.clone(),
+                            file: file.clone(),
+                            noqa_offset: msg.noqa_offset,
+                        })
                     })
                     .collect()
             };
@@ -348,7 +349,7 @@ impl FileCache {
             } else {
                 FxHashMap::default()
             };
-            Diagnostics::new(messages, lint.imports.clone(), notebook_indexes)
+            Diagnostics::new(messages, notebook_indexes)
         })
     }
 }
@@ -394,7 +395,7 @@ pub(crate) fn init(path: &Path) -> Result<()> {
 #[derive(Deserialize, Debug, Serialize, PartialEq)]
 pub(crate) struct LintCacheData {
     /// Imports made.
-    pub(super) imports: ImportMap,
+    // pub(super) imports: ImportMap,
     /// Diagnostic messages.
     pub(super) messages: Vec<CacheMessage>,
     /// Source code of the file.
@@ -410,22 +411,22 @@ pub(crate) struct LintCacheData {
 impl LintCacheData {
     pub(crate) fn from_messages(
         messages: &[Message],
-        imports: ImportMap,
         notebook_index: Option<NotebookIndex>,
     ) -> Self {
         let source = if let Some(msg) = messages.first() {
-            msg.file.source_text().to_owned()
+            msg.source_file().source_text().to_owned()
         } else {
             String::new() // No messages, no need to keep the source!
         };
 
         let messages = messages
             .iter()
+            .filter_map(|message| message.as_diagnostic_message())
             .map(|msg| {
                 // Make sure that all message use the same source file.
                 assert_eq!(
-                    msg.file,
-                    messages.first().unwrap().file,
+                    &msg.file,
+                    messages.first().unwrap().source_file(),
                     "message uses a different source file"
                 );
                 CacheMessage {
@@ -438,7 +439,6 @@ impl LintCacheData {
             .collect();
 
         Self {
-            imports,
             messages,
             source,
             notebook_index,
@@ -574,6 +574,7 @@ mod tests {
     use test_case::test_case;
 
     use ruff_cache::CACHE_DIR_NAME;
+    use ruff_linter::message::Message;
     use ruff_linter::settings::flags;
     use ruff_linter::settings::types::UnsafeFixes;
     use ruff_python_ast::PySourceType;
@@ -636,11 +637,7 @@ mod tests {
                     UnsafeFixes::Enabled,
                 )
                 .unwrap();
-                if diagnostics
-                    .messages
-                    .iter()
-                    .any(|m| m.kind.name == "SyntaxError")
-                {
+                if diagnostics.messages.iter().any(Message::is_syntax_error) {
                     parse_errors.push(path.clone());
                 }
                 paths.push(path);

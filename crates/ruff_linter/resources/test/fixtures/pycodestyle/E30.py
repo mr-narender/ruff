@@ -411,17 +411,9 @@ async def function1():
 
 # no error
 async def function1():
-	await function2()
+    await function2()
     async with function3():
-    	pass
-# end
-
-
-# no error
-class Test:
-    async
-
-    def a(self): pass
+        pass
 # end
 
 
@@ -439,7 +431,7 @@ class Test:
 # no error
 def test():
     pass
-  
+
   # Wrongly indented comment
     pass
 # end
@@ -615,13 +607,13 @@ def g():
 
 # E302
 class Test:
-	
+
 	pass
-	
+
 	def method1():
 		return 1
-		
-		
+
+
 	def method2():
 		return 22
 # end
@@ -762,7 +754,7 @@ class Test:
 def fn():
     pass
 
- 
+
     pass
 # end
 
@@ -932,4 +924,14 @@ def a():
     x = 2
     async def b():
         pass
+# end
+
+
+# no error
+@overload
+def arrow_strip_whitespace(obj: Table, /, *cols: str) -> Table: ...
+@overload
+def arrow_strip_whitespace(obj: Array, /, *cols: str) -> Array: ...  # type: ignore[misc]
+def arrow_strip_whitespace(obj, /, *cols):
+    ...
 # end

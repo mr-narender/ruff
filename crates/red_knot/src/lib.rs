@@ -1,6 +1,4 @@
-use std::fmt::Formatter;
 use std::hash::BuildHasherDefault;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use rustc_hash::{FxHashSet, FxHasher};
@@ -17,9 +15,8 @@ pub mod lint;
 pub mod module;
 mod parse;
 pub mod program;
+mod semantic;
 pub mod source;
-mod symbols;
-mod types;
 pub mod watch;
 
 pub(crate) type FxDashMap<K, V> = dashmap::DashMap<K, V, BuildHasherDefault<FxHasher>>;
@@ -27,7 +24,7 @@ pub(crate) type FxDashMap<K, V> = dashmap::DashMap<K, V, BuildHasherDefault<FxHa
 pub(crate) type FxDashSet<V> = dashmap::DashSet<V, BuildHasherDefault<FxHasher>>;
 pub(crate) type FxIndexSet<V> = indexmap::set::IndexSet<V, BuildHasherDefault<FxHasher>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Workspace {
     /// TODO this should be a resolved path. We should probably use a newtype wrapper that guarantees that
     /// PATH is a UTF-8 path and is normalized.
@@ -67,43 +64,5 @@ impl Workspace {
 
     pub fn is_file_open(&self, file_id: FileId) -> bool {
         self.open_files.contains(&file_id)
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct Name(smol_str::SmolStr);
-
-impl Name {
-    #[inline]
-    pub fn new(name: &str) -> Self {
-        Self(smol_str::SmolStr::new(name))
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl Deref for Name {
-    type Target = str;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl<T> From<T> for Name
-where
-    T: Into<smol_str::SmolStr>,
-{
-    fn from(value: T) -> Self {
-        Self(value.into())
-    }
-}
-
-impl std::fmt::Display for Name {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
