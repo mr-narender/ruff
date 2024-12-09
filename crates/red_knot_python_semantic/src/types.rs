@@ -28,7 +28,7 @@ use crate::symbol::{Boundness, Symbol};
 use crate::types::diagnostic::TypeCheckDiagnosticsBuilder;
 use crate::types::mro::{ClassBase, Mro, MroError, MroIterator};
 use crate::types::narrow::narrowing_constraint;
-use crate::{Db, FxOrderSet, Module, Program};
+use crate::{Db, FxOrderSet, Module, Program, PythonVersion};
 
 mod builder;
 mod diagnostic;
@@ -887,7 +887,7 @@ impl<'db> Type<'db> {
                 Type::SubclassOf(_),
             ) => true,
             (Type::SubclassOf(_), _) | (_, Type::SubclassOf(_)) => {
-                // TODO: Once we have support for final classes, we can determine disjointness in some cases
+                // TODO: Once we have support for final classes, we can determine disjointedness in some cases
                 // here. However, note that it might be better to turn `Type::SubclassOf('FinalClass')` into
                 // `Type::ClassLiteral('FinalClass')` during construction, instead of adding special cases for
                 // final classes inside `Type::SubclassOf` everywhere.
@@ -1173,6 +1173,8 @@ impl<'db> Type<'db> {
                     | KnownClass::Set
                     | KnownClass::Dict
                     | KnownClass::Slice
+                    | KnownClass::BaseException
+                    | KnownClass::BaseExceptionGroup
                     | KnownClass::GenericAlias
                     | KnownClass::ModuleType
                     | KnownClass::FunctionType
@@ -1845,6 +1847,8 @@ pub enum KnownClass {
     Set,
     Dict,
     Slice,
+    BaseException,
+    BaseExceptionGroup,
     // Types
     GenericAlias,
     ModuleType,
@@ -1875,6 +1879,8 @@ impl<'db> KnownClass {
             Self::List => "list",
             Self::Type => "type",
             Self::Slice => "slice",
+            Self::BaseException => "BaseException",
+            Self::BaseExceptionGroup => "BaseExceptionGroup",
             Self::GenericAlias => "GenericAlias",
             Self::ModuleType => "ModuleType",
             Self::FunctionType => "FunctionType",
@@ -1897,13 +1903,19 @@ impl<'db> KnownClass {
     }
 
     pub fn to_class_literal(self, db: &'db dyn Db) -> Type<'db> {
-        core_module_symbol(db, self.canonical_module(), self.as_str())
+        core_module_symbol(db, self.canonical_module(db), self.as_str())
             .ignore_possibly_unbound()
             .unwrap_or(Type::Unknown)
     }
 
+    pub fn to_subclass_of(self, db: &'db dyn Db) -> Option<Type<'db>> {
+        self.to_class_literal(db)
+            .into_class_literal()
+            .map(|ClassLiteralType { class }| Type::subclass_of(class))
+    }
+
     /// Return the module in which we should look up the definition for this class
-    pub(crate) const fn canonical_module(self) -> CoreStdlibModule {
+    pub(crate) fn canonical_module(self, db: &'db dyn Db) -> CoreStdlibModule {
         match self {
             Self::Bool
             | Self::Object
@@ -1916,15 +1928,25 @@ impl<'db> KnownClass {
             | Self::Tuple
             | Self::Set
             | Self::Dict
+            | Self::BaseException
+            | Self::BaseExceptionGroup
             | Self::Slice => CoreStdlibModule::Builtins,
             Self::VersionInfo => CoreStdlibModule::Sys,
             Self::GenericAlias | Self::ModuleType | Self::FunctionType => CoreStdlibModule::Types,
             Self::NoneType => CoreStdlibModule::Typeshed,
             Self::SpecialForm | Self::TypeVar | Self::TypeAliasType => CoreStdlibModule::Typing,
-            // TODO when we understand sys.version_info, we will need an explicit fallback here,
-            // because typing_extensions has a 3.13+ re-export for the `typing.NoDefault`
-            // singleton, but not for `typing._NoDefaultType`
-            Self::NoDefaultType => CoreStdlibModule::TypingExtensions,
+            Self::NoDefaultType => {
+                let python_version = Program::get(db).target_version(db);
+
+                // typing_extensions has a 3.13+ re-export for the `typing.NoDefault`
+                // singleton, but not for `typing._NoDefaultType`. So we need to switch
+                // to `typing._NoDefaultType` for newer versions:
+                if python_version >= PythonVersion::PY313 {
+                    CoreStdlibModule::Typing
+                } else {
+                    CoreStdlibModule::TypingExtensions
+                }
+            }
         }
     }
 
@@ -1951,6 +1973,8 @@ impl<'db> KnownClass {
             | Self::ModuleType
             | Self::FunctionType
             | Self::SpecialForm
+            | Self::BaseException
+            | Self::BaseExceptionGroup
             | Self::TypeVar => false,
         }
     }
@@ -1972,6 +1996,8 @@ impl<'db> KnownClass {
             "dict" => Self::Dict,
             "list" => Self::List,
             "slice" => Self::Slice,
+            "BaseException" => Self::BaseException,
+            "BaseExceptionGroup" => Self::BaseExceptionGroup,
             "GenericAlias" => Self::GenericAlias,
             "NoneType" => Self::NoneType,
             "ModuleType" => Self::ModuleType,
@@ -1984,11 +2010,11 @@ impl<'db> KnownClass {
         };
 
         let module = file_to_module(db, file)?;
-        candidate.check_module(&module).then_some(candidate)
+        candidate.check_module(db, &module).then_some(candidate)
     }
 
     /// Return `true` if the module of `self` matches `module_name`
-    fn check_module(self, module: &Module) -> bool {
+    fn check_module(self, db: &'db dyn Db, module: &Module) -> bool {
         if !module.search_path().is_standard_library() {
             return false;
         }
@@ -2008,7 +2034,9 @@ impl<'db> KnownClass {
             | Self::GenericAlias
             | Self::ModuleType
             | Self::VersionInfo
-            | Self::FunctionType => module.name() == self.canonical_module().as_str(),
+            | Self::BaseException
+            | Self::BaseExceptionGroup
+            | Self::FunctionType => module.name() == self.canonical_module(db).as_str(),
             Self::NoneType => matches!(module.name().as_str(), "_typeshed" | "types"),
             Self::SpecialForm | Self::TypeVar | Self::TypeAliasType | Self::NoDefaultType => {
                 matches!(module.name().as_str(), "typing" | "typing_extensions")
@@ -3683,11 +3711,26 @@ pub(crate) mod tests {
     #[test_case(Ty::None)]
     #[test_case(Ty::BooleanLiteral(true))]
     #[test_case(Ty::BooleanLiteral(false))]
-    #[test_case(Ty::KnownClassInstance(KnownClass::NoDefaultType))]
     fn is_singleton(from: Ty) {
         let db = setup_db();
 
         assert!(from.into_type(&db).is_singleton(&db));
+    }
+
+    /// Explicitly test for Python version <3.13 and >=3.13, to ensure that
+    /// the fallback to `typing_extensions` is working correctly.
+    /// See [`KnownClass::canonical_module`] for more information.
+    #[test_case(PythonVersion::PY312)]
+    #[test_case(PythonVersion::PY313)]
+    fn no_default_type_is_singleton(python_version: PythonVersion) {
+        let db = TestDbBuilder::new()
+            .with_python_version(python_version)
+            .build()
+            .unwrap();
+
+        let no_default = Ty::KnownClassInstance(KnownClass::NoDefaultType).into_type(&db);
+
+        assert!(no_default.is_singleton(&db));
     }
 
     #[test_case(Ty::None)]
