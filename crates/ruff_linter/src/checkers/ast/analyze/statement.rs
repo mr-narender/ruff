@@ -1235,6 +1235,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                     }
                 }
             }
+            if checker.enabled(Rule::IfKeyInDictDel) {
+                ruff::rules::if_key_in_dict_del(checker, if_);
+            }
         }
         Stmt::Assert(
             assert_stmt @ ast::StmtAssert {
@@ -1363,6 +1366,7 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                 Rule::UnnecessaryEnumerate,
                 Rule::UnusedLoopControlVariable,
                 Rule::YieldInForLoop,
+                Rule::ManualListComprehension,
             ]) {
                 checker.analyze.for_loops.push(checker.semantic.snapshot());
             }
@@ -1386,9 +1390,6 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
             if checker.enabled(Rule::DictIterMissingItems) {
                 pylint::rules::dict_iter_missing_items(checker, target, iter);
-            }
-            if checker.enabled(Rule::ManualListComprehension) {
-                perflint::rules::manual_list_comprehension(checker, for_stmt);
             }
             if checker.enabled(Rule::ManualListCopy) {
                 perflint::rules::manual_list_copy(checker, for_stmt);
