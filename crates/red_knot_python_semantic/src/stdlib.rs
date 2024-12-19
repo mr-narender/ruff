@@ -15,6 +15,9 @@ pub(crate) enum CoreStdlibModule {
     TypingExtensions,
     Typing,
     Sys,
+    #[allow(dead_code)]
+    Abc, // currently only used in tests
+    Collections,
 }
 
 impl CoreStdlibModule {
@@ -26,6 +29,8 @@ impl CoreStdlibModule {
             Self::Typeshed => "_typeshed",
             Self::TypingExtensions => "typing_extensions",
             Self::Sys => "sys",
+            Self::Abc => "abc",
+            Self::Collections => "collections",
         }
     }
 
