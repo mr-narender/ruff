@@ -358,6 +358,7 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Flake8Bugbear, "904") => (RuleGroup::Stable, rules::flake8_bugbear::rules::RaiseWithoutFromInsideExcept),
         (Flake8Bugbear, "905") => (RuleGroup::Stable, rules::flake8_bugbear::rules::ZipWithoutExplicitStrict),
         (Flake8Bugbear, "909") => (RuleGroup::Preview, rules::flake8_bugbear::rules::LoopIteratorMutation),
+        (Flake8Bugbear, "911") => (RuleGroup::Preview, rules::flake8_bugbear::rules::BatchedWithoutExplicitStrict),
 
         // flake8-blind-except
         (Flake8BlindExcept, "001") => (RuleGroup::Stable, rules::flake8_blind_except::rules::BlindExcept),
@@ -565,7 +566,7 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Pydocstyle, "400") => (RuleGroup::Stable, rules::pydocstyle::rules::EndsInPeriod),
         (Pydocstyle, "401") => (RuleGroup::Stable, rules::pydocstyle::rules::NonImperativeMood),
         (Pydocstyle, "402") => (RuleGroup::Stable, rules::pydocstyle::rules::NoSignature),
-        (Pydocstyle, "403") => (RuleGroup::Stable, rules::pydocstyle::rules::FirstLineCapitalized),
+        (Pydocstyle, "403") => (RuleGroup::Stable, rules::pydocstyle::rules::FirstWordUncapitalized),
         (Pydocstyle, "404") => (RuleGroup::Stable, rules::pydocstyle::rules::DocstringStartsWithThis),
         (Pydocstyle, "405") => (RuleGroup::Stable, rules::pydocstyle::rules::CapitalizeSectionName),
         (Pydocstyle, "406") => (RuleGroup::Stable, rules::pydocstyle::rules::NewLineAfterSectionName),
@@ -909,6 +910,7 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Flake8UsePathlib, "206") => (RuleGroup::Stable, rules::flake8_use_pathlib::rules::OsSepSplit),
         (Flake8UsePathlib, "207") => (RuleGroup::Stable, rules::flake8_use_pathlib::rules::Glob),
         (Flake8UsePathlib, "208") => (RuleGroup::Preview, rules::flake8_use_pathlib::violations::OsListdir),
+        (Flake8UsePathlib, "210") => (RuleGroup::Preview, rules::flake8_use_pathlib::rules::InvalidPathlibWithSuffix),
 
         // flake8-logging-format
         (Flake8LoggingFormat, "001") => (RuleGroup::Stable, rules::flake8_logging_format::violations::LoggingStringFormat),
@@ -983,7 +985,10 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Ruff, "039") => (RuleGroup::Preview, rules::ruff::rules::UnrawRePattern),
         (Ruff, "040") => (RuleGroup::Preview, rules::ruff::rules::InvalidAssertMessageLiteralArgument),
         (Ruff, "041") => (RuleGroup::Preview, rules::ruff::rules::UnnecessaryNestedLiteral),
+        (Ruff, "043") => (RuleGroup::Preview, rules::ruff::rules::PytestRaisesAmbiguousPattern),
+        (Ruff, "046") => (RuleGroup::Preview, rules::ruff::rules::UnnecessaryCastToInt),
         (Ruff, "048") => (RuleGroup::Preview, rules::ruff::rules::MapIntVersionParsing),
+        (Ruff, "051") => (RuleGroup::Preview, rules::ruff::rules::IfKeyInDictDel),
         (Ruff, "052") => (RuleGroup::Preview, rules::ruff::rules::UsedDummyVariable),
         (Ruff, "055") => (RuleGroup::Preview, rules::ruff::rules::UnnecessaryRegularExpression),
         (Ruff, "100") => (RuleGroup::Stable, rules::ruff::rules::UnusedNOQA),
@@ -1042,6 +1047,7 @@ pub fn code_to_rule(linter: Linter, code: &str) -> Option<(RuleGroup, Rule)> {
         (Airflow, "001") => (RuleGroup::Stable, rules::airflow::rules::AirflowVariableNameTaskIdMismatch),
         (Airflow, "301") => (RuleGroup::Preview, rules::airflow::rules::AirflowDagNoScheduleArgument),
         (Airflow, "302") => (RuleGroup::Preview, rules::airflow::rules::Airflow3Removal),
+        (Airflow, "303") => (RuleGroup::Preview, rules::airflow::rules::Airflow3MovedToProvider),
 
         // perflint
         (Perflint, "101") => (RuleGroup::Stable, rules::perflint::rules::UnnecessaryListCast),
