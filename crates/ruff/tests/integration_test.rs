@@ -1037,7 +1037,7 @@ fn preview_enabled_all() {
     [*] 1 fixable with the `--fix` option (1 hidden fix can be enabled with the `--unsafe-fixes` option).
 
     ----- stderr -----
-    warning: `one-blank-line-before-class` (D203) and `no-blank-line-before-class` (D211) are incompatible. Ignoring `one-blank-line-before-class`.
+    warning: `incorrect-blank-line-before-class` (D203) and `no-blank-line-before-class` (D211) are incompatible. Ignoring `incorrect-blank-line-before-class`.
     warning: `multi-line-summary-first-line` (D212) and `multi-line-summary-second-line` (D213) are incompatible. Ignoring `multi-line-summary-second-line`.
     ");
 }
@@ -2125,4 +2125,68 @@ unfixable = ["RUF"]
     ");
 
     Ok(())
+}
+
+#[test]
+fn verbose_show_failed_fix_errors() {
+    let mut cmd = RuffCheck::default()
+        .args(["--select", "UP006", "--preview", "-v"])
+        .build();
+
+    insta::with_settings!(
+            {
+                // the logs have timestamps we need to remove
+                filters => vec![(
+                    r"\[[\d:-]+]",
+                    ""
+                )]
+            },{
+    assert_cmd_snapshot!(cmd
+            .pass_stdin("import typing\nCallable = 'abc'\ndef g() -> typing.Callable: ..."),
+                @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    -:3:12: UP006 Use `collections.abc.Callable` instead of `typing.Callable` for type annotation
+      |
+    1 | import typing
+    2 | Callable = 'abc'
+    3 | def g() -> typing.Callable: ...
+      |            ^^^^^^^^^^^^^^^ UP006
+      |
+      = help: Replace with `collections.abc.Callable`
+
+    Found 1 error.
+
+    ----- stderr -----
+    [ruff::resolve][DEBUG] Isolated mode, not reading any pyproject.toml
+    [ruff_diagnostics::diagnostic][DEBUG] Failed to create fix for NonPEP585Annotation: Unable to insert `Callable` into scope due to name conflict
+    "###);        }
+        );
+}
+
+#[test]
+fn no_verbose_hide_failed_fix_errors() {
+    let mut cmd = RuffCheck::default()
+        .args(["--select", "UP006", "--preview"])
+        .build();
+    assert_cmd_snapshot!(cmd
+        .pass_stdin("import typing\nCallable = 'abc'\ndef g() -> typing.Callable: ..."),
+            @r###"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    -:3:12: UP006 Use `collections.abc.Callable` instead of `typing.Callable` for type annotation
+      |
+    1 | import typing
+    2 | Callable = 'abc'
+    3 | def g() -> typing.Callable: ...
+      |            ^^^^^^^^^^^^^^^ UP006
+      |
+      = help: Replace with `collections.abc.Callable`
+
+    Found 1 error.
+
+    ----- stderr -----
+    "###);
 }
