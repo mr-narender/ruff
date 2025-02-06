@@ -3,7 +3,7 @@ use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast::name::{QualifiedName, UnqualifiedName};
-use ruff_python_semantic::analyze::typing::is_immutable_func;
+use ruff_python_semantic::analyze::typing::{is_immutable_func, is_immutable_newtype_call};
 use ruff_text_size::Ranged;
 
 use crate::checkers::ast::Checker;
@@ -23,6 +23,9 @@ use crate::rules::ruff::rules::helpers::{
 ///
 /// If a field needs to be initialized with a mutable object, use the
 /// `field(default_factory=...)` pattern.
+///
+/// Attributes whose default arguments are `NewType` calls
+/// where the original type is immutable are ignored.
 ///
 /// ## Examples
 /// ```python
@@ -72,23 +75,20 @@ impl Violation for FunctionCallInDataclassDefaultArgument {
 
 /// RUF009
 pub(crate) fn function_call_in_dataclass_default(
-    checker: &mut Checker,
+    checker: &Checker,
     class_def: &ast::StmtClassDef,
+    diagnostics: &mut Vec<Diagnostic>,
 ) {
     let semantic = checker.semantic();
 
-    let Some(dataclass_kind) = dataclass_kind(class_def, semantic) else {
+    let Some((dataclass_kind, _)) = dataclass_kind(class_def, semantic) else {
         return;
     };
-
-    if dataclass_kind.is_attrs() && checker.settings.preview.is_disabled() {
-        return;
-    }
 
     let attrs_auto_attribs = match dataclass_kind {
         DataclassKind::Stdlib => None,
 
-        DataclassKind::Attrs(attrs_auto_attribs) => match attrs_auto_attribs {
+        DataclassKind::Attrs(auto_attribs) => match auto_attribs {
             AttrsAutoAttribs::Unknown => return,
 
             AttrsAutoAttribs::None => {
@@ -99,12 +99,13 @@ pub(crate) fn function_call_in_dataclass_default(
                 }
             }
 
-            _ => Some(attrs_auto_attribs),
+            _ => Some(auto_attribs),
         },
     };
+
     let dataclass_kind = match attrs_auto_attribs {
         None => DataclassKind::Stdlib,
-        Some(attrs_auto_attribs) => DataclassKind::Attrs(attrs_auto_attribs),
+        Some(auto_attribs) => DataclassKind::Attrs(auto_attribs),
     };
 
     let extend_immutable_calls: Vec<QualifiedName> = checker
@@ -140,6 +141,9 @@ pub(crate) fn function_call_in_dataclass_default(
             || is_class_var_annotation(annotation, checker.semantic())
             || is_immutable_func(func, checker.semantic(), &extend_immutable_calls)
             || is_descriptor_class(func, checker.semantic())
+            || func.as_name_expr().is_some_and(|name| {
+                is_immutable_newtype_call(name, checker.semantic(), &extend_immutable_calls)
+            })
         {
             continue;
         }
@@ -149,7 +153,7 @@ pub(crate) fn function_call_in_dataclass_default(
         };
         let diagnostic = Diagnostic::new(kind, expr.range());
 
-        checker.diagnostics.push(diagnostic);
+        diagnostics.push(diagnostic);
     }
 }
 

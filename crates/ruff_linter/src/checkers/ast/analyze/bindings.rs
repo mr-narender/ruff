@@ -4,7 +4,8 @@ use ruff_text_size::Ranged;
 use crate::checkers::ast::Checker;
 use crate::codes::Rule;
 use crate::rules::{
-    flake8_import_conventions, flake8_pyi, flake8_type_checking, pyflakes, pylint, ruff,
+    flake8_import_conventions, flake8_pyi, flake8_pytest_style, flake8_type_checking, pyflakes,
+    pylint, pyupgrade, refurb, ruff,
 };
 
 /// Run lint rules over the [`Binding`]s.
@@ -20,11 +21,15 @@ pub(crate) fn bindings(checker: &mut Checker) {
         Rule::UnusedVariable,
         Rule::UnquotedTypeAlias,
         Rule::UsedDummyVariable,
+        Rule::PytestUnittestRaisesAssertion,
+        Rule::ForLoopWrites,
+        Rule::CustomTypeVarForSelf,
+        Rule::PrivateTypeParameter,
     ]) {
         return;
     }
 
-    for binding in &*checker.semantic.bindings {
+    for (binding_id, binding) in checker.semantic.bindings.iter_enumerated() {
         if checker.enabled(Rule::UnusedVariable) {
             if binding.kind.is_bound_exception()
                 && binding.is_unused()
@@ -77,7 +82,7 @@ pub(crate) fn bindings(checker: &mut Checker) {
                 checker.diagnostics.push(diagnostic);
             }
         }
-        if checker.enabled(Rule::UnquotedTypeAlias) {
+        if !checker.source_type.is_stub() && checker.enabled(Rule::UnquotedTypeAlias) {
             if let Some(diagnostics) =
                 flake8_type_checking::rules::unquoted_type_alias(checker, binding)
             {
@@ -90,12 +95,37 @@ pub(crate) fn bindings(checker: &mut Checker) {
             }
         }
         if checker.enabled(Rule::UsedDummyVariable) {
-            if let Some(diagnostic) = ruff::rules::used_dummy_variable(checker, binding) {
+            if let Some(diagnostic) = ruff::rules::used_dummy_variable(checker, binding, binding_id)
+            {
                 checker.diagnostics.push(diagnostic);
             }
         }
         if checker.enabled(Rule::AssignmentInAssert) {
             if let Some(diagnostic) = ruff::rules::assignment_in_assert(checker, binding) {
+                checker.diagnostics.push(diagnostic);
+            }
+        }
+        if checker.enabled(Rule::PytestUnittestRaisesAssertion) {
+            if let Some(diagnostic) =
+                flake8_pytest_style::rules::unittest_raises_assertion_binding(checker, binding)
+            {
+                checker.diagnostics.push(diagnostic);
+            }
+        }
+        if checker.enabled(Rule::ForLoopWrites) {
+            if let Some(diagnostic) = refurb::rules::for_loop_writes_binding(checker, binding) {
+                checker.diagnostics.push(diagnostic);
+            }
+        }
+        if checker.enabled(Rule::CustomTypeVarForSelf) {
+            if let Some(diagnostic) =
+                flake8_pyi::rules::custom_type_var_instead_of_self(checker, binding)
+            {
+                checker.diagnostics.push(diagnostic);
+            }
+        }
+        if checker.enabled(Rule::PrivateTypeParameter) {
+            if let Some(diagnostic) = pyupgrade::rules::private_type_parameter(checker, binding) {
                 checker.diagnostics.push(diagnostic);
             }
         }

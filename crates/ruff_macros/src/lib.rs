@@ -7,9 +7,11 @@ use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, Error, ItemFn, ItemStruct};
 
 mod cache_key;
+mod combine;
 mod combine_options;
 mod config;
 mod derive_message_formats;
+mod kebab_case;
 mod map_codes;
 mod newtype_index;
 mod rule_code_prefix;
@@ -32,6 +34,27 @@ pub fn derive_combine_options(input: TokenStream) -> TokenStream {
     combine_options::derive_impl(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
+}
+
+/// Automatically derives a `red_knot_project::project::Combine` implementation for the attributed type
+/// that calls `red_knot_project::project::Combine::combine` for each field.
+///
+/// The derive macro can only be used on structs with named fields.
+#[proc_macro_derive(Combine)]
+pub fn derive_combine(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    combine::derive_impl(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Converts a screaming snake case identifier to a kebab case string.
+#[proc_macro]
+pub fn kebab_case(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::Ident);
+
+    kebab_case::kebab_case(&input).into()
 }
 
 /// Generates a [`CacheKey`] implementation for the attributed type.

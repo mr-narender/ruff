@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     edit::{Replacement, ToRangeExt},
-    resolve::is_document_excluded,
+    resolve::is_document_excluded_for_linting,
     session::DocumentQuery,
     PositionEncoding,
 };
@@ -12,7 +12,7 @@ use ruff_linter::package::PackageRoot;
 use ruff_linter::{
     linter::{FixerResult, LinterResult},
     packaging::detect_package_root,
-    settings::{flags, types::UnsafeFixes, LinterSettings},
+    settings::{flags, LinterSettings},
 };
 use ruff_notebook::SourceValue;
 use ruff_source_file::LineIndex;
@@ -33,11 +33,10 @@ pub(crate) fn fix_all(
 
     // If the document is excluded, return an empty list of fixes.
     let package = if let Some(document_path) = document_path.as_ref() {
-        if is_document_excluded(
+        if is_document_excluded_for_linting(
             document_path,
             file_resolver_settings,
-            Some(linter_settings),
-            None,
+            linter_settings,
             query.text_document_language_id(),
         ) {
             return Ok(Fixes::default());
@@ -72,7 +71,7 @@ pub(crate) fn fix_all(
         &query.virtual_file_path(),
         package,
         flags::Noqa::Enabled,
-        UnsafeFixes::Disabled,
+        query.settings().unsafe_fixes(),
         linter_settings,
         &source_kind,
         source_type,

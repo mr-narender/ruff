@@ -3,6 +3,7 @@ use std::fmt;
 use ruff_diagnostics::{Diagnostic, Fix};
 use ruff_diagnostics::{FixAvailability, Violation};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
+use ruff_python_ast::helpers::any_over_expr;
 use ruff_python_ast::visitor;
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{self as ast, Arguments, Expr, ExprContext, Parameters, Stmt};
@@ -99,19 +100,18 @@ pub(crate) fn unnecessary_map(
             // Only flag, e.g., `map(lambda x: x + 1, iterable)`.
             let [Expr::Lambda(ast::ExprLambda {
                 parameters, body, ..
-            }), _] = args
+            }), iterable] = args
             else {
                 return;
             };
 
-            if parameters.as_ref().is_some_and(|parameters| {
-                late_binding(parameters, body)
-                    || parameters
-                        .iter_non_variadic_params()
-                        .any(|param| param.default.is_some())
-                    || parameters.vararg.is_some()
-                    || parameters.kwarg.is_some()
-            }) {
+            // For example, (x+1 for x in (c:=a)) is invalid syntax
+            // so we can't suggest it.
+            if any_over_expr(iterable, &|expr| expr.is_named_expr()) {
+                return;
+            }
+
+            if !lambda_has_expected_arity(parameters.as_deref(), body) {
                 return;
             }
         }
@@ -146,14 +146,7 @@ pub(crate) fn unnecessary_map(
                 return;
             };
 
-            if parameters.as_ref().is_some_and(|parameters| {
-                late_binding(parameters, body)
-                    || parameters
-                        .iter_non_variadic_params()
-                        .any(|param| param.default.is_some())
-                    || parameters.vararg.is_some()
-                    || parameters.kwarg.is_some()
-            }) {
+            if !lambda_has_expected_arity(parameters.as_deref(), body) {
                 return;
             }
         }
@@ -198,14 +191,7 @@ pub(crate) fn unnecessary_map(
                 return;
             }
 
-            if parameters.as_ref().is_some_and(|parameters| {
-                late_binding(parameters, body)
-                    || parameters
-                        .iter_non_variadic_params()
-                        .any(|param| param.default.is_some())
-                    || parameters.vararg.is_some()
-                    || parameters.kwarg.is_some()
-            }) {
+            if !lambda_has_expected_arity(parameters.as_deref(), body) {
                 return;
             }
         }
@@ -223,6 +209,35 @@ pub(crate) fn unnecessary_map(
         .map(Fix::unsafe_edit)
     });
     checker.diagnostics.push(diagnostic);
+}
+
+/// A lambda as the first argument to `map()` has the "expected" arity when:
+///
+/// * It has exactly one parameter
+/// * That parameter is not variadic
+/// * That parameter does not have a default value
+fn lambda_has_expected_arity(parameters: Option<&Parameters>, body: &Expr) -> bool {
+    let Some(parameters) = parameters else {
+        return false;
+    };
+
+    let [parameter] = &parameters.args[..] else {
+        return false;
+    };
+
+    if parameter.default.is_some() {
+        return false;
+    }
+
+    if parameters.vararg.is_some() || parameters.kwarg.is_some() {
+        return false;
+    }
+
+    if late_binding(parameters, body) {
+        return false;
+    }
+
+    true
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

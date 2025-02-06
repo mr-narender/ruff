@@ -1,6 +1,6 @@
 use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Edit, Fix};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
-use ruff_python_ast::{self as ast, Expr, Parameter, ParameterWithDefault, Stmt};
+use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::{Ranged, TextSize};
 
 use crate::checkers::ast::Checker;
@@ -90,13 +90,7 @@ pub(crate) fn super_call_with_parameters(checker: &mut Checker, call: &ast::Expr
     };
 
     // Extract the name of the first argument to the enclosing function.
-    let Some(ParameterWithDefault {
-        parameter: Parameter {
-            name: parent_arg, ..
-        },
-        ..
-    }) = parent_parameters.args.first()
-    else {
+    let Some(parent_arg) = parent_parameters.args.first() else {
         return;
     };
 
@@ -122,7 +116,7 @@ pub(crate) fn super_call_with_parameters(checker: &mut Checker, call: &ast::Expr
         return;
     };
 
-    if !(first_arg_id == parent_name.as_str() && second_arg_id == parent_arg.as_str()) {
+    if !(first_arg_id == parent_name.as_str() && second_arg_id == parent_arg.name().as_str()) {
         return;
     }
 
@@ -145,7 +139,7 @@ pub(crate) fn super_call_with_parameters(checker: &mut Checker, call: &ast::Expr
             .resolve_qualified_name(func)
             .is_some_and(|name| name.segments() == ["dataclasses", "dataclass"])
         {
-            arguments.find_keyword("slots").map_or(false, |keyword| {
+            arguments.find_keyword("slots").is_some_and(|keyword| {
                 matches!(
                     keyword.value,
                     Expr::BooleanLiteral(ast::ExprBooleanLiteral { value: true, .. })

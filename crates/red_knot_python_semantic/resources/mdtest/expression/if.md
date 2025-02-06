@@ -3,13 +3,11 @@
 ## Union
 
 ```py
-def bool_instance() -> bool:
-    return True
-
-reveal_type(1 if bool_instance() else 2)  # revealed: Literal[1, 2]
+def _(flag: bool):
+    reveal_type(1 if flag else 2)  # revealed: Literal[1, 2]
 ```
 
-## Statically known branches
+## Statically known conditions in if-expressions
 
 ```py
 reveal_type(1 if True else 2)  # revealed: Literal[1]
@@ -30,14 +28,14 @@ reveal_type(1 if 0 else 2)  # revealed: Literal[2]
 The test inside an if expression should not affect code outside of the expression.
 
 ```py
-def bool_instance() -> bool:
-    return True
+from typing import Literal
 
-x: Literal[42, "hello"] = 42 if bool_instance() else "hello"
+def _(flag: bool):
+    x: Literal[42, "hello"] = 42 if flag else "hello"
 
-reveal_type(x)  # revealed: Literal[42] | Literal["hello"]
+    reveal_type(x)  # revealed: Literal[42, "hello"]
 
-_ = ... if isinstance(x, str) else ...
+    _ = ... if isinstance(x, str) else ...
 
-reveal_type(x)  # revealed: Literal[42] | Literal["hello"]
+    reveal_type(x)  # revealed: Literal[42, "hello"]
 ```

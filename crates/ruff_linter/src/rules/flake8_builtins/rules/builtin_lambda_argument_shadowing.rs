@@ -11,9 +11,9 @@ use crate::rules::flake8_builtins::helpers::shadows_builtin;
 ///
 /// ## Why is this bad?
 /// Reusing a builtin name for the name of a lambda argument increases the
-/// difficulty of reading and maintaining the code, and can cause
-/// non-obvious errors, as readers may mistake the variable for the
-/// builtin and vice versa.
+/// difficulty of reading and maintaining the code and can cause
+/// non-obvious errors. Readers may mistake the variable for the
+/// builtin, and vice versa.
 ///
 /// Builtins can be marked as exceptions to this rule via the
 /// [`lint.flake8-builtins.builtins-ignorelist`] configuration option.
@@ -39,9 +39,9 @@ pub(crate) fn builtin_lambda_argument_shadowing(checker: &mut Checker, lambda: &
         return;
     };
     for param in parameters.iter_non_variadic_params() {
-        let name = &param.parameter.name;
+        let name = param.name();
         if shadows_builtin(
-            name.as_ref(),
+            name,
             checker.source_type,
             &checker.settings.flake8_builtins.builtins_ignorelist,
             checker.settings.target_version,

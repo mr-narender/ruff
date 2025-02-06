@@ -97,8 +97,8 @@ pub(crate) fn replaceable_by_pathlib(checker: &mut Checker, call: &ExprCall) {
             // PTH205
             ["os", "path", "getctime"] => Some(OsPathGetctime.into()),
             // PTH123
-            ["" | "builtin", "open"] => {
-                // `closefd` and `openener` are not supported by pathlib, so check if they are
+            ["" | "builtins", "open"] => {
+                // `closefd` and `opener` are not supported by pathlib, so check if they are
                 // are set to non-default values.
                 // https://github.com/astral-sh/ruff/issues/7620
                 // Signature as of Python 3.11 (https://docs.python.org/3/library/functions.html#open):
@@ -115,7 +115,7 @@ pub(crate) fn replaceable_by_pathlib(checker: &mut Checker, call: &ExprCall) {
                 // ```
                 if call
                     .arguments
-                    .find_argument("closefd", 6)
+                    .find_argument_value("closefd", 6)
                     .is_some_and(|expr| {
                         !matches!(
                             expr,
@@ -124,7 +124,7 @@ pub(crate) fn replaceable_by_pathlib(checker: &mut Checker, call: &ExprCall) {
                     })
                     || call
                         .arguments
-                        .find_argument("opener", 7)
+                        .find_argument_value("opener", 7)
                         .is_some_and(|expr| !expr.is_none_literal_expr())
                     || call
                         .arguments

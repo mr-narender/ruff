@@ -67,6 +67,7 @@ mod tests {
     // so we want to make sure their fixes are not going around in circles.
     #[test_case(Rule::UnquotedTypeAlias, Path::new("TC007.py"))]
     #[test_case(Rule::QuotedTypeAlias, Path::new("TC008.py"))]
+    #[test_case(Rule::QuotedTypeAlias, Path::new("TC008_typing_execution_context.py"))]
     fn type_alias_rules(rule_code: Rule, path: &Path) -> Result<()> {
         let snapshot = format!("{}_{}", rule_code.as_ref(), path.to_string_lossy());
         let diagnostics = test_path(
@@ -75,6 +76,24 @@ mod tests {
                 Rule::UnquotedTypeAlias,
                 Rule::QuotedTypeAlias,
             ]),
+        )?;
+        assert_messages!(snapshot, diagnostics);
+        Ok(())
+    }
+
+    #[test_case(Rule::QuotedTypeAlias, Path::new("TC008_union_syntax_pre_py310.py"))]
+    fn type_alias_rules_pre_py310(rule_code: Rule, path: &Path) -> Result<()> {
+        let snapshot = format!(
+            "pre_py310_{}_{}",
+            rule_code.as_ref(),
+            path.to_string_lossy()
+        );
+        let diagnostics = test_path(
+            Path::new("flake8_type_checking").join(path).as_path(),
+            &settings::LinterSettings {
+                target_version: settings::types::PythonVersion::Py39,
+                ..settings::LinterSettings::for_rule(rule_code)
+            },
         )?;
         assert_messages!(snapshot, diagnostics);
         Ok(())
@@ -250,6 +269,33 @@ mod tests {
             &settings::LinterSettings {
                 flake8_type_checking: super::settings::Settings {
                     runtime_required_base_classes: vec!["module.direct.MyBaseClass".to_string()],
+                    ..Default::default()
+                },
+                ..settings::LinterSettings::for_rule(rule_code)
+            },
+        )?;
+        assert_messages!(snapshot, diagnostics);
+        Ok(())
+    }
+
+    #[test_case(Rule::RuntimeImportInTypeCheckingBlock, Path::new("module/app.py"))]
+    #[test_case(Rule::TypingOnlyStandardLibraryImport, Path::new("module/routes.py"))]
+    fn decorator_same_file(rule_code: Rule, path: &Path) -> Result<()> {
+        let snapshot = format!("{}_{}", rule_code.as_ref(), path.to_string_lossy());
+        let diagnostics = test_path(
+            Path::new("flake8_type_checking").join(path).as_path(),
+            &settings::LinterSettings {
+                flake8_type_checking: super::settings::Settings {
+                    runtime_required_decorators: vec![
+                        "fastapi.FastAPI.get".to_string(),
+                        "fastapi.FastAPI.put".to_string(),
+                        "module.app.AppContainer.app.get".to_string(),
+                        "module.app.AppContainer.app.put".to_string(),
+                        "module.app.app.get".to_string(),
+                        "module.app.app.put".to_string(),
+                        "module.app.app_container.app.get".to_string(),
+                        "module.app.app_container.app.put".to_string(),
+                    ],
                     ..Default::default()
                 },
                 ..settings::LinterSettings::for_rule(rule_code)
@@ -475,6 +521,43 @@ mod tests {
         let diagnostics = test_snippet(
             contents,
             &settings::LinterSettings::for_rules(Linter::Flake8TypeChecking.rules()),
+        );
+        assert_messages!(snapshot, diagnostics);
+    }
+
+    #[test_case(
+        r"
+        from __future__ import annotations
+
+        TYPE_CHECKING = False
+        if TYPE_CHECKING:
+            from types import TracebackType
+
+        def foo(tb: TracebackType): ...
+    ",
+        "github_issue_15681_regression_test"
+    )]
+    #[test_case(
+        r"
+        from __future__ import annotations
+
+        import pathlib  # TC003
+
+        TYPE_CHECKING = False
+        if TYPE_CHECKING:
+            from types import TracebackType
+
+        def foo(tb: TracebackType) -> pathlib.Path: ...
+    ",
+        "github_issue_15681_fix_test"
+    )]
+    fn contents_preview(contents: &str, snapshot: &str) {
+        let diagnostics = test_snippet(
+            contents,
+            &settings::LinterSettings {
+                preview: settings::types::PreviewMode::Enabled,
+                ..settings::LinterSettings::for_rules(Linter::Flake8TypeChecking.rules())
+            },
         );
         assert_messages!(snapshot, diagnostics);
     }
