@@ -43,7 +43,7 @@ impl Violation for InvalidEnvvarDefault {
 }
 
 /// PLW1508
-pub(crate) fn invalid_envvar_default(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn invalid_envvar_default(checker: &Checker, call: &ast::ExprCall) {
     if !checker.semantic().seen_module(Modules::OS) {
         return;
     }
@@ -63,7 +63,7 @@ pub(crate) fn invalid_envvar_default(checker: &mut Checker, call: &ast::ExprCall
         })
     {
         // Find the `default` argument, if it exists.
-        let Some(expr) = call.arguments.find_argument("default", 1) else {
+        let Some(expr) = call.arguments.find_argument_value("default", 1) else {
             return;
         };
 
@@ -74,8 +74,6 @@ pub(crate) fn invalid_envvar_default(checker: &mut Checker, call: &ast::ExprCall
         ) {
             return;
         }
-        checker
-            .diagnostics
-            .push(Diagnostic::new(InvalidEnvvarDefault, expr.range()));
+        checker.report_diagnostic(Diagnostic::new(InvalidEnvvarDefault, expr.range()));
     }
 }

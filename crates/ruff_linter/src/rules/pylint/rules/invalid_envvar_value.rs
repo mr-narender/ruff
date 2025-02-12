@@ -36,7 +36,7 @@ impl Violation for InvalidEnvvarValue {
 }
 
 /// PLE1507
-pub(crate) fn invalid_envvar_value(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn invalid_envvar_value(checker: &Checker, call: &ast::ExprCall) {
     if !checker.semantic().seen_module(Modules::OS) {
         return;
     }
@@ -47,7 +47,7 @@ pub(crate) fn invalid_envvar_value(checker: &mut Checker, call: &ast::ExprCall) 
         .is_some_and(|qualified_name| matches!(qualified_name.segments(), ["os", "getenv"]))
     {
         // Find the `key` argument, if it exists.
-        let Some(expr) = call.arguments.find_argument("key", 0) else {
+        let Some(expr) = call.arguments.find_argument_value("key", 0) else {
             return;
         };
 
@@ -58,8 +58,6 @@ pub(crate) fn invalid_envvar_value(checker: &mut Checker, call: &ast::ExprCall) 
             return;
         }
 
-        checker
-            .diagnostics
-            .push(Diagnostic::new(InvalidEnvvarValue, expr.range()));
+        checker.report_diagnostic(Diagnostic::new(InvalidEnvvarValue, expr.range()));
     }
 }

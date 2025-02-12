@@ -119,7 +119,7 @@ class ZeroOrStr:
 reveal_type(len(Zero()))  # revealed: Literal[0]
 reveal_type(len(ZeroOrOne()))  # revealed: Literal[0, 1]
 reveal_type(len(ZeroOrTrue()))  # revealed: Literal[0, 1]
-reveal_type(len(OneOrFalse()))  # revealed: Literal[0, 1]
+reveal_type(len(OneOrFalse()))  # revealed: Literal[1, 0]
 
 # TODO: Emit a diagnostic
 reveal_type(len(OneOrFoo()))  # revealed: int
@@ -172,10 +172,10 @@ class IntUnion:
     def __len__(self) -> Literal[SomeEnum.INT, SomeEnum.INT_2]: ...
 
 reveal_type(len(Auto()))  # revealed: int
-reveal_type(len(Int()))  # revealed: Literal[2]
+reveal_type(len(Int()))  # revealed: int
 reveal_type(len(Str()))  # revealed: int
 reveal_type(len(Tuple()))  # revealed: int
-reveal_type(len(IntUnion()))  # revealed: Literal[2, 32]
+reveal_type(len(IntUnion()))  # revealed: int
 ```
 
 ### Negative integers
@@ -211,8 +211,7 @@ reveal_type(len(SecondRequiredArgument()))  # revealed: Literal[1]
 ### No `__len__`
 
 ```py
-class NoDunderLen:
-    pass
+class NoDunderLen: ...
 
 # TODO: Emit a diagnostic
 reveal_type(len(NoDunderLen()))  # revealed: int

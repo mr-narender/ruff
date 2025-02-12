@@ -3,7 +3,7 @@ use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast::helpers::ReturnStatementVisitor;
 use ruff_python_ast::identifier::Identifier;
 use ruff_python_ast::visitor::Visitor;
-use ruff_python_ast::{self as ast, Expr, ParameterWithDefault, Stmt};
+use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_semantic::analyze::visibility;
 use ruff_python_semantic::Definition;
 use ruff_python_stdlib::typing::simple_magic_return_type;
@@ -33,6 +33,9 @@ use crate::rules::ruff::typing::type_hint_resolves_to_any;
 /// ```python
 /// def foo(x: int): ...
 /// ```
+///
+/// ## Options
+/// - `lint.flake8-annotations.suppress-dummy-args`
 #[derive(ViolationMetadata)]
 pub(crate) struct MissingTypeFunctionArgument {
     name: String,
@@ -65,6 +68,9 @@ impl Violation for MissingTypeFunctionArgument {
 /// ```python
 /// def foo(*args: int): ...
 /// ```
+///
+/// ## Options
+/// - `lint.flake8-annotations.suppress-dummy-args`
 #[derive(ViolationMetadata)]
 pub(crate) struct MissingTypeArgs {
     name: String,
@@ -97,6 +103,9 @@ impl Violation for MissingTypeArgs {
 /// ```python
 /// def foo(**kwargs: int): ...
 /// ```
+///
+/// ## Options
+/// - `lint.flake8-annotations.suppress-dummy-args`
 #[derive(ViolationMetadata)]
 pub(crate) struct MissingTypeKwargs {
     name: String,
@@ -510,7 +519,7 @@ fn check_dynamically_typed<F>(
 {
     if let Expr::StringLiteral(string_expr) = annotation {
         // Quoted annotations
-        if let Some(parsed_annotation) = checker.parse_type_annotation(string_expr) {
+        if let Ok(parsed_annotation) = checker.parse_type_annotation(string_expr) {
             if type_hint_resolves_to_any(
                 parsed_annotation.expression(),
                 checker,
@@ -604,21 +613,17 @@ pub(crate) fn definition(
     let is_overridden = visibility::is_override(decorator_list, checker.semantic());
 
     // If this is a non-static method, skip `cls` or `self`.
-    for ParameterWithDefault {
-        parameter,
-        default: _,
-        range: _,
-    } in parameters.iter_non_variadic_params().skip(usize::from(
+    for parameter in parameters.iter_non_variadic_params().skip(usize::from(
         is_method && !visibility::is_staticmethod(decorator_list, checker.semantic()),
     )) {
         // ANN401 for dynamically typed parameters
-        if let Some(annotation) = &parameter.annotation {
+        if let Some(annotation) = parameter.annotation() {
             has_any_typed_arg = true;
             if checker.enabled(Rule::AnyType) && !is_overridden {
                 check_dynamically_typed(
                     checker,
                     annotation,
-                    || parameter.name.to_string(),
+                    || parameter.name().to_string(),
                     &mut diagnostics,
                 );
             }
@@ -627,14 +632,14 @@ pub(crate) fn definition(
                 && checker
                     .settings
                     .dummy_variable_rgx
-                    .is_match(&parameter.name))
+                    .is_match(parameter.name()))
             {
                 if checker.enabled(Rule::MissingTypeFunctionArgument) {
                     diagnostics.push(Diagnostic::new(
                         MissingTypeFunctionArgument {
-                            name: parameter.name.to_string(),
+                            name: parameter.name().to_string(),
                         },
-                        parameter.range(),
+                        parameter.parameter.range(),
                     ));
                 }
             }
@@ -906,7 +911,7 @@ pub(crate) fn definition(
                 .posonlyargs
                 .first()
                 .or_else(|| parameters.args.first())
-                .is_some_and(|first_param| first_param.parameter.annotation.is_some()))
+                .is_some_and(|first_param| first_param.annotation().is_some()))
     {
         diagnostics
     } else {

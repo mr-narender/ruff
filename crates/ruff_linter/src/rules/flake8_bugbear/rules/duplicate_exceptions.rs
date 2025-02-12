@@ -42,13 +42,18 @@ use crate::registry::Rule;
 #[derive(ViolationMetadata)]
 pub(crate) struct DuplicateTryBlockException {
     name: String,
+    is_star: bool,
 }
 
 impl Violation for DuplicateTryBlockException {
     #[derive_message_formats]
     fn message(&self) -> String {
-        let DuplicateTryBlockException { name } = self;
-        format!("try-except block with duplicate exception `{name}`")
+        let DuplicateTryBlockException { name, is_star } = self;
+        if *is_star {
+            format!("try-except* block with duplicate exception `{name}`")
+        } else {
+            format!("try-except block with duplicate exception `{name}`")
+        }
     }
 }
 
@@ -115,7 +120,7 @@ fn type_pattern(elts: Vec<&Expr>) -> Expr {
 
 /// B014
 fn duplicate_handler_exceptions<'a>(
-    checker: &mut Checker,
+    checker: &Checker,
     expr: &'a Expr,
     elts: &'a [Expr],
 ) -> FxHashMap<UnqualifiedName<'a>, &'a Expr> {
@@ -162,7 +167,7 @@ fn duplicate_handler_exceptions<'a>(
                 },
                 expr.range(),
             )));
-            checker.diagnostics.push(diagnostic);
+            checker.report_diagnostic(diagnostic);
         }
     }
 
@@ -170,7 +175,7 @@ fn duplicate_handler_exceptions<'a>(
 }
 
 /// B025
-pub(crate) fn duplicate_exceptions(checker: &mut Checker, handlers: &[ExceptHandler]) {
+pub(crate) fn duplicate_exceptions(checker: &Checker, handlers: &[ExceptHandler]) {
     let mut seen: FxHashSet<UnqualifiedName> = FxHashSet::default();
     let mut duplicates: FxHashMap<UnqualifiedName, Vec<&Expr>> = FxHashMap::default();
     for handler in handlers {
@@ -207,9 +212,15 @@ pub(crate) fn duplicate_exceptions(checker: &mut Checker, handlers: &[ExceptHand
     if checker.enabled(Rule::DuplicateTryBlockException) {
         for (name, exprs) in duplicates {
             for expr in exprs {
-                checker.diagnostics.push(Diagnostic::new(
+                let is_star = checker
+                    .semantic()
+                    .current_statement()
+                    .as_try_stmt()
+                    .is_some_and(|try_stmt| try_stmt.is_star);
+                checker.report_diagnostic(Diagnostic::new(
                     DuplicateTryBlockException {
                         name: name.segments().join("."),
+                        is_star,
                     },
                     expr.range(),
                 ));

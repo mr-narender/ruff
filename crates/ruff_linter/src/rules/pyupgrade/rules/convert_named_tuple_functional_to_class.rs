@@ -1,6 +1,6 @@
 use log::debug;
 
-use ruff_diagnostics::{Diagnostic, Edit, Fix, FixAvailability, Violation};
+use ruff_diagnostics::{Applicability, Diagnostic, Edit, Fix, FixAvailability, Violation};
 use ruff_macros::{derive_message_formats, ViolationMetadata};
 use ruff_python_ast::helpers::is_dunder;
 use ruff_python_ast::name::Name;
@@ -8,6 +8,7 @@ use ruff_python_ast::{self as ast, Arguments, Expr, ExprContext, Identifier, Key
 use ruff_python_codegen::Generator;
 use ruff_python_semantic::SemanticModel;
 use ruff_python_stdlib::identifiers::is_identifier;
+use ruff_python_trivia::CommentRanges;
 use ruff_source_file::LineRanges;
 use ruff_text_size::{Ranged, TextRange};
 
@@ -41,6 +42,11 @@ use crate::checkers::ast::Checker;
 ///     b: str
 /// ```
 ///
+/// ## Fix safety
+/// This rule's fix is marked as unsafe if there are any comments within the
+/// range of the `NamedTuple` definition, as these will be dropped by the
+/// autofix.
+///
 /// ## References
 /// - [Python documentation: `typing.NamedTuple`](https://docs.python.org/3/library/typing.html#typing.NamedTuple)
 #[derive(ViolationMetadata)]
@@ -66,7 +72,7 @@ impl Violation for ConvertNamedTupleFunctionalToClass {
 
 /// UP014
 pub(crate) fn convert_named_tuple_functional_to_class(
-    checker: &mut Checker,
+    checker: &Checker,
     stmt: &Stmt,
     targets: &[Expr],
     value: &Expr,
@@ -121,9 +127,10 @@ pub(crate) fn convert_named_tuple_functional_to_class(
             fields,
             base_class,
             checker.generator(),
+            checker.comment_ranges(),
         ));
     }
-    checker.diagnostics.push(diagnostic);
+    checker.report_diagnostic(diagnostic);
 }
 
 /// Return the typename, args, keywords, and base class.
@@ -241,9 +248,17 @@ fn convert_to_class(
     body: Vec<Stmt>,
     base_class: &Expr,
     generator: Generator,
+    comment_ranges: &CommentRanges,
 ) -> Fix {
-    Fix::safe_edit(Edit::range_replacement(
-        generator.stmt(&create_class_def_stmt(typename, body, base_class)),
-        stmt.range(),
-    ))
+    Fix::applicable_edit(
+        Edit::range_replacement(
+            generator.stmt(&create_class_def_stmt(typename, body, base_class)),
+            stmt.range(),
+        ),
+        if comment_ranges.intersects(stmt.range()) {
+            Applicability::Unsafe
+        } else {
+            Applicability::Safe
+        },
+    )
 }

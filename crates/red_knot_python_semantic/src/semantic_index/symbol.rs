@@ -96,18 +96,16 @@ impl From<FileSymbolId> for ScopedSymbolId {
 
 /// Symbol ID that uniquely identifies a symbol inside a [`Scope`].
 #[newtype_index]
+#[derive(salsa::Update)]
 pub struct ScopedSymbolId;
 
 /// A cross-module identifier of a scope that can be used as a salsa query parameter.
 #[salsa::tracked]
 pub struct ScopeId<'db> {
-    #[id]
     pub file: File,
 
-    #[id]
     pub file_scope_id: FileScopeId,
 
-    #[no_eq]
     count: countme::Count<ScopeId<'static>>,
 }
 
@@ -119,6 +117,7 @@ impl<'db> ScopeId<'db> {
             self.node(db).scope_kind(),
             ScopeKind::Annotation
                 | ScopeKind::Function
+                | ScopeKind::Lambda
                 | ScopeKind::TypeAlias
                 | ScopeKind::Comprehension
         )
@@ -158,6 +157,7 @@ impl<'db> ScopeId<'db> {
 
 /// ID that uniquely identifies a scope inside of a module.
 #[newtype_index]
+#[derive(salsa::Update)]
 pub struct FileScopeId;
 
 impl FileScopeId {
@@ -176,7 +176,7 @@ impl FileScopeId {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, salsa::Update)]
 pub struct Scope {
     pub(super) parent: Option<FileScopeId>,
     pub(super) node: NodeWithScopeKind,
@@ -203,6 +203,7 @@ pub enum ScopeKind {
     Annotation,
     Class,
     Function,
+    Lambda,
     Comprehension,
     TypeAlias,
 }
@@ -214,7 +215,7 @@ impl ScopeKind {
 }
 
 /// Symbol table for a specific [`Scope`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, salsa::Update)]
 pub struct SymbolTable {
     /// The symbols in this scope.
     symbols: IndexVec<ScopedSymbolId, Symbol>,
@@ -422,7 +423,7 @@ impl NodeWithScopeRef<'_> {
 }
 
 /// Node that introduces a new scope.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, salsa::Update)]
 pub enum NodeWithScopeKind {
     Module,
     Class(AstNodeRef<ast::StmtClassDef>),
@@ -443,7 +444,8 @@ impl NodeWithScopeKind {
         match self {
             Self::Module => ScopeKind::Module,
             Self::Class(_) => ScopeKind::Class,
-            Self::Function(_) | Self::Lambda(_) => ScopeKind::Function,
+            Self::Function(_) => ScopeKind::Function,
+            Self::Lambda(_) => ScopeKind::Lambda,
             Self::FunctionTypeParameters(_)
             | Self::ClassTypeParameters(_)
             | Self::TypeAliasTypeParameters(_) => ScopeKind::Annotation,
@@ -463,16 +465,20 @@ impl NodeWithScopeKind {
     }
 
     pub fn expect_function(&self) -> &ast::StmtFunctionDef {
-        match self {
-            Self::Function(function) => function.node(),
-            _ => panic!("expected function"),
-        }
+        self.as_function().expect("expected function")
     }
 
     pub fn expect_type_alias(&self) -> &ast::StmtTypeAlias {
         match self {
             Self::TypeAlias(type_alias) => type_alias.node(),
             _ => panic!("expected type alias"),
+        }
+    }
+
+    pub const fn as_function(&self) -> Option<&ast::StmtFunctionDef> {
+        match self {
+            Self::Function(function) => Some(function.node()),
+            _ => None,
         }
     }
 }

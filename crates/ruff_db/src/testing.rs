@@ -18,7 +18,7 @@ pub fn assert_function_query_was_not_run<Db, Q, QDb, I, R>(
 
     db.attach(|_| {
         if let Some(will_execute_event) = will_execute_event {
-            panic!("Expected query {query_name}({id}) not to have run but it did: {will_execute_event:?}");
+            panic!("Expected query {query_name}({id}) not to have run but it did: {will_execute_event:?}\n\n{events:#?}");
         }
     });
 }
@@ -46,7 +46,7 @@ pub fn assert_const_function_query_was_not_run<Db, Q, QDb, R>(
     db.attach(|_| {
         if let Some(will_execute_event) = event {
             panic!(
-                "Expected query {query_name}() not to have run but it did: {will_execute_event:?}"
+                "Expected query {query_name}() not to have run but it did: {will_execute_event:?}\n\n{events:#?}"
             );
         }
     });
@@ -158,7 +158,7 @@ impl LoggingBuilder {
                         .parse()
                         .expect("Hardcoded directive to be valid"),
                 ),
-            hierarchical: true,
+            hierarchical: false,
         }
     }
 
@@ -167,7 +167,7 @@ impl LoggingBuilder {
 
         Some(Self {
             filter,
-            hierarchical: true,
+            hierarchical: false,
         })
     }
 

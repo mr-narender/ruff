@@ -52,9 +52,9 @@ use crate::registry::Rule;
 /// [PEP 8]: https://peps.python.org/pep-0008/#tabs-or-spaces
 /// [formatter]: https://docs.astral.sh/ruff/formatter
 #[derive(ViolationMetadata)]
-pub(crate) struct IndentWithSpaces;
+pub(crate) struct DocstringTabIndentation;
 
-impl Violation for IndentWithSpaces {
+impl Violation for DocstringTabIndentation {
     #[derive_message_formats]
     fn message(&self) -> String {
         "Docstring should be indented with spaces, not tabs".to_string()
@@ -166,7 +166,7 @@ impl AlwaysFixableViolation for OverIndentation {
 }
 
 /// D206, D207, D208
-pub(crate) fn indent(checker: &mut Checker, docstring: &Docstring) {
+pub(crate) fn indent(checker: &Checker, docstring: &Docstring) {
     let body = docstring.body();
 
     // Split the docstring into lines.
@@ -229,7 +229,7 @@ pub(crate) fn indent(checker: &mut Checker, docstring: &Docstring) {
                     clean_space(docstring.indentation),
                     TextRange::at(line.start(), line_indent.text_len()),
                 )));
-                checker.diagnostics.push(diagnostic);
+                checker.report_diagnostic(diagnostic);
             }
         }
 
@@ -264,11 +264,9 @@ pub(crate) fn indent(checker: &mut Checker, docstring: &Docstring) {
         current = lines.next();
     }
 
-    if checker.enabled(Rule::IndentWithSpaces) {
+    if checker.enabled(Rule::DocstringTabIndentation) {
         if has_seen_tab {
-            checker
-                .diagnostics
-                .push(Diagnostic::new(IndentWithSpaces, docstring.range()));
+            checker.report_diagnostic(Diagnostic::new(DocstringTabIndentation, docstring.range()));
         }
     }
 
@@ -312,7 +310,7 @@ pub(crate) fn indent(checker: &mut Checker, docstring: &Docstring) {
                     Edit::range_replacement(indent, range)
                 };
                 diagnostic.set_fix(Fix::safe_edit(edit));
-                checker.diagnostics.push(diagnostic);
+                checker.report_diagnostic(diagnostic);
             }
         }
 
@@ -334,7 +332,7 @@ pub(crate) fn indent(checker: &mut Checker, docstring: &Docstring) {
                     Edit::range_replacement(indent, range)
                 };
                 diagnostic.set_fix(Fix::safe_edit(edit));
-                checker.diagnostics.push(diagnostic);
+                checker.report_diagnostic(diagnostic);
             }
         }
     }

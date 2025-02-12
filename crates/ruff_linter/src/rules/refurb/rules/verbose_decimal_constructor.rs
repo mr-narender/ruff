@@ -57,7 +57,7 @@ impl Violation for VerboseDecimalConstructor {
 }
 
 /// FURB157
-pub(crate) fn verbose_decimal_constructor(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn verbose_decimal_constructor(checker: &Checker, call: &ast::ExprCall) {
     if !checker
         .semantic()
         .resolve_qualified_name(&call.func)
@@ -67,7 +67,7 @@ pub(crate) fn verbose_decimal_constructor(checker: &mut Checker, call: &ast::Exp
     }
 
     // Decimal accepts arguments of the form: `Decimal(value='0', context=None)`
-    let Some(value) = call.arguments.find_argument("value", 0) else {
+    let Some(value) = call.arguments.find_argument_value("value", 0) else {
         return;
     };
 
@@ -199,7 +199,7 @@ pub(crate) fn verbose_decimal_constructor(checker: &mut Checker, call: &ast::Exp
         }
     };
 
-    checker.diagnostics.push(diagnostic);
+    checker.report_diagnostic(diagnostic);
 }
 
 // ```console

@@ -17,7 +17,7 @@ use crate::fix::edits::add_argument;
 /// iterable. This can lead to subtle bugs.
 ///
 /// Pass `strict=True` to raise a `ValueError` if the iterables are of
-/// non-uniform length. Alternatively, if the iterables are deliberately
+/// non-uniform length. Alternatively, if the iterables are deliberately of
 /// different lengths, pass `strict=False` to make the intention explicit.
 ///
 /// ## Example
@@ -52,7 +52,7 @@ impl AlwaysFixableViolation for ZipWithoutExplicitStrict {
 }
 
 /// B905
-pub(crate) fn zip_without_explicit_strict(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn zip_without_explicit_strict(checker: &Checker, call: &ast::ExprCall) {
     let semantic = checker.semantic();
 
     if semantic.match_builtin_expr(&call.func, "zip")
@@ -61,9 +61,9 @@ pub(crate) fn zip_without_explicit_strict(checker: &mut Checker, call: &ast::Exp
             .arguments
             .args
             .iter()
-            .any(|arg| is_infinite_iterator(arg, semantic))
+            .any(|arg| is_infinite_iterable(arg, semantic))
     {
-        checker.diagnostics.push(
+        checker.report_diagnostic(
             Diagnostic::new(ZipWithoutExplicitStrict, call.range()).with_fix(Fix::applicable_edit(
                 add_argument(
                     "strict=False",
@@ -89,7 +89,7 @@ pub(crate) fn zip_without_explicit_strict(checker: &mut Checker, call: &ast::Exp
 
 /// Return `true` if the [`Expr`] appears to be an infinite iterator (e.g., a call to
 /// `itertools.cycle` or similar).
-fn is_infinite_iterator(arg: &Expr, semantic: &SemanticModel) -> bool {
+pub(crate) fn is_infinite_iterable(arg: &Expr, semantic: &SemanticModel) -> bool {
     let Expr::Call(ast::ExprCall {
         func,
         arguments: Arguments { args, keywords, .. },

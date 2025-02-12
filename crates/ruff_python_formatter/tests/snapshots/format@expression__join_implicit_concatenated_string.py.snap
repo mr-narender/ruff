@@ -61,7 +61,7 @@ b"aaaaaaaaa" b"bbbbbbbbbbbbbbbbbbbb" # Join
 # F-strings
 ##############################################################################
 
-# Escape `{` and `}` when marging an f-string with a string
+# Escape `{` and `}` when merging an f-string with a string
 "a {not_a_variable}" f"b {10}" "c"
 
 # Join, and break expressions
@@ -102,7 +102,7 @@ f"{f'''test ' '''}" f'{f"""other " """}'
 f"{10 + len('bar')=}" f"{10 + len('bar')=}"
 f"{10 + len('bar')=}" f'no debug{10}' f"{10 + len('bar')=}"
 
-# We can't savely merge this pre Python 3.12 without altering the debug expression.
+# We can't safely merge this pre Python 3.12 without altering the debug expression.
 f"{10 + len('bar')=}" f'{10 + len("bar")=}'
 
 
@@ -265,7 +265,7 @@ def short_docstring():
     "Implicit" "concatenated" "docstring"
 
 def long_docstring():
-    "Loooooooooooooooooooooong" "doooooooooooooooooooocstriiiiiiiiiiiiiiiiiiiiiiiiiiiiiiing" "exceding the line width" "but it should be concatenated anyways because it is single line"
+    "Loooooooooooooooooooooong" "doooooooooooooooooooocstriiiiiiiiiiiiiiiiiiiiiiiiiiiiiiing" "exceeding the line width" "but it should be concatenated anyways because it is single line"
 
 def docstring_with_leading_whitespace():
     "    This is a " "implicit" "concatenated" "docstring"
@@ -355,22 +355,7 @@ f"aaaaaaaaaaaaaaaa \
 )
 ```
 
-## Outputs
-### Output 1
-```
-indent-style               = space
-line-width                 = 88
-indent-width               = 4
-quote-style                = Double
-line-ending                = LineFeed
-magic-trailing-comma       = Respect
-docstring-code             = Disabled
-docstring-code-line-width  = "dynamic"
-preview                    = Enabled
-target_version             = Py39
-source_type                = Python
-```
-
+## Output
 ```python
 "aaaaaaaaabbbbbbbbbbbbbbbbbbbb"  # Join
 
@@ -427,7 +412,7 @@ b"aaaaaaaaabbbbbbbbbbbbbbbbbbbb"  # Join
 # F-strings
 ##############################################################################
 
-# Escape `{` and `}` when marging an f-string with a string
+# Escape `{` and `}` when merging an f-string with a string
 f"a {{not_a_variable}}b {10}c"
 
 # Join, and break expressions
@@ -463,7 +448,7 @@ f"{f'''test ' '''}" f'{f"""other " """}'
 f"{10 + len('bar')=}{10 + len('bar')=}"
 f"{10 + len('bar')=}no debug{10}{10 + len('bar')=}"
 
-# We can't savely merge this pre Python 3.12 without altering the debug expression.
+# We can't safely merge this pre Python 3.12 without altering the debug expression.
 f"{10 + len('bar')=}" f'{10 + len("bar")=}'
 
 
@@ -616,12 +601,9 @@ assert (
 ##############################################################################
 # Use can_omit_optional_parentheses layout to avoid an instability where the formatter
 # picks the can_omit_optional_parentheses layout when the strings are joined.
-if f"implicitconcatenatedstring" + f"implicitconcadddddddddddedring" * len([
-    aaaaaa,
-    bbbbbbbbbbbbbbbb,
-    cccccccccccccccccc,
-    ddddddddddddddddddddddddddd,
-]):
+if f"implicitconcatenatedstring" + f"implicitconcadddddddddddedring" * len(
+    [aaaaaa, bbbbbbbbbbbbbbbb, cccccccccccccccccc, ddddddddddddddddddddddddddd]
+):
     pass
 
 # Keep parenthesizing multiline - implicit concatenated strings
@@ -690,7 +672,7 @@ def short_docstring():
 
 
 def long_docstring():
-    "Loooooooooooooooooooooongdoooooooooooooooooooocstriiiiiiiiiiiiiiiiiiiiiiiiiiiiiiingexceding the line widthbut it should be concatenated anyways because it is single line"
+    "Loooooooooooooooooooooongdoooooooooooooooooooocstriiiiiiiiiiiiiiiiiiiiiiiiiiiiiiingexceeding the line widthbut it should be concatenated anyways because it is single line"
 
 
 def docstring_with_leading_whitespace():
@@ -791,4 +773,27 @@ f"aaaaaaaaaaaaaaaa \
     "cccccccccccccc \
             ddddddddddddddddddd"  # comment 4
 )
+```
+
+
+## Preview changes
+```diff
+--- Stable
++++ Preview
+@@ -242,9 +242,12 @@
+ ##############################################################################
+ # Use can_omit_optional_parentheses layout to avoid an instability where the formatter
+ # picks the can_omit_optional_parentheses layout when the strings are joined.
+-if f"implicitconcatenatedstring" + f"implicitconcadddddddddddedring" * len(
+-    [aaaaaa, bbbbbbbbbbbbbbbb, cccccccccccccccccc, ddddddddddddddddddddddddddd]
+-):
++if f"implicitconcatenatedstring" + f"implicitconcadddddddddddedring" * len([
++    aaaaaa,
++    bbbbbbbbbbbbbbbb,
++    cccccccccccccccccc,
++    ddddddddddddddddddddddddddd,
++]):
+     pass
+ 
+ # Keep parenthesizing multiline - implicit concatenated strings
 ```

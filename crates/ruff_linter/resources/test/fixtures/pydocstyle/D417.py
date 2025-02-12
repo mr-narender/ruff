@@ -168,3 +168,53 @@ def select_data(
         database:
             Which database to connect to ("origin" or "destination").
     """
+
+def f(x, *args, **kwargs):
+    """Do something.
+
+    Args:
+        x: the value
+        *args: var-arguments
+    """
+    return x
+
+
+# regression test for https://github.com/astral-sh/ruff/issues/16007.
+# attributes is a section name without subsections, so it was failing the
+# previous workaround for Args: args: sections
+def send(payload: str, attributes: dict[str, Any]) -> None:
+    """
+    Send a message.
+
+    Args:
+        payload:
+            The message payload.
+
+        attributes:
+            Additional attributes to be sent alongside the message.
+    """
+
+
+# undocumented argument with the same name as a section
+def should_fail(payload, Args):
+    """
+    Send a message.
+
+    Args:
+        payload:
+            The message payload.
+    """
+
+
+# documented argument with the same name as a section
+def should_not_fail(payload, Args):
+    """
+    Send a message.
+
+    Args:
+        payload:
+            The message payload.
+
+        Args:
+            The other arguments.
+    """
