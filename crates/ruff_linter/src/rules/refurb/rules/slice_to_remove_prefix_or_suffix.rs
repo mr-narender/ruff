@@ -8,32 +8,34 @@ use crate::Locator;
 use crate::{checkers::ast::Checker, settings::types::PythonVersion};
 
 /// ## What it does
-/// Checks for the removal of a prefix or suffix from a string by assigning
-/// the string to a slice after checking `.startswith()` or `.endswith()`, respectively.
+/// Checks for code that could be written more idiomatically using
+/// [`str.removeprefix()`](https://docs.python.org/3/library/stdtypes.html#str.removeprefix)
+/// or [`str.removesuffix()`](https://docs.python.org/3/library/stdtypes.html#str.removesuffix).
+///
+/// Specifically, the rule flags code that conditionally removes a prefix or suffix
+/// using a slice operation following an `if` test that uses `str.startswith()` or `str.endswith()`.
+///
+/// The rule is only applied if your project targets Python 3.9 or later.
 ///
 /// ## Why is this bad?
-/// The methods [`str.removeprefix`](https://docs.python.org/3/library/stdtypes.html#str.removeprefix)
-/// and [`str.removesuffix`](https://docs.python.org/3/library/stdtypes.html#str.removesuffix),
-/// introduced in Python 3.9, have the same behavior
-/// and are more readable and efficient.
+/// The methods [`str.removeprefix()`](https://docs.python.org/3/library/stdtypes.html#str.removeprefix)
+/// and [`str.removesuffix()`](https://docs.python.org/3/library/stdtypes.html#str.removesuffix),
+/// introduced in Python 3.9, have the same behavior while being more readable and efficient.
 ///
 /// ## Example
 /// ```python
-/// filename[:-4] if filename.endswith(".txt") else filename
-/// ```
+/// def example(filename: str, text: str):
+///     filename = filename[:-4] if filename.endswith(".txt") else filename
 ///
-/// ```python
-/// if text.startswith("pre"):
-///     text = text[3:]
+///     if text.startswith("pre"):
+///         text = text[3:]
 /// ```
 ///
 /// Use instead:
 /// ```python
-/// filename = filename.removesuffix(".txt")
-/// ```
-///
-/// ```python
-/// text = text.removeprefix("pre")
+/// def example(filename: str, text: str):
+///     filename = filename.removesuffix(".txt")
+///     text = text.removeprefix("pre")
 /// ```
 #[derive(ViolationMetadata)]
 pub(crate) struct SliceToRemovePrefixOrSuffix {
@@ -46,10 +48,10 @@ impl AlwaysFixableViolation for SliceToRemovePrefixOrSuffix {
     fn message(&self) -> String {
         match self.affix_kind {
             AffixKind::StartsWith => {
-                "Prefer `removeprefix` over conditionally replacing with slice.".to_string()
+                "Prefer `str.removeprefix()` over conditionally replacing with slice.".to_string()
             }
             AffixKind::EndsWith => {
-                "Prefer `removesuffix` over conditionally replacing with slice.".to_string()
+                "Prefer `str.removesuffix()` over conditionally replacing with slice.".to_string()
             }
         }
     }
@@ -66,7 +68,7 @@ impl AlwaysFixableViolation for SliceToRemovePrefixOrSuffix {
 }
 
 /// FURB188
-pub(crate) fn slice_to_remove_affix_expr(checker: &mut Checker, if_expr: &ast::ExprIf) {
+pub(crate) fn slice_to_remove_affix_expr(checker: &Checker, if_expr: &ast::ExprIf) {
     if checker.settings.target_version < PythonVersion::Py39 {
         return;
     }
@@ -91,13 +93,13 @@ pub(crate) fn slice_to_remove_affix_expr(checker: &mut Checker, if_expr: &ast::E
                 if_expr.start(),
                 if_expr.end(),
             )));
-            checker.diagnostics.push(diagnostic);
+            checker.report_diagnostic(diagnostic);
         }
     }
 }
 
 /// FURB188
-pub(crate) fn slice_to_remove_affix_stmt(checker: &mut Checker, if_stmt: &ast::StmtIf) {
+pub(crate) fn slice_to_remove_affix_stmt(checker: &Checker, if_stmt: &ast::StmtIf) {
     if checker.settings.target_version < PythonVersion::Py39 {
         return;
     }
@@ -125,7 +127,7 @@ pub(crate) fn slice_to_remove_affix_stmt(checker: &mut Checker, if_stmt: &ast::S
                 if_stmt.start(),
                 if_stmt.end(),
             )));
-            checker.diagnostics.push(diagnostic);
+            checker.report_diagnostic(diagnostic);
         }
     }
 }

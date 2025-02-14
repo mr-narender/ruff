@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     edit::{NotebookRange, ToRangeExt},
-    resolve::is_document_excluded,
+    resolve::is_document_excluded_for_linting,
     session::DocumentQuery,
     PositionEncoding, DIAGNOSTIC_NAME,
 };
@@ -67,17 +67,15 @@ pub(crate) fn check(
     show_syntax_errors: bool,
 ) -> DiagnosticsMap {
     let source_kind = query.make_source_kind();
-    let file_resolver_settings = query.settings().file_resolver();
-    let linter_settings = query.settings().linter();
+    let settings = query.settings();
     let document_path = query.file_path();
 
     // If the document is excluded, return an empty list of diagnostics.
     let package = if let Some(document_path) = document_path.as_ref() {
-        if is_document_excluded(
+        if is_document_excluded_for_linting(
             document_path,
-            file_resolver_settings,
-            Some(linter_settings),
-            None,
+            &settings.file_resolver,
+            &settings.linter,
             query.text_document_language_id(),
         ) {
             return DiagnosticsMap::default();
@@ -87,7 +85,7 @@ pub(crate) fn check(
             document_path
                 .parent()
                 .expect("a path to a document should have a parent path"),
-            &linter_settings.namespace_packages,
+            &settings.linter.namespace_packages,
         )
         .map(PackageRoot::root)
     } else {
@@ -119,7 +117,7 @@ pub(crate) fn check(
         &stylist,
         &indexer,
         &directives,
-        linter_settings,
+        &settings.linter,
         flags::Noqa::Enabled,
         &source_kind,
         source_type,
@@ -131,7 +129,7 @@ pub(crate) fn check(
         &diagnostics,
         &locator,
         indexer.comment_ranges(),
-        &linter_settings.external,
+        &settings.linter.external,
         &directives.noqa_line_for,
         stylist.line_ending(),
     );
@@ -206,6 +204,7 @@ pub(crate) fn fixes_for_diagnostics(
 ) -> crate::Result<Vec<DiagnosticFix>> {
     diagnostics
         .into_iter()
+        .filter(|diagnostic| diagnostic.source.as_deref() == Some(DIAGNOSTIC_NAME))
         .map(move |mut diagnostic| {
             let Some(data) = diagnostic.data.take() else {
                 return Ok(None);

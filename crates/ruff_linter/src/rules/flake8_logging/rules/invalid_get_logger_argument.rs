@@ -57,12 +57,13 @@ impl Violation for InvalidGetLoggerArgument {
 }
 
 /// LOG002
-pub(crate) fn invalid_get_logger_argument(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn invalid_get_logger_argument(checker: &Checker, call: &ast::ExprCall) {
     if !checker.semantic().seen_module(Modules::LOGGING) {
         return;
     }
 
-    let Some(Expr::Name(expr @ ast::ExprName { id, .. })) = call.arguments.find_argument("name", 0)
+    let Some(Expr::Name(expr @ ast::ExprName { id, .. })) =
+        call.arguments.find_argument_value("name", 0)
     else {
         return;
     };
@@ -90,5 +91,5 @@ pub(crate) fn invalid_get_logger_argument(checker: &mut Checker, call: &ast::Exp
             expr.range(),
         )));
     }
-    checker.diagnostics.push(diagnostic);
+    checker.report_diagnostic(diagnostic);
 }

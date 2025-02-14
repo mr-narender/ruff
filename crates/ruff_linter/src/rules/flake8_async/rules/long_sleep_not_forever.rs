@@ -56,7 +56,7 @@ impl Violation for LongSleepNotForever {
 }
 
 /// ASYNC116
-pub(crate) fn long_sleep_not_forever(checker: &mut Checker, call: &ExprCall) {
+pub(crate) fn long_sleep_not_forever(checker: &Checker, call: &ExprCall) {
     if !(checker.semantic().seen_module(Modules::TRIO)
         || checker.semantic().seen_module(Modules::ANYIO))
     {
@@ -67,7 +67,7 @@ pub(crate) fn long_sleep_not_forever(checker: &mut Checker, call: &ExprCall) {
         return;
     }
 
-    let Some(arg) = call.arguments.find_argument("seconds", 0) else {
+    let Some(arg) = call.arguments.find_argument_value("seconds", 0) else {
         return;
     };
 
@@ -127,5 +127,5 @@ pub(crate) fn long_sleep_not_forever(checker: &mut Checker, call: &ExprCall) {
         let arg_edit = Edit::range_replacement("()".to_string(), call.arguments.range());
         Ok(Fix::unsafe_edits(import_edit, [reference_edit, arg_edit]))
     });
-    checker.diagnostics.push(diagnostic);
+    checker.report_diagnostic(diagnostic);
 }

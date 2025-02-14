@@ -8,6 +8,7 @@ use crate::{nodes, Expr};
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "cache", derive(ruff_macros::CacheKey))]
+#[cfg_attr(feature = "salsa", derive(salsa::Update))]
 pub struct Name(compact_str::CompactString);
 
 impl Name {
@@ -275,6 +276,14 @@ impl<'a> QualifiedName<'a> {
     pub fn append_member(self, member: &'a str) -> Self {
         let mut inner = self.0;
         inner.push(member);
+        Self(inner)
+    }
+
+    /// Extends the qualified name using the given members.
+    #[must_use]
+    pub fn extend_members<T: IntoIterator<Item = &'a str>>(self, members: T) -> Self {
+        let mut inner = self.0;
+        inner.extend(members);
         Self(inner)
     }
 }

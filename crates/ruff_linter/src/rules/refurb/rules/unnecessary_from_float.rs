@@ -59,7 +59,7 @@ impl Violation for UnnecessaryFromFloat {
 }
 
 /// FURB164
-pub(crate) fn unnecessary_from_float(checker: &mut Checker, call: &ExprCall) {
+pub(crate) fn unnecessary_from_float(checker: &Checker, call: &ExprCall) {
     let Expr::Attribute(ast::ExprAttribute { value, attr, .. }) = &*call.func else {
         return;
     };
@@ -115,8 +115,8 @@ pub(crate) fn unnecessary_from_float(checker: &mut Checker, call: &ExprCall) {
         };
 
         let Some(value) = (match method_name {
-            MethodName::FromFloat => call.arguments.find_argument("f", 0),
-            MethodName::FromDecimal => call.arguments.find_argument("dec", 0),
+            MethodName::FromFloat => call.arguments.find_argument_value("f", 0),
+            MethodName::FromDecimal => call.arguments.find_argument_value("dec", 0),
         }) else {
             return;
         };
@@ -157,13 +157,13 @@ pub(crate) fn unnecessary_from_float(checker: &mut Checker, call: &ExprCall) {
             edit,
             [Edit::range_replacement(replacement, call.range())],
         ));
-        checker.diagnostics.push(diagnostic);
+        checker.report_diagnostic(diagnostic);
 
         return;
     }
 
     diagnostic.set_fix(Fix::safe_edit(edit));
-    checker.diagnostics.push(diagnostic);
+    checker.report_diagnostic(diagnostic);
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

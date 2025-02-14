@@ -29,7 +29,7 @@ completing. The type of `x` at the beginning of the `except` suite in this examp
 `x = could_raise_returns_str()` redefinition, but we *also* could have jumped to the `except` suite
 *after* that redefinition.
 
-```py path=union_type_inferred.py
+```py
 def could_raise_returns_str() -> str:
     return "foo"
 
@@ -50,10 +50,7 @@ reveal_type(x)  # revealed: str | Literal[2]
 If `x` has the same type at the end of both branches, however, the branches unify and `x` is not
 inferred as having a union type following the `try`/`except` block:
 
-```py path=branches_unify_to_non_union_type.py
-def could_raise_returns_str() -> str:
-    return "foo"
-
+```py
 x = 1
 
 try:
@@ -133,7 +130,7 @@ the `except` suite:
 - At the end of `else`, `x == 3`
 - At the end of `except`, `x == 2`
 
-```py path=single_except.py
+```py
 def could_raise_returns_str() -> str:
     return "foo"
 
@@ -161,9 +158,6 @@ been executed in its entirety, or the `try` suite and the `else` suite must both
 in their entireties:
 
 ```py
-def could_raise_returns_str() -> str:
-    return "foo"
-
 x = 1
 
 try:
@@ -192,7 +186,7 @@ A `finally` suite is *always* executed. As such, if we reach the `reveal_type` c
 this example, we know that `x` *must* have been reassigned to `2` during the `finally` suite. The
 type of `x` at the end of the example is therefore `Literal[2]`:
 
-```py path=redef_in_finally.py
+```py
 def could_raise_returns_str() -> str:
     return "foo"
 
@@ -217,10 +211,7 @@ at this point than there were when we were inside the `finally` block.
 (Our current model does *not* correctly infer the types *inside* `finally` suites, however; this is
 still a TODO item for us.)
 
-```py path=no_redef_in_finally.py
-def could_raise_returns_str() -> str:
-    return "foo"
-
+```py
 x = 1
 
 try:
@@ -249,7 +240,7 @@ suites:
     exception raised in the `except` suite to cause us to jump to the `finally` suite before the
     `except` suite ran to completion
 
-```py path=redef_in_finally.py
+```py
 def could_raise_returns_str() -> str:
     return "foo"
 
@@ -286,16 +277,7 @@ itself. (In some control-flow possibilities, some exceptions were merely *suspen
 `finally` suite; these lead to the scope's termination following the conclusion of the `finally`
 suite.)
 
-```py path=no_redef_in_finally.py
-def could_raise_returns_str() -> str:
-    return "foo"
-
-def could_raise_returns_bytes() -> bytes:
-    return b"foo"
-
-def could_raise_returns_bool() -> bool:
-    return True
-
+```py
 x = 1
 
 try:
@@ -317,21 +299,12 @@ reveal_type(x)  # revealed: str | bool
 
 An example with multiple `except` branches and a `finally` branch:
 
-```py path=multiple_except_branches.py
-def could_raise_returns_str() -> str:
-    return "foo"
-
-def could_raise_returns_bytes() -> bytes:
-    return b"foo"
-
-def could_raise_returns_bool() -> bool:
-    return True
-
+```py
 def could_raise_returns_memoryview() -> memoryview:
     return memoryview(b"")
 
-def could_raise_returns_float() -> float:
-    return 3.14
+def could_raise_returns_bytearray() -> bytearray:
+    return bytearray()
 
 x = 1
 
@@ -349,13 +322,13 @@ except ValueError:
     reveal_type(x)  # revealed: Literal[1] | str
     x = could_raise_returns_memoryview()
     reveal_type(x)  # revealed: memoryview
-    x = could_raise_returns_float()
-    reveal_type(x)  # revealed: float
+    x = could_raise_returns_bytearray()
+    reveal_type(x)  # revealed: bytearray
 finally:
-    # TODO: should be `Literal[1] | str | bytes | bool | memoryview | float`
-    reveal_type(x)  # revealed: str | bool | float
+    # TODO: should be `Literal[1] | str | bytes | bool | memoryview | bytearray`
+    reveal_type(x)  # revealed: str | bool | bytearray
 
-reveal_type(x)  # revealed: str | bool | float
+reveal_type(x)  # revealed: str | bool | bytearray
 ```
 
 ## Combining `except`, `else` and `finally` branches
@@ -364,7 +337,7 @@ If the exception handler has an `else` branch, we must also take into account th
 control flow could have jumped to the `finally` suite from partway through the `else` suite due to
 an exception raised *there*.
 
-```py path=single_except_branch.py
+```py
 def could_raise_returns_str() -> str:
     return "foo"
 
@@ -377,8 +350,8 @@ def could_raise_returns_bool() -> bool:
 def could_raise_returns_memoryview() -> memoryview:
     return memoryview(b"")
 
-def could_raise_returns_float() -> float:
-    return 3.14
+def could_raise_returns_bytearray() -> bytearray:
+    return bytearray()
 
 x = 1
 
@@ -396,33 +369,18 @@ else:
     reveal_type(x)  # revealed: str
     x = could_raise_returns_memoryview()
     reveal_type(x)  # revealed: memoryview
-    x = could_raise_returns_float()
-    reveal_type(x)  # revealed: float
+    x = could_raise_returns_bytearray()
+    reveal_type(x)  # revealed: bytearray
 finally:
-    # TODO: should be `Literal[1] | str | bytes | bool | memoryview | float`
-    reveal_type(x)  # revealed: bool | float
+    # TODO: should be `Literal[1] | str | bytes | bool | memoryview | bytearray`
+    reveal_type(x)  # revealed: bool | bytearray
 
-reveal_type(x)  # revealed: bool | float
+reveal_type(x)  # revealed: bool | bytearray
 ```
 
 The same again, this time with multiple `except` branches:
 
-```py path=multiple_except_branches.py
-def could_raise_returns_str() -> str:
-    return "foo"
-
-def could_raise_returns_bytes() -> bytes:
-    return b"foo"
-
-def could_raise_returns_bool() -> bool:
-    return True
-
-def could_raise_returns_memoryview() -> memoryview:
-    return memoryview(b"")
-
-def could_raise_returns_float() -> float:
-    return 3.14
-
+```py
 def could_raise_returns_range() -> range:
     return range(42)
 
@@ -445,8 +403,8 @@ except ValueError:
     reveal_type(x)  # revealed: Literal[1] | str
     x = could_raise_returns_memoryview()
     reveal_type(x)  # revealed: memoryview
-    x = could_raise_returns_float()
-    reveal_type(x)  # revealed: float
+    x = could_raise_returns_bytearray()
+    reveal_type(x)  # revealed: bytearray
 else:
     reveal_type(x)  # revealed: str
     x = could_raise_returns_range()
@@ -454,10 +412,10 @@ else:
     x = could_raise_returns_slice()
     reveal_type(x)  # revealed: slice
 finally:
-    # TODO: should be `Literal[1] | str | bytes | bool | memoryview | float | range | slice`
-    reveal_type(x)  # revealed: bool | float | slice
+    # TODO: should be `Literal[1] | str | bytes | bool | memoryview | bytearray | range | slice`
+    reveal_type(x)  # revealed: bool | bytearray | slice
 
-reveal_type(x)  # revealed: bool | float | slice
+reveal_type(x)  # revealed: bool | bytearray | slice
 ```
 
 ## Nested `try`/`except` blocks
@@ -483,8 +441,8 @@ def could_raise_returns_bool() -> bool:
 def could_raise_returns_memoryview() -> memoryview:
     return memoryview(b"")
 
-def could_raise_returns_float() -> float:
-    return 3.14
+def could_raise_returns_property() -> property:
+    return property()
 
 def could_raise_returns_range() -> range:
     return range(42)
@@ -492,8 +450,8 @@ def could_raise_returns_range() -> range:
 def could_raise_returns_slice() -> slice:
     return slice(None)
 
-def could_raise_returns_complex() -> complex:
-    return 3j
+def could_raise_returns_super() -> super:
+    return super()
 
 def could_raise_returns_bytearray() -> bytearray:
     return bytearray()
@@ -524,8 +482,8 @@ try:
         reveal_type(x)  # revealed: Literal[1] | str
         x = could_raise_returns_memoryview()
         reveal_type(x)  # revealed: memoryview
-        x = could_raise_returns_float()
-        reveal_type(x)  # revealed: float
+        x = could_raise_returns_property()
+        reveal_type(x)  # revealed: property
     else:
         reveal_type(x)  # revealed: str
         x = could_raise_returns_range()
@@ -533,15 +491,15 @@ try:
         x = could_raise_returns_slice()
         reveal_type(x)  # revealed: slice
     finally:
-        # TODO: should be `Literal[1] | str | bytes | bool | memoryview | float | range | slice`
-        reveal_type(x)  # revealed: bool | float | slice
+        # TODO: should be `Literal[1] | str | bytes | bool | memoryview | property | range | slice`
+        reveal_type(x)  # revealed: bool | property | slice
         x = 2
         reveal_type(x)  # revealed: Literal[2]
     reveal_type(x)  # revealed: Literal[2]
 except:
-    reveal_type(x)  # revealed: Literal[1, 2] | str | bytes | bool | memoryview | float | range | slice
-    x = could_raise_returns_complex()
-    reveal_type(x)  # revealed: complex
+    reveal_type(x)  # revealed: Literal[1, 2] | str | bytes | bool | memoryview | property | range | slice
+    x = could_raise_returns_super()
+    reveal_type(x)  # revealed: super
     x = could_raise_returns_bytearray()
     reveal_type(x)  # revealed: bytearray
 else:
@@ -551,7 +509,7 @@ else:
     x = could_raise_returns_Bar()
     reveal_type(x)  # revealed: Bar
 finally:
-    # TODO: should be `Literal[1, 2] | str | bytes | bool | memoryview | float | range | slice | complex | bytearray | Foo | Bar`
+    # TODO: should be `Literal[1, 2] | str | bytes | bool | memoryview | property | range | slice | super | bytearray | Foo | Bar`
     reveal_type(x)  # revealed: bytearray | Bar
 
 # Either one `except` branch or the `else`
@@ -577,8 +535,8 @@ def could_raise_returns_range() -> range:
 def could_raise_returns_bytearray() -> bytearray:
     return bytearray()
 
-def could_raise_returns_float() -> float:
-    return 3.14
+def could_raise_returns_memoryview() -> memoryview:
+    return memoryview(b"")
 
 x = 1
 
@@ -595,12 +553,12 @@ try:
             reveal_type(x)  # revealed: str | bytes
             x = could_raise_returns_bytearray()
             reveal_type(x)  # revealed: bytearray
-            x = could_raise_returns_float()
-            reveal_type(x)  # revealed: float
+            x = could_raise_returns_memoryview()
+            reveal_type(x)  # revealed: memoryview
         finally:
-            # TODO: should be `str | bytes | bytearray | float`
-            reveal_type(x)  # revealed: bytes | float
-        reveal_type(x)  # revealed: bytes | float
+            # TODO: should be `str | bytes | bytearray | memoryview`
+            reveal_type(x)  # revealed: bytes | memoryview
+        reveal_type(x)  # revealed: bytes | memoryview
     x = foo
     reveal_type(x)  # revealed: Literal[foo]
 except:

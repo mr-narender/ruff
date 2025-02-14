@@ -49,7 +49,7 @@ impl Violation for BadOpenMode {
 }
 
 /// PLW1501
-pub(crate) fn bad_open_mode(checker: &mut Checker, call: &ast::ExprCall) {
+pub(crate) fn bad_open_mode(checker: &Checker, call: &ast::ExprCall) {
     let Some(kind) = is_open(call.func.as_ref(), checker.semantic()) else {
         return;
     };
@@ -66,7 +66,7 @@ pub(crate) fn bad_open_mode(checker: &mut Checker, call: &ast::ExprCall) {
         return;
     }
 
-    checker.diagnostics.push(Diagnostic::new(
+    checker.report_diagnostic(Diagnostic::new(
         BadOpenMode {
             mode: value.to_string(),
         },
@@ -107,7 +107,7 @@ fn is_open(func: &Expr, semantic: &SemanticModel) -> Option<Kind> {
 /// Returns the mode argument, if present.
 fn extract_mode(call: &ast::ExprCall, kind: Kind) -> Option<&Expr> {
     match kind {
-        Kind::Builtin => call.arguments.find_argument("mode", 1),
-        Kind::Pathlib => call.arguments.find_argument("mode", 0),
+        Kind::Builtin => call.arguments.find_argument_value("mode", 1),
+        Kind::Pathlib => call.arguments.find_argument_value("mode", 0),
     }
 }
