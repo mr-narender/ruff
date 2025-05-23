@@ -223,6 +223,10 @@ impl<'db> ClassType<'db> {
         }
     }
 
+    pub(super) const fn is_generic(self) -> bool {
+        matches!(self, Self::Generic(_))
+    }
+
     /// Returns the class literal and specialization for this class. For a non-generic class, this
     /// is the class itself. For a generic alias, this is the alias's origin.
     pub(crate) fn class_literal(
@@ -352,7 +356,7 @@ impl<'db> ClassType<'db> {
                 ClassBase::Dynamic(_) => false,
 
                 // Protocol and Generic are not represented by a ClassType.
-                ClassBase::Protocol(_) | ClassBase::Generic(_) => false,
+                ClassBase::Protocol | ClassBase::Generic => false,
 
                 ClassBase::Class(base) => match (base, other) {
                     (ClassType::NonGeneric(base), ClassType::NonGeneric(other)) => base == other,
@@ -390,7 +394,7 @@ impl<'db> ClassType<'db> {
                 ClassBase::Dynamic(_) => false,
 
                 // Protocol and Generic are not represented by a ClassType.
-                ClassBase::Protocol(_) | ClassBase::Generic(_) => false,
+                ClassBase::Protocol | ClassBase::Generic => false,
 
                 ClassBase::Class(base) => match (base, other) {
                     (ClassType::NonGeneric(base), ClassType::NonGeneric(other)) => base == other,
@@ -600,11 +604,6 @@ impl<'db> ClassLiteral<'db> {
                 .copied()
                 .filter(|ty| matches!(ty, Type::GenericAlias(_))),
         )
-    }
-
-    /// Return `true` if this class represents the builtin class `object`
-    pub(crate) fn is_object(self, db: &'db dyn Db) -> bool {
-        self.is_known(db, KnownClass::Object)
     }
 
     fn file(self, db: &dyn Db) -> File {
@@ -1068,7 +1067,7 @@ impl<'db> ClassLiteral<'db> {
 
         for superclass in mro_iter {
             match superclass {
-                ClassBase::Generic(_) | ClassBase::Protocol(_) => {
+                ClassBase::Generic | ClassBase::Protocol => {
                     // Skip over these very special class bases that aren't really classes.
                 }
                 ClassBase::Dynamic(_) => {
@@ -1427,7 +1426,7 @@ impl<'db> ClassLiteral<'db> {
 
         for superclass in self.iter_mro(db, specialization) {
             match superclass {
-                ClassBase::Generic(_) | ClassBase::Protocol(_) => {
+                ClassBase::Generic | ClassBase::Protocol => {
                     // Skip over these very special class bases that aren't really classes.
                 }
                 ClassBase::Dynamic(_) => {
@@ -1738,9 +1737,15 @@ impl<'db> ClassLiteral<'db> {
             let declared_and_qualifiers = symbol_from_declarations(db, declarations);
             match declared_and_qualifiers {
                 Ok(SymbolAndQualifiers {
-                    symbol: declared @ Symbol::Type(declared_ty, declaredness),
+                    symbol: mut declared @ Symbol::Type(declared_ty, declaredness),
                     qualifiers,
                 }) => {
+                    // For the purpose of finding instance attributes, ignore `ClassVar`
+                    // declarations:
+                    if qualifiers.contains(TypeQualifiers::CLASS_VAR) {
+                        declared = Symbol::Unbound;
+                    }
+
                     // The attribute is declared in the class body.
 
                     let bindings = use_def.public_bindings(symbol_id);

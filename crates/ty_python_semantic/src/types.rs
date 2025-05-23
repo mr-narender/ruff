@@ -1,4 +1,4 @@
-use infer::enclosing_class_symbol;
+use infer::nearest_enclosing_class;
 use itertools::Either;
 
 use std::slice::Iter;
@@ -8,7 +8,7 @@ use bitflags::bitflags;
 use call::{CallDunderError, CallError, CallErrorKind};
 use context::InferContext;
 use diagnostic::{
-    CALL_POSSIBLY_UNBOUND_METHOD, INVALID_CONTEXT_MANAGER, INVALID_SUPER_ARGUMENT, NOT_ITERABLE,
+    INVALID_CONTEXT_MANAGER, INVALID_SUPER_ARGUMENT, NOT_ITERABLE, POSSIBLY_UNBOUND_IMPLICIT_CALL,
     UNAVAILABLE_IMPLICIT_SUPER_ARGUMENTS,
 };
 use ruff_db::diagnostic::{
@@ -596,6 +596,10 @@ impl<'db> Type<'db> {
 
     pub const fn is_todo(&self) -> bool {
         matches!(self, Type::Dynamic(DynamicType::Todo(_)))
+    }
+
+    pub const fn is_generic_alias(&self) -> bool {
+        matches!(self, Type::GenericAlias(_))
     }
 
     /// Replace references to the class `class` with a self-reference marker. This is currently
@@ -1291,12 +1295,20 @@ impl<'db> Type<'db> {
             }
 
             (Type::NominalInstance(_) | Type::ProtocolInstance(_), Type::Callable(_)) => {
-                let call_symbol = self.member(db, "__call__").symbol;
-                match call_symbol {
-                    Symbol::Type(Type::BoundMethod(call_function), _) => call_function
-                        .into_callable_type(db)
-                        .is_subtype_of(db, target),
-                    _ => false,
+                let call_symbol = self
+                    .member_lookup_with_policy(
+                        db,
+                        Name::new_static("__call__"),
+                        MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    )
+                    .symbol;
+                // If the type of __call__ is a subtype of a callable type, this instance is.
+                // Don't add other special cases here; our subtyping of a callable type
+                // shouldn't get out of sync with the calls we will actually allow.
+                if let Symbol::Type(t, Boundness::Bound) = call_symbol {
+                    t.is_subtype_of(db, target)
+                } else {
+                    false
                 }
             }
             (Type::ProtocolInstance(left), Type::ProtocolInstance(right)) => {
@@ -1641,12 +1653,20 @@ impl<'db> Type<'db> {
             }
 
             (Type::NominalInstance(_) | Type::ProtocolInstance(_), Type::Callable(_)) => {
-                let call_symbol = self.member(db, "__call__").symbol;
-                match call_symbol {
-                    Symbol::Type(Type::BoundMethod(call_function), _) => call_function
-                        .into_callable_type(db)
-                        .is_assignable_to(db, target),
-                    _ => false,
+                let call_symbol = self
+                    .member_lookup_with_policy(
+                        db,
+                        Name::new_static("__call__"),
+                        MemberLookupPolicy::NO_INSTANCE_FALLBACK,
+                    )
+                    .symbol;
+                // If the type of __call__ is assignable to a callable type, this instance is.
+                // Don't add other special cases here; our assignability to a callable type
+                // shouldn't get out of sync with the calls we will actually allow.
+                if let Symbol::Type(t, Boundness::Bound) = call_symbol {
+                    t.is_assignable_to(db, target)
+                } else {
+                    false
                 }
             }
 
@@ -2746,6 +2766,7 @@ impl<'db> Type<'db> {
             instance.display(db),
             owner.display(db)
         );
+
         let descr_get = self.class_member(db, "__get__".into()).symbol;
 
         if let Symbol::Type(descr_get, descr_get_boundness) = descr_get {
@@ -4821,7 +4842,7 @@ impl<'db> Type<'db> {
     pub fn in_type_expression(
         &self,
         db: &'db dyn Db,
-        scope_id: ScopeId,
+        scope_id: ScopeId<'db>,
     ) -> Result<Type<'db>, InvalidTypeExpressionError<'db>> {
         match self {
             // Special cases for `float` and `complex`
@@ -4872,7 +4893,9 @@ impl<'db> Type<'db> {
             | Type::BoundSuper(_)
             | Type::ProtocolInstance(_)
             | Type::PropertyInstance(_) => Err(InvalidTypeExpressionError {
-                invalid_expressions: smallvec::smallvec![InvalidTypeExpression::InvalidType(*self)],
+                invalid_expressions: smallvec::smallvec![InvalidTypeExpression::InvalidType(
+                    *self, scope_id
+                )],
                 fallback_type: Type::unknown(),
             }),
 
@@ -4906,32 +4929,21 @@ impl<'db> Type<'db> {
 
                 KnownInstanceType::TypingSelf => {
                     let index = semantic_index(db, scope_id.file(db));
-                    let Some(class_ty) = enclosing_class_symbol(db, index, scope_id) else {
+                    let Some(class) = nearest_enclosing_class(db, index, scope_id) else {
                         return Err(InvalidTypeExpressionError {
                             fallback_type: Type::unknown(),
                             invalid_expressions: smallvec::smallvec![
-                                InvalidTypeExpression::InvalidType(*self)
+                                InvalidTypeExpression::InvalidType(*self, scope_id)
                             ],
                         });
                     };
-                    let Some(TypeDefinition::Class(class_def)) = class_ty.definition(db) else {
-                        debug_assert!(
-                            false,
-                            "enclosing_class_symbol must return a type with class definition"
-                        );
-                        return Ok(Type::unknown());
-                    };
-                    let Some(instance) = class_ty.to_instance(db) else {
-                        debug_assert!(
-                            false,
-                            "enclosing_class_symbol must return type that can be instantiated"
-                        );
-                        return Ok(Type::unknown());
-                    };
+                    let instance = Type::ClassLiteral(class)
+                        .to_instance(db)
+                        .expect("enclosing_class_symbol must return type that can be instantiated");
                     Ok(Type::TypeVar(TypeVarInstance::new(
                         db,
                         ast::name::Name::new("Self"),
-                        Some(class_def),
+                        Some(class.definition(db)),
                         Some(TypeVarBoundOrConstraints::UpperBound(instance)),
                         TypeVarVariance::Invariant,
                         None,
@@ -5048,7 +5060,7 @@ impl<'db> Type<'db> {
                 )),
                 _ => Err(InvalidTypeExpressionError {
                     invalid_expressions: smallvec::smallvec![InvalidTypeExpression::InvalidType(
-                        *self
+                        *self, scope_id
                     )],
                     fallback_type: Type::unknown(),
                 }),
@@ -5762,7 +5774,8 @@ impl<'db> InvalidTypeExpressionError<'db> {
                 let Some(builder) = context.report_lint(&INVALID_TYPE_FORM, node) else {
                     continue;
                 };
-                builder.into_diagnostic(error.reason(context.db()));
+                let diagnostic = builder.into_diagnostic(error.reason(context.db()));
+                error.add_subdiagnostics(context.db(), diagnostic);
             }
         }
         fallback_type
@@ -5789,7 +5802,7 @@ enum InvalidTypeExpression<'db> {
     /// and which would require exactly one argument even if they appeared in an annotation expression
     TypeQualifierRequiresOneArgument(KnownInstanceType<'db>),
     /// Some types are always invalid in type expressions
-    InvalidType(Type<'db>),
+    InvalidType(Type<'db>, ScopeId<'db>),
 }
 
 impl<'db> InvalidTypeExpression<'db> {
@@ -5833,7 +5846,7 @@ impl<'db> InvalidTypeExpression<'db> {
                         "Type qualifier `{q}` is not allowed in type expressions (only in annotation expressions, and only with exactly one argument)",
                         q = qualifier.repr(self.db)
                     ),
-                    InvalidTypeExpression::InvalidType(ty) => write!(
+                    InvalidTypeExpression::InvalidType(ty, _) => write!(
                         f,
                         "Variable of type `{ty}` is not allowed in a type expression",
                         ty = ty.display(self.db)
@@ -5843,6 +5856,38 @@ impl<'db> InvalidTypeExpression<'db> {
         }
 
         Display { error: self, db }
+    }
+
+    fn add_subdiagnostics(self, db: &'db dyn Db, mut diagnostic: LintDiagnosticGuard) {
+        let InvalidTypeExpression::InvalidType(ty, scope) = self else {
+            return;
+        };
+        let Type::ModuleLiteral(module_type) = ty else {
+            return;
+        };
+        let module = module_type.module(db);
+        let Some(module_name_final_part) = module.name().components().next_back() else {
+            return;
+        };
+        let Some(module_member_with_same_name) = ty
+            .member(db, module_name_final_part)
+            .symbol
+            .ignore_possibly_unbound()
+        else {
+            return;
+        };
+        if module_member_with_same_name
+            .in_type_expression(db, scope)
+            .is_err()
+        {
+            return;
+        }
+
+        // TODO: showing a diff (and even having an autofix) would be even better
+        diagnostic.info(format_args!(
+            "Did you mean to use the module's member \
+            `{module_name_final_part}.{module_name_final_part}` instead?"
+        ));
     }
 }
 
@@ -6628,7 +6673,7 @@ impl<'db> ConstructorCallError<'db> {
         let report_init_error = |call_dunder_error: &CallDunderError<'db>| match call_dunder_error {
             CallDunderError::MethodNotAvailable => {
                 if let Some(builder) =
-                    context.report_lint(&CALL_POSSIBLY_UNBOUND_METHOD, context_expression_node)
+                    context.report_lint(&POSSIBLY_UNBOUND_IMPLICIT_CALL, context_expression_node)
                 {
                     // If we are using vendored typeshed, it should be impossible to have missing
                     // or unbound `__init__` method on a class, as all classes have `object` in MRO.
@@ -6642,7 +6687,7 @@ impl<'db> ConstructorCallError<'db> {
             }
             CallDunderError::PossiblyUnbound(bindings) => {
                 if let Some(builder) =
-                    context.report_lint(&CALL_POSSIBLY_UNBOUND_METHOD, context_expression_node)
+                    context.report_lint(&POSSIBLY_UNBOUND_IMPLICIT_CALL, context_expression_node)
                 {
                     builder.into_diagnostic(format_args!(
                         "Method `__init__` on type `{}` is possibly unbound.",
@@ -6660,7 +6705,7 @@ impl<'db> ConstructorCallError<'db> {
         let report_new_error = |error: &DunderNewCallError<'db>| match error {
             DunderNewCallError::PossiblyUnbound(call_error) => {
                 if let Some(builder) =
-                    context.report_lint(&CALL_POSSIBLY_UNBOUND_METHOD, context_expression_node)
+                    context.report_lint(&POSSIBLY_UNBOUND_IMPLICIT_CALL, context_expression_node)
                 {
                     builder.into_diagnostic(format_args!(
                         "Method `__new__` on type `{}` is possibly unbound.",
