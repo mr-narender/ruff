@@ -21,10 +21,7 @@ See the [typing documentation] for more information.
     as `int | float` and `int | float | complex`, respectively.
 
 ```py
-from ty_extensions import is_subtype_of, static_assert, TypeOf
-
-type JustFloat = TypeOf[1.0]
-type JustComplex = TypeOf[1j]
+from ty_extensions import is_subtype_of, static_assert, JustFloat, JustComplex
 
 static_assert(is_subtype_of(bool, bool))
 static_assert(is_subtype_of(bool, int))
@@ -88,9 +85,7 @@ static_assert(is_subtype_of(C, object))
 
 ```py
 from typing_extensions import Literal, LiteralString
-from ty_extensions import is_subtype_of, static_assert, TypeOf
-
-type JustFloat = TypeOf[1.0]
+from ty_extensions import is_subtype_of, static_assert, TypeOf, JustFloat
 
 # Boolean literals
 static_assert(is_subtype_of(Literal[True], bool))
@@ -164,6 +159,11 @@ from typing import Literal, Any, Sequence
 from ty_extensions import static_assert, is_subtype_of, Not, AlwaysFalsy
 
 static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[Literal[1, 2], ...]))
+static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[Literal[1], *tuple[Literal[2], ...]]))
+static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[*tuple[Literal[1], ...], Literal[2]]))
+static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[Literal[1], *tuple[str, ...], Literal[2]]))
+static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[Literal[1], Literal[2], *tuple[str, ...]]))
+static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[*tuple[str, ...], Literal[1], Literal[2]]))
 static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[int, ...]))
 static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[int | str, ...]))
 static_assert(is_subtype_of(tuple[Literal[1], Literal[2]], tuple[Not[AlwaysFalsy], ...]))
@@ -180,6 +180,215 @@ static_assert(not is_subtype_of(tuple[Literal[1], Literal[2]], tuple[Any, ...]))
 static_assert(not is_subtype_of(tuple[int, int], tuple[str, ...]))
 static_assert(not is_subtype_of(tuple[int, ...], Sequence[Any]))
 static_assert(not is_subtype_of(tuple[Any, ...], Sequence[int]))
+```
+
+## Subtyping of two mixed tuple types
+
+```py
+from typing import Literal, Any, Sequence
+from ty_extensions import static_assert, is_subtype_of, Not, AlwaysFalsy
+
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[10]],
+    )
+)
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...]],
+    )
+)
+
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], *tuple[int, ...], Literal[10]],
+    )
+)
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], *tuple[int, ...]],
+    )
+)
+
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[*tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[*tuple[int, ...], Literal[10]],
+    )
+)
+static_assert(
+    is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[*tuple[int, ...]],
+    )
+)
+
+static_assert(
+    not is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    not is_subtype_of(
+        tuple[Literal[1], Literal[2], *tuple[int, ...]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+
+static_assert(
+    not is_subtype_of(
+        tuple[Literal[1], *tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    not is_subtype_of(
+        tuple[Literal[1], *tuple[int, ...], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    not is_subtype_of(
+        tuple[Literal[1], *tuple[int, ...]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+
+static_assert(
+    not is_subtype_of(
+        tuple[*tuple[int, ...], Literal[9], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    not is_subtype_of(
+        tuple[*tuple[int, ...], Literal[10]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+static_assert(
+    not is_subtype_of(
+        tuple[*tuple[int, ...]],
+        tuple[Literal[1], Literal[2], *tuple[int, ...], Literal[9], Literal[10]],
+    )
+)
+```
+
+## Subtyping of the gradual tuple
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+As a [special case][gradual tuple], `tuple[Any, ...]` is a [gradual][gradual form] tuple type.
+However, the special-case behavior of assignability does not also apply to subtyping, since gradual
+types to not participate in subtyping.
+
+```py
+from typing import Any
+from ty_extensions import static_assert, is_subtype_of
+
+static_assert(not is_subtype_of(tuple[Any, ...], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[Any, ...], tuple[Any]))
+static_assert(not is_subtype_of(tuple[Any, ...], tuple[Any, Any]))
+static_assert(not is_subtype_of(tuple[Any, ...], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[Any, ...], tuple[int]))
+static_assert(not is_subtype_of(tuple[Any, ...], tuple[int, int]))
+```
+
+Subtyping also does not apply when `tuple[Any, ...]` is unpacked into a mixed tuple.
+
+```py
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[int, *tuple[Any, ...]]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[Any]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[Any, Any]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[int, *tuple[int, ...]]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[int]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...]], tuple[int, int]))
+
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[*tuple[Any, ...], int]))
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[Any]))
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[Any, Any]))
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[*tuple[int, ...], int]))
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[int]))
+static_assert(not is_subtype_of(tuple[*tuple[Any, ...], int], tuple[int, int]))
+
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[int, *tuple[Any, ...], int]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[Any]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[Any, Any]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[int, *tuple[int, ...], int]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[int]))
+static_assert(not is_subtype_of(tuple[int, *tuple[Any, ...], int], tuple[int, int]))
+```
+
+Subtyping does apply to unbounded homogeneous tuples of a fully static type. However, such tuples
+are defined to be the _union_ of all tuple lengths, not the _gradual choice_ of them, so no
+variable-length tuples are a subtyping of _any_ fixed-length tuple.
+
+```py
+static_assert(not is_subtype_of(tuple[int, ...], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[int, ...], tuple[Any]))
+static_assert(not is_subtype_of(tuple[int, ...], tuple[Any, Any]))
+static_assert(is_subtype_of(tuple[int, ...], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[int, ...], tuple[int]))
+static_assert(not is_subtype_of(tuple[int, ...], tuple[int, int]))
+
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...]], tuple[int, *tuple[Any, ...]]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...]], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...]], tuple[Any]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...]], tuple[Any, Any]))
+static_assert(is_subtype_of(tuple[int, *tuple[int, ...]], tuple[int, *tuple[int, ...]]))
+static_assert(is_subtype_of(tuple[int, *tuple[int, ...]], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...]], tuple[int]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...]], tuple[int, int]))
+
+static_assert(not is_subtype_of(tuple[*tuple[int, ...], int], tuple[*tuple[Any, ...], int]))
+static_assert(not is_subtype_of(tuple[*tuple[int, ...], int], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[*tuple[int, ...], int], tuple[Any]))
+static_assert(not is_subtype_of(tuple[*tuple[int, ...], int], tuple[Any, Any]))
+static_assert(is_subtype_of(tuple[*tuple[int, ...], int], tuple[*tuple[int, ...], int]))
+static_assert(is_subtype_of(tuple[*tuple[int, ...], int], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[*tuple[int, ...], int], tuple[int]))
+static_assert(not is_subtype_of(tuple[*tuple[int, ...], int], tuple[int, int]))
+
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[int, *tuple[Any, ...], int]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[Any, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[Any]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[Any, Any]))
+static_assert(is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[int, *tuple[int, ...], int]))
+static_assert(is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[int, ...]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[int]))
+static_assert(not is_subtype_of(tuple[int, *tuple[int, ...], int], tuple[int, int]))
 ```
 
 ## Union types
@@ -345,6 +554,38 @@ static_assert(is_subtype_of(Intersection[LiteralString, Not[Literal["", "a"]]], 
 static_assert(is_subtype_of(Intersection[LiteralString, Not[Literal[""]]], Not[AlwaysFalsy]))
 # error: [static-assert-error]
 static_assert(is_subtype_of(Intersection[LiteralString, Not[Literal["", "a"]]], Not[AlwaysFalsy]))
+```
+
+### `TypeGuard` and `TypeIs`
+
+Fully-static `TypeGuard[...]` and `TypeIs[...]` are subtypes of `bool`.
+
+```py
+from ty_extensions import is_subtype_of, static_assert
+from typing_extensions import TypeGuard, TypeIs
+
+# TODO: TypeGuard
+# static_assert(is_subtype_of(TypeGuard[int], bool))
+# static_assert(is_subtype_of(TypeGuard[int], int))
+static_assert(is_subtype_of(TypeIs[str], bool))
+static_assert(is_subtype_of(TypeIs[str], int))
+```
+
+`TypeIs` is invariant. `TypeGuard` is covariant.
+
+```py
+from ty_extensions import is_equivalent_to, is_subtype_of, static_assert
+from typing_extensions import TypeGuard, TypeIs
+
+# TODO: TypeGuard
+# static_assert(is_subtype_of(TypeGuard[int], TypeGuard[int]))
+# static_assert(is_subtype_of(TypeGuard[bool], TypeGuard[int]))
+static_assert(is_subtype_of(TypeIs[int], TypeIs[int]))
+static_assert(is_subtype_of(TypeIs[int], TypeIs[int]))
+
+static_assert(not is_subtype_of(TypeGuard[int], TypeGuard[bool]))
+static_assert(not is_subtype_of(TypeIs[bool], TypeIs[int]))
+static_assert(not is_subtype_of(TypeIs[int], TypeIs[bool]))
 ```
 
 ### Module literals
@@ -1157,6 +1398,29 @@ def f(fn: Callable[[int], int]) -> None: ...
 f(a)
 ```
 
+### Classes with `__call__` as attribute
+
+An instance type can be a subtype of a compatible callable type if the instance type's class has a
+callable `__call__` attribute.
+
+TODO: for the moment, we don't consider the callable type as a bound-method descriptor, but this may
+change for better compatibility with mypy/pyright.
+
+```py
+from typing import Callable
+from ty_extensions import static_assert, is_subtype_of
+
+def call_impl(a: int) -> str:
+    return ""
+
+class A:
+    __call__: Callable[[int], str] = call_impl
+
+static_assert(is_subtype_of(A, Callable[[int], str]))
+static_assert(not is_subtype_of(A, Callable[[int], int]))
+reveal_type(A()(1))  # revealed: str
+```
+
 ### Class literals
 
 #### Classes with metaclasses
@@ -1201,7 +1465,7 @@ static_assert(is_subtype_of(TypeOf[C], Callable[[], str]))
 #### Classes with `__new__`
 
 ```py
-from typing import Callable
+from typing import Callable, overload
 from ty_extensions import TypeOf, static_assert, is_subtype_of
 
 class A:
@@ -1226,6 +1490,20 @@ static_assert(is_subtype_of(TypeOf[E], Callable[[], C]))
 static_assert(is_subtype_of(TypeOf[E], Callable[[], B]))
 static_assert(not is_subtype_of(TypeOf[D], Callable[[], C]))
 static_assert(is_subtype_of(TypeOf[D], Callable[[], B]))
+
+class F:
+    @overload
+    def __new__(cls) -> int: ...
+    @overload
+    def __new__(cls, x: int) -> "F": ...
+    def __new__(cls, x: int | None = None) -> "int | F":
+        return 1 if x is None else object.__new__(cls)
+
+    def __init__(self, y: str) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[F], Callable[[int], F]))
+static_assert(is_subtype_of(TypeOf[F], Callable[[], int]))
+static_assert(not is_subtype_of(TypeOf[F], Callable[[str], F]))
 ```
 
 #### Classes with `__call__` and `__new__`
@@ -1246,6 +1524,123 @@ class F(metaclass=MetaWithIntReturn):
 
 static_assert(is_subtype_of(TypeOf[F], Callable[[], int]))
 static_assert(not is_subtype_of(TypeOf[F], Callable[[], str]))
+```
+
+#### Classes with `__init__`
+
+```py
+from typing import Callable, overload
+from ty_extensions import TypeOf, static_assert, is_subtype_of
+
+class A:
+    def __init__(self, a: int) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[A], Callable[[int], A]))
+static_assert(not is_subtype_of(TypeOf[A], Callable[[], A]))
+
+class B:
+    @overload
+    def __init__(self, a: int) -> None: ...
+    @overload
+    def __init__(self) -> None: ...
+    def __init__(self, a: int | None = None) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[B], Callable[[int], B]))
+static_assert(is_subtype_of(TypeOf[B], Callable[[], B]))
+
+class C: ...
+
+# TODO: This assertion should be true once we understand `Self`
+# error: [static-assert-error] "Static assertion error: argument evaluates to `False`"
+static_assert(is_subtype_of(TypeOf[C], Callable[[], C]))
+
+class D[T]:
+    def __init__(self, x: T) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[D[int]], Callable[[int], D[int]]))
+static_assert(not is_subtype_of(TypeOf[D[int]], Callable[[str], D[int]]))
+```
+
+#### Classes with `__init__` and `__new__`
+
+```py
+from typing import Callable, overload, Self
+from ty_extensions import TypeOf, static_assert, is_subtype_of
+
+class A:
+    def __new__(cls, a: int) -> Self:
+        return super().__new__(cls)
+
+    def __init__(self, a: int) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[A], Callable[[int], A]))
+static_assert(not is_subtype_of(TypeOf[A], Callable[[], A]))
+
+class B:
+    def __new__(cls, a: int) -> int:
+        return super().__new__(cls)
+
+    def __init__(self, a: str) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[B], Callable[[int], int]))
+static_assert(not is_subtype_of(TypeOf[B], Callable[[str], B]))
+
+class C:
+    def __new__(cls, *args, **kwargs) -> "C":
+        return super().__new__(cls)
+
+    def __init__(self, x: int) -> None: ...
+
+# Not subtype because __new__ signature is not fully static
+static_assert(not is_subtype_of(TypeOf[C], Callable[[int], C]))
+static_assert(not is_subtype_of(TypeOf[C], Callable[[], C]))
+
+class D: ...
+
+class E:
+    @overload
+    def __new__(cls) -> int: ...
+    @overload
+    def __new__(cls, x: int) -> D: ...
+    def __new__(cls, x: int | None = None) -> int | D:
+        return D()
+
+    def __init__(self, y: str) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[E], Callable[[int], D]))
+static_assert(is_subtype_of(TypeOf[E], Callable[[], int]))
+
+class F[T]:
+    def __new__(cls, x: T) -> "F[T]":
+        return super().__new__(cls)
+
+    def __init__(self, x: T) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[F[int]], Callable[[int], F[int]]))
+static_assert(not is_subtype_of(TypeOf[F[int]], Callable[[str], F[int]]))
+```
+
+#### Classes with `__call__`, `__new__` and `__init__`
+
+If `__call__`, `__new__` and `__init__` are all present, `__call__` takes precedence.
+
+```py
+from typing import Callable
+from ty_extensions import TypeOf, static_assert, is_subtype_of
+
+class MetaWithIntReturn(type):
+    def __call__(cls) -> int:
+        return super().__call__()
+
+class F(metaclass=MetaWithIntReturn):
+    def __new__(cls) -> str:
+        return super().__new__(cls)
+
+    def __init__(self, x: int) -> None: ...
+
+static_assert(is_subtype_of(TypeOf[F], Callable[[], int]))
+static_assert(not is_subtype_of(TypeOf[F], Callable[[], str]))
+static_assert(not is_subtype_of(TypeOf[F], Callable[[int], F]))
 ```
 
 ### Bound methods
@@ -1458,5 +1853,7 @@ static_assert(is_subtype_of(CallableTypeOf[overload_ab], CallableTypeOf[overload
 static_assert(is_subtype_of(CallableTypeOf[overload_ba], CallableTypeOf[overload_ab]))
 ```
 
+[gradual form]: https://typing.python.org/en/latest/spec/glossary.html#term-gradual-form
+[gradual tuple]: https://typing.python.org/en/latest/spec/tuples.html#tuple-type-form
 [special case for float and complex]: https://typing.python.org/en/latest/spec/special-types.html#special-cases-for-float-and-complex
 [typing documentation]: https://typing.python.org/en/latest/spec/concepts.html#subtype-supertype-and-type-equivalence

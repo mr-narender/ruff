@@ -1,11 +1,11 @@
-use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Edit, Fix};
 use ruff_macros::{ViolationMetadata, derive_message_formats};
 use ruff_python_parser::TokenKind;
 use ruff_text_size::{Ranged, TextRange};
 
-use crate::checkers::logical_lines::LogicalLinesContext;
+use crate::checkers::ast::LintContext;
 use crate::rules::pycodestyle::helpers::is_non_logical_token;
 use crate::rules::pycodestyle::rules::logical_lines::{DefinitionState, LogicalLine};
+use crate::{AlwaysFixableViolation, Edit, Fix};
 
 /// ## What it does
 /// Checks for missing whitespace around all operators.
@@ -142,10 +142,7 @@ impl AlwaysFixableViolation for MissingWhitespaceAroundModuloOperator {
 }
 
 /// E225, E226, E227, E228
-pub(crate) fn missing_whitespace_around_operator(
-    line: &LogicalLine,
-    context: &mut LogicalLinesContext,
-) {
+pub(crate) fn missing_whitespace_around_operator(line: &LogicalLine, context: &LintContext) {
     let mut definition_state = DefinitionState::from_tokens(line.tokens());
     let mut tokens = line.tokens().iter().peekable();
     let first_token = tokens
@@ -252,31 +249,37 @@ pub(crate) fn missing_whitespace_around_operator(
             match (has_leading_trivia, has_trailing_trivia) {
                 // Operator with trailing but no leading space, enforce consistent spacing.
                 (false, true) => {
-                    context.push_diagnostic(
-                        diagnostic_kind_for_operator(kind, token.range()).with_fix(Fix::safe_edit(
-                            Edit::insertion(" ".to_string(), token.start()),
-                        )),
-                    );
+                    if let Some(mut diagnostic) =
+                        diagnostic_kind_for_operator(kind, token.range(), context)
+                    {
+                        diagnostic.set_fix(Fix::safe_edit(Edit::insertion(
+                            " ".to_string(),
+                            token.start(),
+                        )));
+                    }
                 }
                 // Operator with leading but no trailing space, enforce consistent spacing.
                 (true, false) => {
-                    context.push_diagnostic(
-                        diagnostic_kind_for_operator(kind, token.range()).with_fix(Fix::safe_edit(
-                            Edit::insertion(" ".to_string(), token.end()),
-                        )),
-                    );
+                    if let Some(mut diagnostic) =
+                        diagnostic_kind_for_operator(kind, token.range(), context)
+                    {
+                        diagnostic.set_fix(Fix::safe_edit(Edit::insertion(
+                            " ".to_string(),
+                            token.end(),
+                        )));
+                    }
                 }
                 // Operator with no space, require spaces if it is required by the operator.
                 (false, false) => {
                     if needs_space == NeedsSpace::Yes {
-                        context.push_diagnostic(
-                            diagnostic_kind_for_operator(kind, token.range()).with_fix(
-                                Fix::safe_edits(
-                                    Edit::insertion(" ".to_string(), token.start()),
-                                    [Edit::insertion(" ".to_string(), token.end())],
-                                ),
-                            ),
-                        );
+                        if let Some(mut diagnostic) =
+                            diagnostic_kind_for_operator(kind, token.range(), context)
+                        {
+                            diagnostic.set_fix(Fix::safe_edits(
+                                Edit::insertion(" ".to_string(), token.start()),
+                                [Edit::insertion(" ".to_string(), token.end())],
+                            ));
+                        }
                     }
                 }
                 (true, true) => {
@@ -314,15 +317,19 @@ impl From<bool> for NeedsSpace {
     }
 }
 
-fn diagnostic_kind_for_operator(operator: TokenKind, range: TextRange) -> Diagnostic {
+fn diagnostic_kind_for_operator<'a>(
+    operator: TokenKind,
+    range: TextRange,
+    context: &'a LintContext<'a>,
+) -> Option<crate::checkers::ast::DiagnosticGuard<'a, 'a>> {
     if operator == TokenKind::Percent {
-        Diagnostic::new(MissingWhitespaceAroundModuloOperator, range)
+        context.report_diagnostic_if_enabled(MissingWhitespaceAroundModuloOperator, range)
     } else if operator.is_bitwise_or_shift() {
-        Diagnostic::new(MissingWhitespaceAroundBitwiseOrShiftOperator, range)
+        context.report_diagnostic_if_enabled(MissingWhitespaceAroundBitwiseOrShiftOperator, range)
     } else if operator.is_arithmetic() {
-        Diagnostic::new(MissingWhitespaceAroundArithmeticOperator, range)
+        context.report_diagnostic_if_enabled(MissingWhitespaceAroundArithmeticOperator, range)
     } else {
-        Diagnostic::new(MissingWhitespaceAroundOperator, range)
+        context.report_diagnostic_if_enabled(MissingWhitespaceAroundOperator, range)
     }
 }
 

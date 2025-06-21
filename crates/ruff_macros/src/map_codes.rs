@@ -174,7 +174,7 @@ pub(crate) fn map_codes(func: &ItemFn) -> syn::Result<TokenStream> {
 
         output.extend(quote! {
             impl #linter {
-                pub fn rules(&self) -> ::std::vec::IntoIter<Rule> {
+                pub(crate) fn rules(&self) -> ::std::vec::IntoIter<Rule> {
                     match self { #prefix_into_iter_match_arms }
                 }
             }
@@ -182,7 +182,7 @@ pub(crate) fn map_codes(func: &ItemFn) -> syn::Result<TokenStream> {
     }
     output.extend(quote! {
         impl RuleCodePrefix {
-            pub fn parse(linter: &Linter, code: &str) -> Result<Self, crate::registry::FromCodeError> {
+            pub(crate) fn parse(linter: &Linter, code: &str) -> Result<Self, crate::registry::FromCodeError> {
                 use std::str::FromStr;
 
                 Ok(match linter {
@@ -190,7 +190,7 @@ pub(crate) fn map_codes(func: &ItemFn) -> syn::Result<TokenStream> {
                 })
             }
 
-            pub fn rules(&self) -> ::std::vec::IntoIter<Rule> {
+            pub(crate) fn rules(&self) -> ::std::vec::IntoIter<Rule> {
                 match self {
                     #(RuleCodePrefix::#linter_idents(prefix) => prefix.clone().rules(),)*
                 }
@@ -254,9 +254,11 @@ fn generate_rule_to_code(linter_to_rules: &BTreeMap<Ident, BTreeMap<String, Rule
     }
 
     let mut rule_noqa_code_match_arms = quote!();
+    let mut noqa_code_rule_match_arms = quote!();
     let mut rule_group_match_arms = quote!();
+    let mut noqa_code_consts = quote!();
 
-    for (rule, codes) in rule_to_codes {
+    for (i, (rule, codes)) in rule_to_codes.into_iter().enumerate() {
         let rule_name = rule.segments.last().unwrap();
         assert_eq!(
             codes.len(),
@@ -292,6 +294,14 @@ See also https://github.com/astral-sh/ruff/issues/2186.
             #(#attrs)* Rule::#rule_name => NoqaCode(crate::registry::Linter::#linter.common_prefix(), #code),
         });
 
+        let const_ident = quote::format_ident!("NOQA_PREFIX_{}", i);
+        noqa_code_consts.extend(quote! {
+            const #const_ident: &str = crate::registry::Linter::#linter.common_prefix();
+        });
+        noqa_code_rule_match_arms.extend(quote! {
+            #(#attrs)* NoqaCode(#const_ident, #code) => Some(Rule::#rule_name),
+        });
+
         rule_group_match_arms.extend(quote! {
             #(#attrs)* Rule::#rule_name => #group,
         });
@@ -319,7 +329,7 @@ See also https://github.com/astral-sh/ruff/issues/2186.
                 matches!(self.group(), RuleGroup::Preview)
             }
 
-            pub fn is_stable(&self) -> bool {
+            pub(crate) fn is_stable(&self) -> bool {
                 matches!(self.group(), RuleGroup::Stable)
             }
 
@@ -337,6 +347,16 @@ See also https://github.com/astral-sh/ruff/issues/2186.
                 match (self, rule) {
                     #linter_code_for_rule_match_arms
                     _ => None,
+                }
+            }
+        }
+
+        impl NoqaCode {
+            pub fn rule(&self) -> Option<Rule> {
+                #noqa_code_consts
+                match self {
+                    #noqa_code_rule_match_arms
+                    _ => None
                 }
             }
         }
@@ -371,7 +391,7 @@ fn generate_iter_impl(
     quote! {
         impl Linter {
             /// Rules not in the preview.
-            pub fn rules(self: &Linter) -> ::std::vec::IntoIter<Rule> {
+            pub(crate) fn rules(self: &Linter) -> ::std::vec::IntoIter<Rule> {
                 match self {
                     #linter_rules_match_arms
                 }
@@ -385,7 +405,7 @@ fn generate_iter_impl(
         }
 
         impl RuleCodePrefix {
-            pub fn iter() -> impl Iterator<Item = RuleCodePrefix> {
+            pub(crate) fn iter() -> impl Iterator<Item = RuleCodePrefix> {
                 use strum::IntoEnumIterator;
 
                 let mut prefixes = Vec::new();
@@ -413,16 +433,17 @@ fn register_rules<'a>(input: impl Iterator<Item = &'a Rule>) -> TokenStream {
             #name,
         });
         // Apply the `attrs` to each arm, like `[cfg(feature = "foo")]`.
-        rule_message_formats_match_arms
-            .extend(quote! {#(#attrs)* Self::#name => <#path as ruff_diagnostics::Violation>::message_formats(),});
+        rule_message_formats_match_arms.extend(
+            quote! {#(#attrs)* Self::#name => <#path as crate::Violation>::message_formats(),},
+        );
         rule_fixable_match_arms.extend(
-            quote! {#(#attrs)* Self::#name => <#path as ruff_diagnostics::Violation>::FIX_AVAILABILITY,},
+            quote! {#(#attrs)* Self::#name => <#path as crate::Violation>::FIX_AVAILABILITY,},
         );
         rule_explanation_match_arms.extend(quote! {#(#attrs)* Self::#name => #path::explain(),});
     }
 
     quote! {
-        use ruff_diagnostics::Violation;
+        use crate::Violation;
 
         #[derive(
             EnumIter,
@@ -435,7 +456,6 @@ fn register_rules<'a>(input: impl Iterator<Item = &'a Rule>) -> TokenStream {
             PartialOrd,
             Ord,
             ::ruff_macros::CacheKey,
-            AsRefStr,
             ::strum_macros::IntoStaticStr,
             ::strum_macros::EnumString,
             ::serde::Serialize,
@@ -453,24 +473,15 @@ fn register_rules<'a>(input: impl Iterator<Item = &'a Rule>) -> TokenStream {
 
             /// Returns the documentation for this rule.
             pub fn explanation(&self) -> Option<&'static str> {
-                use ruff_diagnostics::ViolationMetadata;
+                use crate::ViolationMetadata;
                 match self { #rule_explanation_match_arms }
             }
 
             /// Returns the fix status of this rule.
-            pub const fn fixable(&self) -> ruff_diagnostics::FixAvailability {
+            pub const fn fixable(&self) -> crate::FixAvailability {
                 match self { #rule_fixable_match_arms }
             }
         }
-
-        impl AsRule for ruff_diagnostics::Diagnostic {
-            fn rule(&self) -> Rule {
-                self.name
-                    .parse()
-                    .unwrap_or_else(|_| unreachable!("invalid rule name: {}", self.name))
-            }
-        }
-
     }
 }
 

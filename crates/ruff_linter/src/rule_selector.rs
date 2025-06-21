@@ -265,7 +265,6 @@ mod schema {
     use strum::IntoEnumIterator;
 
     use crate::RuleSelector;
-    use crate::registry::RuleNamespace;
     use crate::rule_selector::{Linter, RuleCodePrefix};
 
     impl JsonSchema for RuleSelector {
@@ -485,8 +484,7 @@ pub mod clap_completion {
                                     prefix.linter().common_prefix(),
                                     prefix.short_code()
                                 );
-                                let name: &'static str = rule.into();
-                                return Some(PossibleValue::new(code).help(name));
+                                return Some(PossibleValue::new(code).help(rule.name().as_str()));
                             }
 
                             None

@@ -1,6 +1,7 @@
 //! Remnant of the registry of all [`Rule`] implementations, now it's reexporting from codes.rs
 //! with some helper symbols
 
+use ruff_db::diagnostic::LintName;
 use strum_macros::EnumIter;
 
 pub use codes::Rule;
@@ -214,12 +215,6 @@ pub enum Linter {
 }
 
 pub trait RuleNamespace: Sized {
-    /// Returns the prefix that every single code that ruff uses to identify
-    /// rules from this linter starts with.  In the case that multiple
-    /// `#[prefix]`es are configured for the variant in the `Linter` enum
-    /// definition this is the empty string.
-    fn common_prefix(&self) -> &'static str;
-
     /// Attempts to parse the given rule code. If the prefix is recognized
     /// returns the respective variant along with the code with the common
     /// prefix stripped.
@@ -348,9 +343,18 @@ impl Rule {
 
     /// Return the URL for the rule documentation, if it exists.
     pub fn url(&self) -> Option<String> {
-        self.explanation()
-            .is_some()
-            .then(|| format!("{}/rules/{}", env!("CARGO_PKG_HOMEPAGE"), self.as_ref()))
+        self.explanation().is_some().then(|| {
+            format!(
+                "{}/rules/{name}",
+                env!("CARGO_PKG_HOMEPAGE"),
+                name = self.name()
+            )
+        })
+    }
+
+    pub fn name(&self) -> LintName {
+        let name: &'static str = self.into();
+        LintName::of(name)
     }
 }
 
@@ -421,7 +425,7 @@ pub mod clap_completion {
         fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
             Some(Box::new(Rule::iter().map(|rule| {
                 let name = rule.noqa_code().to_string();
-                let help = rule.as_ref().to_string();
+                let help = rule.name().as_str();
                 PossibleValue::new(name).help(help)
             })))
         }
@@ -443,7 +447,7 @@ mod tests {
             assert!(
                 rule.explanation().is_some(),
                 "Rule {} is missing documentation",
-                rule.as_ref()
+                rule.name()
             );
         }
     }
@@ -460,10 +464,10 @@ mod tests {
             .collect();
 
         for rule in Rule::iter() {
-            let rule_name = rule.as_ref();
+            let rule_name = rule.name();
             for pattern in &patterns {
                 assert!(
-                    !pattern.matches(rule_name),
+                    !pattern.matches(&rule_name),
                     "{rule_name} does not match naming convention, see CONTRIBUTING.md"
                 );
             }
