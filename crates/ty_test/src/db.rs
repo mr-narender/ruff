@@ -1,4 +1,5 @@
 use camino::{Utf8Component, Utf8PathBuf};
+use ruff_db::Db as SourceDb;
 use ruff_db::diagnostic::Severity;
 use ruff_db::files::{File, Files};
 use ruff_db::system::{
@@ -6,7 +7,6 @@ use ruff_db::system::{
     SystemPathBuf, WritableSystem,
 };
 use ruff_db::vendored::VendoredFileSystem;
-use ruff_db::{Db as SourceDb, Upcast};
 use ruff_notebook::{Notebook, NotebookError};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -75,22 +75,13 @@ impl SourceDb for Db {
     }
 }
 
-impl Upcast<dyn SourceDb> for Db {
-    fn upcast(&self) -> &(dyn SourceDb + 'static) {
-        self
-    }
-    fn upcast_mut(&mut self) -> &mut (dyn SourceDb + 'static) {
-        self
-    }
-}
-
 #[salsa::db]
 impl SemanticDb for Db {
     fn is_file_open(&self, file: File) -> bool {
         !file.path(self).is_vendored_path()
     }
 
-    fn rule_selection(&self) -> &RuleSelection {
+    fn rule_selection(&self, _file: File) -> &RuleSelection {
         &self.rule_selection
     }
 

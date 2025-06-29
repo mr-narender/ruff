@@ -6,14 +6,14 @@ use ruff_python_ast::ExprRef;
 
 use crate::Db;
 use crate::semantic_index::ast_ids::node_key::ExpressionNodeKey;
+use crate::semantic_index::place::ScopeId;
 use crate::semantic_index::semantic_index;
-use crate::semantic_index::symbol::ScopeId;
 
 /// AST ids for a single scope.
 ///
 /// The motivation for building the AST ids per scope isn't about reducing invalidation because
 /// the struct changes whenever the parsed AST changes. Instead, it's mainly that we can
-/// build the AST ids struct when building the symbol table and also keep the property that
+/// build the AST ids struct when building the place table and also keep the property that
 /// IDs of outer scopes are unaffected by changes in inner scopes.
 ///
 /// For example, we don't want that adding new statements to `foo` changes the statement id of `x = foo()` in:
@@ -24,11 +24,11 @@ use crate::semantic_index::symbol::ScopeId;
 ///
 /// x = foo()
 /// ```
-#[derive(Debug, salsa::Update)]
+#[derive(Debug, salsa::Update, get_size2::GetSize)]
 pub(crate) struct AstIds {
     /// Maps expressions to their expression id.
     expressions_map: FxHashMap<ExpressionNodeKey, ScopedExpressionId>,
-    /// Maps expressions which "use" a symbol (that is, [`ast::ExprName`]) to a use id.
+    /// Maps expressions which "use" a place (that is, [`ast::ExprName`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`]) to a use id.
     uses_map: FxHashMap<ExpressionNodeKey, ScopedUseId>,
 }
 
@@ -49,8 +49,9 @@ fn ast_ids<'db>(db: &'db dyn Db, scope: ScopeId) -> &'db AstIds {
     semantic_index(db, scope.file(db)).ast_ids(scope.file_scope_id(db))
 }
 
-/// Uniquely identifies a use of a name in a [`crate::semantic_index::symbol::FileScopeId`].
+/// Uniquely identifies a use of a name in a [`crate::semantic_index::place::FileScopeId`].
 #[newtype_index]
+#[derive(get_size2::GetSize)]
 pub struct ScopedUseId;
 
 pub trait HasScopedUseId {
@@ -72,6 +73,20 @@ impl HasScopedUseId for ast::ExprName {
     }
 }
 
+impl HasScopedUseId for ast::ExprAttribute {
+    fn scoped_use_id(&self, db: &dyn Db, scope: ScopeId) -> ScopedUseId {
+        let expression_ref = ExprRef::from(self);
+        expression_ref.scoped_use_id(db, scope)
+    }
+}
+
+impl HasScopedUseId for ast::ExprSubscript {
+    fn scoped_use_id(&self, db: &dyn Db, scope: ScopeId) -> ScopedUseId {
+        let expression_ref = ExprRef::from(self);
+        expression_ref.scoped_use_id(db, scope)
+    }
+}
+
 impl HasScopedUseId for ast::ExprRef<'_> {
     fn scoped_use_id(&self, db: &dyn Db, scope: ScopeId) -> ScopedUseId {
         let ast_ids = ast_ids(db, scope);
@@ -79,9 +94,9 @@ impl HasScopedUseId for ast::ExprRef<'_> {
     }
 }
 
-/// Uniquely identifies an [`ast::Expr`] in a [`crate::semantic_index::symbol::FileScopeId`].
+/// Uniquely identifies an [`ast::Expr`] in a [`crate::semantic_index::place::FileScopeId`].
 #[newtype_index]
-#[derive(salsa::Update)]
+#[derive(salsa::Update, get_size2::GetSize)]
 pub struct ScopedExpressionId;
 
 pub trait HasScopedExpressionId {
@@ -189,7 +204,7 @@ pub(crate) mod node_key {
 
     use crate::node_key::NodeKey;
 
-    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, salsa::Update)]
+    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, salsa::Update, get_size2::GetSize)]
     pub(crate) struct ExpressionNodeKey(NodeKey);
 
     impl From<ast::ExprRef<'_>> for ExpressionNodeKey {

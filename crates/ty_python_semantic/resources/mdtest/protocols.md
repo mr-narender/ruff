@@ -58,21 +58,23 @@ class Bar1(Protocol[T], Generic[T]):
 class Bar2[T](Protocol):
     x: T
 
-# error: [invalid-generic-class] "Cannot both inherit from subscripted `typing.Protocol` and use PEP 695 type variables"
+# error: [invalid-generic-class] "Cannot both inherit from subscripted `Protocol` and use PEP 695 type variables"
 class Bar3[T](Protocol[T]):
     x: T
+
+# Note that this class definition *will* actually succeed at runtime,
+# unlike classes that combine PEP-695 type parameters with inheritance from `Generic[]`
+reveal_type(Bar3.__mro__)  # revealed: tuple[<class 'Bar3[Unknown]'>, typing.Protocol, typing.Generic, <class 'object'>]
 ```
 
 It's an error to include both bare `Protocol` and subscripted `Protocol[]` in the bases list
 simultaneously:
 
 ```py
-# TODO: should emit a `[duplicate-bases]` error here:
-class DuplicateBases(Protocol, Protocol[T]):
+class DuplicateBases(Protocol, Protocol[T]):  # error: [duplicate-base]
     x: T
 
-# TODO: should not have `Protocol` or `Generic` multiple times
-# revealed: tuple[<class 'DuplicateBases[Unknown]'>, typing.Protocol, typing.Generic, typing.Protocol[T], typing.Generic[T], <class 'object'>]
+# revealed: tuple[<class 'DuplicateBases[Unknown]'>, Unknown, <class 'object'>]
 reveal_type(DuplicateBases.__mro__)
 ```
 
@@ -377,8 +379,7 @@ class Foo(Protocol):
     def method_member(self) -> bytes:
         return b"foo"
 
-# TODO: actually a frozenset (requires support for legacy generics)
-reveal_type(get_protocol_members(Foo))  # revealed: tuple[Literal["method_member"], Literal["x"], Literal["y"], Literal["z"]]
+reveal_type(get_protocol_members(Foo))  # revealed: frozenset[Literal["method_member", "x", "y", "z"]]
 ```
 
 Certain special attributes and methods are not considered protocol members at runtime, and should
@@ -388,6 +389,7 @@ not be considered protocol members by type checkers either:
 class Lumberjack(Protocol):
     __slots__ = ()
     __match_args__ = ()
+    _abc_foo: str  # any attribute starting with `_abc_` is excluded as a protocol attribute
     x: int
 
     def __new__(cls, x: int) -> "Lumberjack":
@@ -396,8 +398,7 @@ class Lumberjack(Protocol):
     def __init__(self, x: int) -> None:
         self.x = x
 
-# TODO: actually a frozenset
-reveal_type(get_protocol_members(Lumberjack))  # revealed: tuple[Literal["x"]]
+reveal_type(get_protocol_members(Lumberjack))  # revealed: frozenset[Literal["x"]]
 ```
 
 A sub-protocol inherits and extends the members of its superclass protocol(s):
@@ -409,13 +410,11 @@ class Bar(Protocol):
 class Baz(Bar, Protocol):
     ham: memoryview
 
-# TODO: actually a frozenset
-reveal_type(get_protocol_members(Baz))  # revealed: tuple[Literal["ham"], Literal["spam"]]
+reveal_type(get_protocol_members(Baz))  # revealed: frozenset[Literal["ham", "spam"]]
 
 class Baz2(Bar, Foo, Protocol): ...
 
-# TODO: actually a frozenset
-# revealed: tuple[Literal["method_member"], Literal["spam"], Literal["x"], Literal["y"], Literal["z"]]
+# revealed: frozenset[Literal["method_member", "spam", "x", "y", "z"]]
 reveal_type(get_protocol_members(Baz2))
 ```
 
@@ -443,8 +442,7 @@ class Foo(Protocol):
         e = 56
         def f(self) -> None: ...
 
-# TODO: actually a frozenset
-reveal_type(get_protocol_members(Foo))  # revealed: tuple[Literal["d"], Literal["e"], Literal["f"]]
+reveal_type(get_protocol_members(Foo))  # revealed: frozenset[Literal["d", "e", "f"]]
 ```
 
 ## Invalid calls to `get_protocol_members()`
@@ -491,35 +489,122 @@ python-version = "3.12"
 ```
 
 ```py
-from typing import Protocol
+from typing import Protocol, Any, ClassVar
+from collections.abc import Sequence
 from ty_extensions import static_assert, is_assignable_to, is_subtype_of
 
 class HasX(Protocol):
     x: int
+
+class HasXY(Protocol):
+    x: int
+    y: int
 
 class Foo:
     x: int
 
 static_assert(is_subtype_of(Foo, HasX))
 static_assert(is_assignable_to(Foo, HasX))
+static_assert(not is_subtype_of(Foo, HasXY))
+static_assert(not is_assignable_to(Foo, HasXY))
 
 class FooSub(Foo): ...
 
 static_assert(is_subtype_of(FooSub, HasX))
 static_assert(is_assignable_to(FooSub, HasX))
+static_assert(not is_subtype_of(FooSub, HasXY))
+static_assert(not is_assignable_to(FooSub, HasXY))
+
+class FooBool(Foo):
+    x: bool
+
+static_assert(not is_subtype_of(FooBool, HasX))
+static_assert(not is_assignable_to(FooBool, HasX))
+
+class FooAny:
+    x: Any
+
+static_assert(not is_subtype_of(FooAny, HasX))
+static_assert(is_assignable_to(FooAny, HasX))
+
+class SubclassOfAny(Any): ...
+
+class FooSubclassOfAny:
+    x: SubclassOfAny
+
+static_assert(not is_subtype_of(FooSubclassOfAny, HasX))
+static_assert(not is_assignable_to(FooSubclassOfAny, HasX))
+
+class FooWithY(Foo):
+    y: int
+
+assert is_subtype_of(FooWithY, HasXY)
+static_assert(is_assignable_to(FooWithY, HasXY))
 
 class Bar:
     x: str
 
-# TODO: these should pass
-static_assert(not is_subtype_of(Bar, HasX))  # error: [static-assert-error]
-static_assert(not is_assignable_to(Bar, HasX))  # error: [static-assert-error]
+static_assert(not is_subtype_of(Bar, HasX))
+static_assert(not is_assignable_to(Bar, HasX))
 
 class Baz:
     y: int
 
 static_assert(not is_subtype_of(Baz, HasX))
 static_assert(not is_assignable_to(Baz, HasX))
+
+class Qux:
+    def __init__(self, x: int) -> None:
+        self.x: int = x
+
+static_assert(is_subtype_of(Qux, HasX))
+static_assert(is_assignable_to(Qux, HasX))
+
+class HalfUnknownQux:
+    def __init__(self, x: int) -> None:
+        self.x = x
+
+reveal_type(HalfUnknownQux(1).x)  # revealed: Unknown | int
+
+static_assert(not is_subtype_of(HalfUnknownQux, HasX))
+static_assert(is_assignable_to(HalfUnknownQux, HasX))
+
+class FullyUnknownQux:
+    def __init__(self, x) -> None:
+        self.x = x
+
+static_assert(not is_subtype_of(FullyUnknownQux, HasX))
+static_assert(is_assignable_to(FullyUnknownQux, HasX))
+
+class HasXWithDefault(Protocol):
+    x: int = 0
+
+class FooWithZero:
+    x: int = 0
+
+# TODO: these should pass
+static_assert(is_subtype_of(FooWithZero, HasXWithDefault))  # error: [static-assert-error]
+static_assert(is_assignable_to(FooWithZero, HasXWithDefault))  # error: [static-assert-error]
+static_assert(not is_subtype_of(Foo, HasXWithDefault))
+static_assert(not is_assignable_to(Foo, HasXWithDefault))
+static_assert(not is_subtype_of(Qux, HasXWithDefault))
+static_assert(not is_assignable_to(Qux, HasXWithDefault))
+
+class HasClassVarX(Protocol):
+    x: ClassVar[int]
+
+static_assert(is_subtype_of(FooWithZero, HasClassVarX))
+static_assert(is_assignable_to(FooWithZero, HasClassVarX))
+# TODO: these should pass
+static_assert(not is_subtype_of(Foo, HasClassVarX))  # error: [static-assert-error]
+static_assert(not is_assignable_to(Foo, HasClassVarX))  # error: [static-assert-error]
+static_assert(not is_subtype_of(Qux, HasClassVarX))  # error: [static-assert-error]
+static_assert(not is_assignable_to(Qux, HasClassVarX))  # error: [static-assert-error]
+
+static_assert(is_subtype_of(Sequence[Foo], Sequence[HasX]))
+static_assert(is_assignable_to(Sequence[Foo], Sequence[HasX]))
+static_assert(not is_subtype_of(list[Foo], list[HasX]))
+static_assert(not is_assignable_to(list[Foo], list[HasX]))
 ```
 
 Note that declaring an attribute member on a protocol mandates that the attribute must be mutable. A
@@ -554,10 +639,8 @@ class C:
 # due to invariance, a type is only a subtype of `HasX`
 # if its `x` attribute is of type *exactly* `int`:
 # a subclass of `int` does not satisfy the interface
-#
-# TODO: these should pass
-static_assert(not is_subtype_of(C, HasX))  # error: [static-assert-error]
-static_assert(not is_assignable_to(C, HasX))  # error: [static-assert-error]
+static_assert(not is_subtype_of(C, HasX))
+static_assert(not is_assignable_to(C, HasX))
 ```
 
 All attributes on frozen dataclasses and namedtuples are immutable, so instances of these classes
@@ -675,8 +758,7 @@ class LotsOfBindings(Protocol):
         case l:  # TODO: this should error with `[invalid-protocol]` (`l` is not declared)
             ...
 
-# TODO: actually a frozenset
-# revealed: tuple[Literal["Nested"], Literal["NestedProtocol"], Literal["a"], Literal["b"], Literal["c"], Literal["d"], Literal["e"], Literal["f"], Literal["g"], Literal["h"], Literal["i"], Literal["j"], Literal["k"], Literal["l"]]
+# revealed: frozenset[Literal["Nested", "NestedProtocol", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]]
 reveal_type(get_protocol_members(LotsOfBindings))
 ```
 
@@ -704,9 +786,7 @@ class Foo(Protocol):
 
 # Note: the list of members does not include `a`, `b` or `c`,
 # as none of these attributes is declared in the class body.
-#
-# TODO: actually a frozenset
-reveal_type(get_protocol_members(Foo))  # revealed: tuple[Literal["non_init_method"], Literal["x"], Literal["y"]]
+reveal_type(get_protocol_members(Foo))  # revealed: frozenset[Literal["non_init_method", "x", "y"]]
 ```
 
 If a member is declared in a superclass of a protocol class, it is fine for it to be assigned to in
@@ -719,9 +799,8 @@ class Super(Protocol):
 class Sub(Super, Protocol):
     x = 42  # no error here, since it's declared in the superclass
 
-# TODO: actually frozensets
-reveal_type(get_protocol_members(Super))  # revealed: tuple[Literal["x"]]
-reveal_type(get_protocol_members(Sub))  # revealed: tuple[Literal["x"]]
+reveal_type(get_protocol_members(Super))  # revealed: frozenset[Literal["x"]]
+reveal_type(get_protocol_members(Sub))  # revealed: frozenset[Literal["x"]]
 ```
 
 If a protocol has 0 members, then all other types are assignable to it, and all fully static types
@@ -908,8 +987,7 @@ from ty_extensions import is_subtype_of, is_assignable_to, static_assert, TypeOf
 class HasX(Protocol):
     x: int
 
-# TODO: this should pass
-static_assert(is_subtype_of(TypeOf[module], HasX))  # error: [static-assert-error]
+static_assert(is_subtype_of(TypeOf[module], HasX))
 static_assert(is_assignable_to(TypeOf[module], HasX))
 
 class ExplicitProtocolSubtype(HasX, Protocol):
@@ -1236,6 +1314,62 @@ static_assert(is_subtype_of(HasGetAttrAndSetAttr, XAsymmetricProperty))  # error
 static_assert(is_assignable_to(HasGetAttrAndSetAttr, XAsymmetricProperty))  # error: [static-assert-error]
 ```
 
+## Subtyping of protocols with method members
+
+A protocol can have method members. `T` is assignable to `P` in the following example because the
+class `T` has a method `m` which is assignable to the `Callable` supertype of the method `P.m`:
+
+```py
+from typing import Protocol
+from ty_extensions import is_subtype_of, static_assert
+
+class P(Protocol):
+    def m(self, x: int, /) -> None: ...
+
+class NominalSubtype:
+    def m(self, y: int) -> None: ...
+
+class NotSubtype:
+    def m(self, x: int) -> int:
+        return 42
+
+static_assert(is_subtype_of(NominalSubtype, P))
+
+# TODO: should pass
+static_assert(not is_subtype_of(NotSubtype, P))  # error: [static-assert-error]
+```
+
+## Equivalence of protocols with method members
+
+Two protocols `P1` and `P2`, both with a method member `x`, are considered equivalent if the
+signature of `P1.x` is equivalent to the signature of `P2.x`, even though ty would normally model
+any two function definitions as inhabiting distinct function-literal types.
+
+```py
+from typing import Protocol
+from ty_extensions import is_equivalent_to, static_assert
+
+class P1(Protocol):
+    def x(self, y: int) -> None: ...
+
+class P2(Protocol):
+    def x(self, y: int) -> None: ...
+
+# TODO: this should pass
+static_assert(is_equivalent_to(P1, P2))  # error: [static-assert-error]
+```
+
+As with protocols that only have non-method members, this also holds true when they appear in
+differently ordered unions:
+
+```py
+class A: ...
+class B: ...
+
+# TODO: this should pass
+static_assert(is_equivalent_to(A | B | P1, P2 | B | A))  # error: [static-assert-error]
+```
+
 ## Narrowing of protocols
 
 <!-- snapshot-diagnostics -->
@@ -1353,107 +1487,6 @@ def h(obj: InstanceAttrBool):
     reveal_type(bool(obj))  # revealed: bool
 ```
 
-## Fully static protocols; gradual protocols
-
-A protocol is only fully static if all of its members are fully static:
-
-```py
-from typing import Protocol, Any
-from ty_extensions import is_fully_static, static_assert
-
-class FullyStatic(Protocol):
-    x: int
-
-class NotFullyStatic(Protocol):
-    x: Any
-
-static_assert(is_fully_static(FullyStatic))
-static_assert(not is_fully_static(NotFullyStatic))
-```
-
-Non-fully-static protocols do not participate in subtyping or equivalence, only assignability and
-gradual equivalence:
-
-```py
-from ty_extensions import is_subtype_of, is_assignable_to, is_equivalent_to, is_gradual_equivalent_to
-
-class NominalWithX:
-    x: int = 42
-
-static_assert(is_assignable_to(NominalWithX, FullyStatic))
-static_assert(is_assignable_to(NominalWithX, NotFullyStatic))
-
-static_assert(not is_subtype_of(FullyStatic, NotFullyStatic))
-static_assert(is_assignable_to(FullyStatic, NotFullyStatic))
-
-static_assert(not is_subtype_of(NotFullyStatic, FullyStatic))
-static_assert(is_assignable_to(NotFullyStatic, FullyStatic))
-
-static_assert(not is_subtype_of(NominalWithX, NotFullyStatic))
-static_assert(is_assignable_to(NominalWithX, NotFullyStatic))
-
-static_assert(is_subtype_of(NominalWithX, FullyStatic))
-
-static_assert(is_equivalent_to(FullyStatic, FullyStatic))
-static_assert(not is_equivalent_to(NotFullyStatic, NotFullyStatic))
-
-static_assert(is_gradual_equivalent_to(FullyStatic, FullyStatic))
-static_assert(is_gradual_equivalent_to(NotFullyStatic, NotFullyStatic))
-
-class AlsoNotFullyStatic(Protocol):
-    x: Any
-
-static_assert(not is_equivalent_to(NotFullyStatic, AlsoNotFullyStatic))
-static_assert(is_gradual_equivalent_to(NotFullyStatic, AlsoNotFullyStatic))
-```
-
-Empty protocols are fully static; this follows from the fact that an empty protocol is equivalent to
-the nominal type `object` (as described above):
-
-```py
-class Empty(Protocol): ...
-
-static_assert(is_fully_static(Empty))
-```
-
-A method member is only considered fully static if all its parameter annotations and its return
-annotation are fully static:
-
-```py
-class FullyStaticMethodMember(Protocol):
-    def method(self, x: int) -> str: ...
-
-class DynamicParameter(Protocol):
-    def method(self, x: Any) -> str: ...
-
-class DynamicReturn(Protocol):
-    def method(self, x: int) -> Any: ...
-
-static_assert(is_fully_static(FullyStaticMethodMember))
-
-# TODO: these should pass
-static_assert(not is_fully_static(DynamicParameter))  # error: [static-assert-error]
-static_assert(not is_fully_static(DynamicReturn))  # error: [static-assert-error]
-```
-
-The [typing spec][spec_protocol_members] states:
-
-> If any parameters of a protocol method are not annotated, then their types are assumed to be `Any`
-
-Thus, a partially unannotated method member can also not be considered to be fully static:
-
-```py
-class NoParameterAnnotation(Protocol):
-    def method(self, x) -> str: ...
-
-class NoReturnAnnotation(Protocol):
-    def method(self, x: int): ...
-
-# TODO: these should pass
-static_assert(not is_fully_static(NoParameterAnnotation))  # error: [static-assert-error]
-static_assert(not is_fully_static(NoReturnAnnotation))  # error: [static-assert-error]
-```
-
 ## Callable protocols
 
 An instance of a protocol type is callable if the protocol defines a `__call__` method:
@@ -1566,8 +1599,8 @@ def two(some_list: list, some_tuple: tuple[int, str], some_sized: Sized):
 ```py
 from __future__ import annotations
 
-from typing import Protocol, Any
-from ty_extensions import is_fully_static, static_assert, is_assignable_to, is_subtype_of, is_equivalent_to
+from typing import Protocol, Any, TypeVar
+from ty_extensions import static_assert, is_assignable_to, is_subtype_of, is_equivalent_to
 
 class RecursiveFullyStatic(Protocol):
     parent: RecursiveFullyStatic
@@ -1577,11 +1610,9 @@ class RecursiveNonFullyStatic(Protocol):
     parent: RecursiveNonFullyStatic
     x: Any
 
-static_assert(is_fully_static(RecursiveFullyStatic))
-static_assert(not is_fully_static(RecursiveNonFullyStatic))
-
-static_assert(not is_subtype_of(RecursiveFullyStatic, RecursiveNonFullyStatic))
-static_assert(not is_subtype_of(RecursiveNonFullyStatic, RecursiveFullyStatic))
+# TODO: these should pass, once we take into account types of members
+static_assert(not is_subtype_of(RecursiveFullyStatic, RecursiveNonFullyStatic))  # error: [static-assert-error]
+static_assert(not is_subtype_of(RecursiveNonFullyStatic, RecursiveFullyStatic))  # error: [static-assert-error]
 
 static_assert(is_assignable_to(RecursiveNonFullyStatic, RecursiveNonFullyStatic))
 static_assert(is_assignable_to(RecursiveFullyStatic, RecursiveNonFullyStatic))
@@ -1595,8 +1626,6 @@ static_assert(is_equivalent_to(AlsoRecursiveFullyStatic, RecursiveFullyStatic))
 
 class RecursiveOptionalParent(Protocol):
     parent: RecursiveOptionalParent | None
-
-static_assert(is_fully_static(RecursiveOptionalParent))
 
 static_assert(is_assignable_to(RecursiveOptionalParent, RecursiveOptionalParent))
 
@@ -1626,6 +1655,17 @@ class Bar(Protocol):
 # TODO: this should pass
 # error: [static-assert-error]
 static_assert(is_equivalent_to(Foo, Bar))
+
+T = TypeVar("T", bound="TypeVarRecursive")
+
+class TypeVarRecursive(Protocol):
+    # TODO: commenting this out will cause a stack overflow.
+    # x: T
+    y: "TypeVarRecursive"
+
+def _(t: TypeVarRecursive):
+    # reveal_type(t.x)  # revealed: T
+    reveal_type(t.y)  # revealed: TypeVarRecursive
 ```
 
 ### Nested occurrences of self-reference
@@ -1642,7 +1682,7 @@ python-version = "3.12"
 from __future__ import annotations
 
 from typing import Protocol, Callable
-from ty_extensions import Intersection, Not, is_fully_static, is_assignable_to, is_equivalent_to, static_assert
+from ty_extensions import Intersection, Not, is_assignable_to, is_equivalent_to, static_assert
 
 class C: ...
 
@@ -1670,7 +1710,6 @@ class Recursive(Protocol):
 
     nested: Recursive | Callable[[Recursive | Recursive, tuple[Recursive, Recursive]], Recursive | Recursive]
 
-static_assert(is_fully_static(Recursive))
 static_assert(is_equivalent_to(Recursive, Recursive))
 static_assert(is_assignable_to(Recursive, Recursive))
 

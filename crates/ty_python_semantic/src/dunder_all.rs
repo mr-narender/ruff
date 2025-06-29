@@ -7,7 +7,7 @@ use ruff_python_ast::statement_visitor::{StatementVisitor, walk_stmt};
 use ruff_python_ast::{self as ast};
 
 use crate::semantic_index::ast_ids::HasScopedExpressionId;
-use crate::semantic_index::symbol::ScopeId;
+use crate::semantic_index::place::ScopeId;
 use crate::semantic_index::{SemanticIndex, global_scope, semantic_index};
 use crate::types::{Truthiness, Type, infer_expression_types};
 use crate::{Db, ModuleName, resolve_module};
@@ -28,11 +28,11 @@ fn dunder_all_names_cycle_initial(_db: &dyn Db, _file: File) -> Option<FxHashSet
 
 /// Returns a set of names in the `__all__` variable for `file`, [`None`] if it is not defined or
 /// if it contains invalid elements.
-#[salsa::tracked(returns(as_ref), cycle_fn=dunder_all_names_cycle_recover, cycle_initial=dunder_all_names_cycle_initial)]
+#[salsa::tracked(returns(as_ref), cycle_fn=dunder_all_names_cycle_recover, cycle_initial=dunder_all_names_cycle_initial, heap_size=get_size2::GetSize::get_heap_size)]
 pub(crate) fn dunder_all_names(db: &dyn Db, file: File) -> Option<FxHashSet<Name>> {
     let _span = tracing::trace_span!("dunder_all_names", file=?file.path(db)).entered();
 
-    let module = parsed_module(db.upcast(), file);
+    let module = parsed_module(db, file).load(db);
     let index = semantic_index(db, file);
     let mut collector = DunderAllNamesCollector::new(db, file, index);
     collector.visit_body(module.suite());
