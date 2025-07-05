@@ -24,9 +24,7 @@ class:
 
 ```py
 class Bad(Generic[T], Generic[T]): ...  # error: [duplicate-base]
-
-# TODO: should emit an error (fails at runtime)
-class AlsoBad(Generic[T], Generic[S]): ...
+class AlsoBad(Generic[T], Generic[S]): ...  # error: [duplicate-base]
 ```
 
 You cannot use the same typevar more than once.
@@ -39,7 +37,7 @@ class RepeatedTypevar(Generic[T, T]): ...
 You can only specialize `typing.Generic` with typevars (TODO: or param specs or typevar tuples).
 
 ```py
-# error: [invalid-argument-type] "`<class 'int'>` is not a valid argument to `typing.Generic`"
+# error: [invalid-argument-type] "`<class 'int'>` is not a valid argument to `Generic`"
 class GenericOfType(Generic[int]): ...
 ```
 
@@ -381,6 +379,21 @@ C[None](b"bytes")  # error: [no-matching-overload]
 C[None](12)
 ```
 
+### Synthesized methods with dataclasses
+
+```py
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+@dataclass
+class A(Generic[T]):
+    x: T
+
+reveal_type(A(x=1))  # revealed: A[int]
+```
+
 ## Generic subclass
 
 When a generic subclass fills its superclass's type parameter with one of its own, the actual types
@@ -469,8 +482,8 @@ reveal_type(c.method3())  # revealed: LinkedList[int]
 class SomeProtocol(Protocol[T]):
     x: T
 
-class Foo:
-    x: int
+class Foo(Generic[T]):
+    x: T
 
 class D(Generic[T, U]):
     x: T

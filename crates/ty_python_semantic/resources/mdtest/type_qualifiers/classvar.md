@@ -64,31 +64,13 @@ c = C()
 c.a = 2
 ```
 
-and similarly here:
-
-```py
-class Base:
-    a: ClassVar[int] = 1
-
-class Derived(Base):
-    if flag():
-        a: int
-
-reveal_type(Derived.a)  # revealed: int
-
-d = Derived()
-
-# error: [invalid-attribute-access]
-d.a = 2
-```
-
 ## Too many arguments
 
 ```py
 from typing import ClassVar
 
 class C:
-    # error: [invalid-type-form] "Type qualifier `typing.ClassVar` expects exactly one type parameter"
+    # error: [invalid-type-form] "Type qualifier `typing.ClassVar` expected exactly 1 argument, got 2"
     x: ClassVar[int, str] = 1
 ```
 

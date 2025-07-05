@@ -1,8 +1,8 @@
-use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{ViolationMetadata, derive_message_formats};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_text_size::Ranged;
 
+use crate::Violation;
 use crate::checkers::ast::Checker;
 use crate::rules::flake8_async::helpers::AsyncModule;
 
@@ -16,6 +16,8 @@ use crate::rules::flake8_async::helpers::AsyncModule;
 ///
 /// ## Example
 /// ```python
+/// import asyncio
+///
 /// DONE = False
 ///
 ///
@@ -26,6 +28,8 @@ use crate::rules::flake8_async::helpers::AsyncModule;
 ///
 /// Use instead:
 /// ```python
+/// import asyncio
+///
 /// DONE = asyncio.Event()
 ///
 ///
@@ -74,11 +78,11 @@ pub(crate) fn async_busy_wait(checker: &Checker, while_stmt: &ast::StmtWhile) {
         qualified_name.segments(),
         ["trio" | "anyio", "sleep" | "sleep_until"] | ["asyncio", "sleep"]
     ) {
-        checker.report_diagnostic(Diagnostic::new(
+        checker.report_diagnostic(
             AsyncBusyWait {
                 module: AsyncModule::try_from(&qualified_name).unwrap(),
             },
             while_stmt.range(),
-        ));
+        );
     }
 }

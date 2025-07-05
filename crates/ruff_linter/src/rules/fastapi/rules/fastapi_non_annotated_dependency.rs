@@ -1,4 +1,3 @@
-use ruff_diagnostics::{Diagnostic, Edit, Fix, FixAvailability, Violation};
 use ruff_macros::{ViolationMetadata, derive_message_formats};
 use ruff_python_ast as ast;
 use ruff_python_ast::helpers::map_callable;
@@ -7,6 +6,7 @@ use ruff_text_size::{Ranged, TextRange};
 
 use crate::checkers::ast::Checker;
 use crate::rules::fastapi::rules::is_fastapi_route;
+use crate::{Edit, Fix, FixAvailability, Violation};
 use ruff_python_ast::PythonVersion;
 
 /// ## What it does
@@ -59,11 +59,17 @@ use ruff_python_ast::PythonVersion;
 ///     return commons
 /// ```
 ///
+/// ## Fix safety
+/// This fix is always unsafe, as adding/removing/changing a function parameter's
+/// default value can change runtime behavior. Additionally, comments inside the
+/// deprecated uses might be removed.
+///
 /// ## Availability
 ///
 /// Because this rule relies on the third-party `typing_extensions` module for Python versions
-/// before 3.9, its diagnostic will not be emitted, and no fix will be offered, if
-/// `typing_extensions` imports have been disabled by the [`lint.typing-extensions`] linter option.
+/// before 3.9, if the target version is < 3.9 and `typing_extensions` imports have been
+/// disabled by the [`lint.typing-extensions`] linter option the diagnostic will not be emitted
+/// and no fix will be offered.
 ///
 /// ## Options
 ///
@@ -237,7 +243,7 @@ fn create_diagnostic(
         return seen_default;
     };
 
-    let mut diagnostic = Diagnostic::new(
+    let mut diagnostic = checker.report_diagnostic(
         FastApiNonAnnotatedDependency {
             py_version: checker.target_version(),
         },
@@ -307,8 +313,6 @@ fn create_diagnostic(
         seen_default = true;
     }
     diagnostic.try_set_optional_fix(|| fix);
-
-    checker.report_diagnostic(diagnostic);
 
     seen_default
 }

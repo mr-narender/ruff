@@ -8,8 +8,10 @@ use ty_project::ProjectDatabase;
 
 use crate::DocumentSnapshot;
 use crate::document::{PositionExt, ToLink};
-use crate::server::api::traits::{BackgroundDocumentRequestHandler, RequestHandler};
-use crate::server::client::Notifier;
+use crate::server::api::traits::{
+    BackgroundDocumentRequestHandler, RequestHandler, RetriableRequestHandler,
+};
+use crate::session::client::Client;
 
 pub(crate) struct GotoTypeDefinitionRequestHandler;
 
@@ -25,9 +27,13 @@ impl BackgroundDocumentRequestHandler for GotoTypeDefinitionRequestHandler {
     fn run_with_snapshot(
         db: &ProjectDatabase,
         snapshot: DocumentSnapshot,
-        _notifier: Notifier,
+        _client: &Client,
         params: GotoTypeDefinitionParams,
     ) -> crate::server::Result<Option<GotoDefinitionResponse>> {
+        if snapshot.client_settings().is_language_services_disabled() {
+            return Ok(None);
+        }
+
         let Some(file) = snapshot.file(db) else {
             tracing::debug!("Failed to resolve file for {:?}", params);
             return Ok(None);
@@ -66,3 +72,5 @@ impl BackgroundDocumentRequestHandler for GotoTypeDefinitionRequestHandler {
         }
     }
 }
+
+impl RetriableRequestHandler for GotoTypeDefinitionRequestHandler {}

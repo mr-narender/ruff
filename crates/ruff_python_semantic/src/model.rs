@@ -1604,7 +1604,7 @@ impl<'a> SemanticModel<'a> {
         let mut parent_expressions = self.current_expressions().skip(1);
 
         match parent_expressions.next() {
-            // The parent expression is of the inner union is a single `typing.Union`.
+            // The parent expression of the inner union is a single `typing.Union`.
             // Ex) `Union[Union[a, b]]`
             Some(Expr::Subscript(parent)) => self.match_typing_expr(&parent.value, "Union"),
             // The parent expression is of the inner union is a tuple with two or more
@@ -1622,6 +1622,18 @@ impl<'a> SemanticModel<'a> {
             // Not a nested union otherwise.
             _ => false,
         }
+    }
+
+    /// Return `true` if the model is directly inside an Optional (e.g., the inner `Union` in
+    /// `Optional[Union[int, str]]`).
+    pub fn inside_optional(&self) -> bool {
+        let mut parent_expressions = self.current_expressions().skip(1);
+        matches!(
+            parent_expressions.next(),
+            // The parent expression is a single `typing.Optional`.
+            // Ex) `Optional[EXPR]`
+            Some(Expr::Subscript(parent)) if self.match_typing_expr(&parent.value, "Optional")
+        )
     }
 
     /// Return `true` if the model is in a nested literal expression (e.g., the inner `Literal` in
@@ -1939,10 +1951,20 @@ impl<'a> SemanticModel<'a> {
         self.flags.intersects(SemanticModelFlags::F_STRING)
     }
 
+    /// Return `true` if the model is in a t-string.
+    pub const fn in_t_string(&self) -> bool {
+        self.flags.intersects(SemanticModelFlags::T_STRING)
+    }
+
+    /// Return `true` if the model is in an f-string or t-string.
+    pub const fn in_interpolated_string(&self) -> bool {
+        self.in_f_string() || self.in_t_string()
+    }
+
     /// Return `true` if the model is in an f-string replacement field.
-    pub const fn in_f_string_replacement_field(&self) -> bool {
+    pub const fn in_interpolated_string_replacement_field(&self) -> bool {
         self.flags
-            .intersects(SemanticModelFlags::F_STRING_REPLACEMENT_FIELD)
+            .intersects(SemanticModelFlags::INTERPOLATED_STRING_REPLACEMENT_FIELD)
     }
 
     /// Return `true` if the model is in boolean test.
@@ -2461,7 +2483,7 @@ bitflags! {
         /// ```python
         /// f"first {x} second {y}"
         /// ```
-        const F_STRING_REPLACEMENT_FIELD = 1 << 21;
+        const INTERPOLATED_STRING_REPLACEMENT_FIELD = 1 << 21;
 
         /// The model is visiting the bases tuple of a class.
         ///
@@ -2548,6 +2570,15 @@ bitflags! {
         /// [no_type_check]: https://docs.python.org/3/library/typing.html#typing.no_type_check
         /// [#13824]: https://github.com/astral-sh/ruff/issues/13824
         const NO_TYPE_CHECK = 1 << 28;
+
+        /// The model is in a t-string.
+        ///
+        /// For example, the model could be visiting `x` in:
+        /// ```python
+        /// t'{x}'
+        /// ```
+        const T_STRING = 1 << 29;
+
 
         /// The context is in any type annotation.
         const ANNOTATION = Self::TYPING_ONLY_ANNOTATION.bits() | Self::RUNTIME_EVALUATED_ANNOTATION.bits() | Self::RUNTIME_REQUIRED_ANNOTATION.bits();

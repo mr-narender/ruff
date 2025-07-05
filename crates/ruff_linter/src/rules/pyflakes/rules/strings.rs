@@ -1,21 +1,23 @@
 use std::string::ToString;
 
+use ruff_diagnostics::Applicability;
+use ruff_python_ast::helpers::contains_effect;
 use rustc_hash::FxHashSet;
 
-use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Fix, FixAvailability, Violation};
 use ruff_macros::{ViolationMetadata, derive_message_formats};
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{self as ast, Expr, Keyword};
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::checkers::ast::Checker;
+use crate::{AlwaysFixableViolation, Fix, FixAvailability, Violation};
 
-use super::super::cformat::CFormatSummary;
-use super::super::fixes::{
+use crate::rules::pyflakes::cformat::CFormatSummary;
+use crate::rules::pyflakes::fixes::{
     remove_unused_format_arguments_from_dict, remove_unused_keyword_arguments_from_format_call,
     remove_unused_positional_arguments_from_format_call,
 };
-use super::super::format::FormatSummary;
+use crate::rules::pyflakes::format::FormatSummary;
 
 /// ## What it does
 /// Checks for invalid `printf`-style format strings.
@@ -136,6 +138,16 @@ impl Violation for PercentFormatExpectedSequence {
 /// Use instead:
 /// ```python
 /// "Hello, %(name)s" % {"name": "World"}
+/// ```
+///
+/// ## Fix safety
+/// This rule's fix is marked as unsafe for mapping key
+/// containing function calls with potential side effects,
+/// because removing such arguments could change the behavior of the code.
+///
+/// For example, the fix would be marked as unsafe in the following case:
+/// ```python
+/// "Hello, %(name)s" % {"greeting": print(1), "name": "World"}
 /// ```
 ///
 /// ## References
@@ -379,6 +391,16 @@ impl Violation for StringDotFormatInvalidFormat {
 /// "Hello, {name}".format(name="World")
 /// ```
 ///
+/// ## Fix safety
+/// This rule's fix is marked as unsafe if the unused keyword argument
+/// contains a function call with potential side effects,
+/// because removing such arguments could change the behavior of the code.
+///
+/// For example, the fix would be marked as unsafe in the following case:
+/// ```python
+/// "Hello, {name}".format(greeting=print(1), name="World")
+/// ```
+///
 /// ## References
 /// - [Python documentation: `str.format`](https://docs.python.org/3/library/stdtypes.html#str.format)
 #[derive(ViolationMetadata)]
@@ -418,6 +440,16 @@ impl Violation for StringDotFormatExtraNamedArguments {
 /// Use instead:
 /// ```python
 /// "Hello, {0}".format("world")
+/// ```
+///
+/// ## Fix safety
+/// This rule's fix is marked as unsafe if the unused positional argument
+/// contains a function call with potential side effects,
+/// because removing such arguments could change the behavior of the code.
+///
+/// For example, the fix would be marked as unsafe in the following case:
+/// ```python
+/// "Hello, {0}".format("world", print(1))
 /// ```
 ///
 /// ## References
@@ -539,7 +571,7 @@ pub(crate) fn percent_format_expected_mapping(
             | Expr::ListComp(_)
             | Expr::SetComp(_)
             | Expr::Generator(_) => {
-                checker.report_diagnostic(Diagnostic::new(PercentFormatExpectedMapping, location));
+                checker.report_diagnostic(PercentFormatExpectedMapping, location);
             }
             _ => {}
         }
@@ -554,7 +586,7 @@ pub(crate) fn percent_format_expected_sequence(
     location: TextRange,
 ) {
     if summary.num_positional > 1 && matches!(right, Expr::Dict(_) | Expr::DictComp(_)) {
-        checker.report_diagnostic(Diagnostic::new(PercentFormatExpectedSequence, location));
+        checker.report_diagnostic(PercentFormatExpectedSequence, location);
     }
 }
 
@@ -599,21 +631,29 @@ pub(crate) fn percent_format_extra_named_arguments(
         .iter()
         .map(|(_, name)| (*name).to_string())
         .collect();
-    let mut diagnostic = Diagnostic::new(
+    let mut diagnostic = checker.report_diagnostic(
         PercentFormatExtraNamedArguments { missing: names },
         location,
     );
-    let indexes: Vec<usize> = missing.iter().map(|(index, _)| *index).collect();
+
     diagnostic.try_set_fix(|| {
+        let indexes: Vec<usize> = missing.iter().map(|(index, _)| *index).collect();
         let edit = remove_unused_format_arguments_from_dict(
             &indexes,
             dict,
             checker.locator(),
             checker.stylist(),
         )?;
-        Ok(Fix::safe_edit(edit))
+        Ok(Fix::applicable_edit(
+            edit,
+            // Mark fix as unsafe if `dict` contains a call with side effect
+            if contains_effect(right, |id| checker.semantic().has_builtin_binding(id)) {
+                Applicability::Unsafe
+            } else {
+                Applicability::Safe
+            },
+        ))
     });
-    checker.report_diagnostic(diagnostic);
 }
 
 /// F505
@@ -654,12 +694,12 @@ pub(crate) fn percent_format_missing_arguments(
         .collect();
 
     if !missing.is_empty() {
-        checker.report_diagnostic(Diagnostic::new(
+        checker.report_diagnostic(
             PercentFormatMissingArgument {
                 missing: missing.iter().map(|&s| s.clone()).collect(),
             },
             location,
-        ));
+        );
     }
 }
 
@@ -670,10 +710,7 @@ pub(crate) fn percent_format_mixed_positional_and_named(
     location: TextRange,
 ) {
     if !(summary.num_positional == 0 || summary.keywords.is_empty()) {
-        checker.report_diagnostic(Diagnostic::new(
-            PercentFormatMixedPositionalAndNamed,
-            location,
-        ));
+        checker.report_diagnostic(PercentFormatMixedPositionalAndNamed, location);
     }
 }
 
@@ -698,13 +735,13 @@ pub(crate) fn percent_format_positional_count_mismatch(
         }
 
         if found != summary.num_positional {
-            checker.report_diagnostic(Diagnostic::new(
+            checker.report_diagnostic(
                 PercentFormatPositionalCountMismatch {
                     wanted: summary.num_positional,
                     got: found,
                 },
                 location,
-            ));
+            );
         }
     }
 }
@@ -718,8 +755,9 @@ pub(crate) fn percent_format_star_requires_sequence(
 ) {
     if summary.starred {
         match right {
-            Expr::Dict(_) | Expr::DictComp(_) => checker
-                .report_diagnostic(Diagnostic::new(PercentFormatStarRequiresSequence, location)),
+            Expr::Dict(_) | Expr::DictComp(_) => {
+                checker.report_diagnostic(PercentFormatStarRequiresSequence, location);
+            }
             _ => {}
         }
     }
@@ -737,16 +775,19 @@ pub(crate) fn string_dot_format_extra_named_arguments(
         return;
     }
 
-    let keywords = keywords
+    let keyword_names = keywords
         .iter()
-        .filter_map(|Keyword { arg, .. }| arg.as_ref());
+        .filter_map(|Keyword { arg, value, .. }| Some((arg.as_ref()?, value)));
 
-    let missing: Vec<(usize, &Name)> = keywords
+    let mut side_effects = false;
+    let missing: Vec<(usize, &Name)> = keyword_names
         .enumerate()
-        .filter_map(|(index, keyword)| {
+        .filter_map(|(index, (keyword, value))| {
             if summary.keywords.contains(keyword.id()) {
                 None
             } else {
+                side_effects |=
+                    contains_effect(value, |id| checker.semantic().has_builtin_binding(id));
                 Some((index, &keyword.id))
             }
         })
@@ -757,11 +798,11 @@ pub(crate) fn string_dot_format_extra_named_arguments(
     }
 
     let names: Vec<Name> = missing.iter().map(|(_, name)| (*name).clone()).collect();
-    let mut diagnostic = Diagnostic::new(
+    let mut diagnostic = checker.report_diagnostic(
         StringDotFormatExtraNamedArguments { missing: names },
         call.range(),
     );
-    let indexes: Vec<usize> = missing.iter().map(|(index, _)| *index).collect();
+    let indexes: Vec<usize> = missing.into_iter().map(|(index, _)| index).collect();
     diagnostic.try_set_fix(|| {
         let edit = remove_unused_keyword_arguments_from_format_call(
             &indexes,
@@ -769,9 +810,17 @@ pub(crate) fn string_dot_format_extra_named_arguments(
             checker.locator(),
             checker.stylist(),
         )?;
-        Ok(Fix::safe_edit(edit))
+
+        Ok(Fix::applicable_edit(
+            edit,
+            // Mark fix as unsafe if the `format` call contains an argument with side effect
+            if side_effects {
+                Applicability::Unsafe
+            } else {
+                Applicability::Safe
+            },
+        ))
     });
-    checker.report_diagnostic(diagnostic);
 }
 
 /// F523
@@ -806,20 +855,24 @@ pub(crate) fn string_dot_format_extra_positional_arguments(
         true
     }
 
+    let mut side_effects = false;
     let missing: Vec<usize> = args
         .iter()
         .enumerate()
         .filter(|(i, arg)| {
             !(arg.is_starred_expr() || summary.autos.contains(i) || summary.indices.contains(i))
         })
-        .map(|(i, _)| i)
+        .map(|(i, arg)| {
+            side_effects |= contains_effect(arg, |id| checker.semantic().has_builtin_binding(id));
+            i
+        })
         .collect();
 
     if missing.is_empty() {
         return;
     }
 
-    let mut diagnostic = Diagnostic::new(
+    let mut diagnostic = checker.report_diagnostic(
         StringDotFormatExtraPositionalArguments {
             missing: missing
                 .iter()
@@ -837,11 +890,17 @@ pub(crate) fn string_dot_format_extra_positional_arguments(
                 checker.locator(),
                 checker.stylist(),
             )?;
-            Ok(Fix::safe_edit(edit))
+            Ok(Fix::applicable_edit(
+                edit,
+                // Mark fix as unsafe if the `format` call contains an argument with side effect
+                if side_effects {
+                    Applicability::Unsafe
+                } else {
+                    Applicability::Safe
+                },
+            ))
         });
     }
-
-    checker.report_diagnostic(diagnostic);
 }
 
 /// F524
@@ -880,10 +939,7 @@ pub(crate) fn string_dot_format_missing_argument(
         .collect();
 
     if !missing.is_empty() {
-        checker.report_diagnostic(Diagnostic::new(
-            StringDotFormatMissingArguments { missing },
-            call.range(),
-        ));
+        checker.report_diagnostic(StringDotFormatMissingArguments { missing }, call.range());
     }
 }
 
@@ -894,9 +950,6 @@ pub(crate) fn string_dot_format_mixing_automatic(
     summary: &FormatSummary,
 ) {
     if !(summary.autos.is_empty() || summary.indices.is_empty()) {
-        checker.report_diagnostic(Diagnostic::new(
-            StringDotFormatMixingAutomatic,
-            call.range(),
-        ));
+        checker.report_diagnostic(StringDotFormatMixingAutomatic, call.range());
     }
 }

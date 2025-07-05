@@ -25,6 +25,10 @@ pub(crate) fn main(args: &Args) -> anyhow::Result<()> {
     let file_name = "crates/ty/docs/configuration.md";
     let markdown_path = PathBuf::from(ROOT_DIR).join(file_name);
 
+    output.push_str(
+        "<!-- WARNING: This file is auto-generated (cargo dev generate-all). Update the doc comments on the 'Options' struct in 'crates/ty_project/src/metadata/options.rs' if you want to change anything here. -->\n\n",
+    );
+
     generate_set(
         &mut output,
         Set::Toplevel(Options::metadata()),
@@ -110,6 +114,7 @@ fn generate_set(output: &mut String, set: Set, parents: &mut Vec<Set>) {
     parents.pop();
 }
 
+#[derive(Debug)]
 enum Set {
     Toplevel(OptionSet),
     Named { name: String, set: OptionSet },
@@ -132,7 +137,7 @@ impl Set {
 }
 
 fn emit_field(output: &mut String, name: &str, field: &OptionField, parents: &[Set]) {
-    let header_level = if parents.is_empty() { "###" } else { "####" };
+    let header_level = "#".repeat(parents.len() + 1);
 
     let _ = writeln!(output, "{header_level} `{name}`");
 

@@ -1,12 +1,12 @@
 use ruff_db::files::File;
+use ruff_db::parsed::ParsedModuleRef;
 use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_text_size::{Ranged, TextRange};
 
 use crate::Db;
 use crate::ast_node_ref::AstNodeRef;
-use crate::semantic_index::ast_ids::{HasScopedExpressionId, ScopedExpressionId};
 use crate::semantic_index::expression::Expression;
-use crate::semantic_index::symbol::{FileScopeId, ScopeId};
+use crate::semantic_index::place::{FileScopeId, ScopeId};
 
 /// This ingredient represents a single unpacking.
 ///
@@ -37,9 +37,9 @@ pub(crate) struct Unpack<'db> {
     /// The target expression that is being unpacked. For example, in `(a, b) = (1, 2)`, the target
     /// expression is `(a, b)`.
     #[no_eq]
-    #[returns(deref)]
     #[tracked]
-    pub(crate) target: AstNodeRef<ast::Expr>,
+    #[returns(ref)]
+    pub(crate) _target: AstNodeRef<ast::Expr>,
 
     /// The ingredient representing the value expression of the unpacking. For example, in
     /// `(a, b) = (1, 2)`, the value expression is `(1, 2)`.
@@ -49,14 +49,12 @@ pub(crate) struct Unpack<'db> {
 }
 
 impl<'db> Unpack<'db> {
-    /// Returns the scope in which the unpack value expression belongs.
-    ///
-    /// The scope in which the target and value expression belongs to are usually the same
-    /// except in generator expressions and comprehensions (list/dict/set), where the value
-    /// expression of the first generator is evaluated in the outer scope, while the ones in the subsequent
-    /// generators are evaluated in the comprehension scope.
-    pub(crate) fn value_scope(self, db: &'db dyn Db) -> ScopeId<'db> {
-        self.value_file_scope(db).to_scope_id(db, self.file(db))
+    pub(crate) fn target<'ast>(
+        self,
+        db: &'db dyn Db,
+        parsed: &'ast ParsedModuleRef,
+    ) -> &'ast ast::Expr {
+        self._target(db).node(parsed)
     }
 
     /// Returns the scope where the unpack target expression belongs to.
@@ -65,8 +63,8 @@ impl<'db> Unpack<'db> {
     }
 
     /// Returns the range of the unpack target expression.
-    pub(crate) fn range(self, db: &'db dyn Db) -> TextRange {
-        self.target(db).range()
+    pub(crate) fn range(self, db: &'db dyn Db, module: &ParsedModuleRef) -> TextRange {
+        self.target(db, module).range()
     }
 }
 
@@ -89,20 +87,13 @@ impl<'db> UnpackValue<'db> {
         self.expression
     }
 
-    /// Returns the [`ScopedExpressionId`] of the underlying expression.
-    pub(crate) fn scoped_expression_id(
+    /// Returns the expression as an [`AnyNodeRef`].
+    pub(crate) fn as_any_node_ref<'ast>(
         self,
         db: &'db dyn Db,
-        scope: ScopeId<'db>,
-    ) -> ScopedExpressionId {
-        self.expression()
-            .node_ref(db)
-            .scoped_expression_id(db, scope)
-    }
-
-    /// Returns the expression as an [`AnyNodeRef`].
-    pub(crate) fn as_any_node_ref(self, db: &'db dyn Db) -> AnyNodeRef<'db> {
-        self.expression().node_ref(db).into()
+        module: &'ast ParsedModuleRef,
+    ) -> AnyNodeRef<'ast> {
+        self.expression().node_ref(db, module).into()
     }
 
     pub(crate) const fn kind(self) -> UnpackKind {
