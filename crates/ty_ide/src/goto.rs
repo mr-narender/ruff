@@ -1,7 +1,7 @@
 use crate::find_node::covering_node;
 use crate::{Db, HasNavigationTargets, NavigationTargets, RangedValue};
 use ruff_db::files::{File, FileRange};
-use ruff_db::parsed::{ParsedModule, parsed_module};
+use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::{self as ast, AnyNodeRef};
 use ruff_python_parser::TokenKind;
 use ruff_text_size::{Ranged, TextRange, TextSize};
@@ -13,16 +13,13 @@ pub fn goto_type_definition(
     file: File,
     offset: TextSize,
 ) -> Option<RangedValue<NavigationTargets>> {
-    let parsed = parsed_module(db.upcast(), file);
-    let goto_target = find_goto_target(parsed, offset)?;
+    let module = parsed_module(db, file).load(db);
+    let goto_target = find_goto_target(&module, offset)?;
 
-    let model = SemanticModel::new(db.upcast(), file);
+    let model = SemanticModel::new(db, file);
     let ty = goto_target.inferred_type(&model)?;
 
-    tracing::debug!(
-        "Inferred type of covering node is {}",
-        ty.display(db.upcast())
-    );
+    tracing::debug!("Inferred type of covering node is {}", ty.display(db));
 
     let navigation_targets = ty.navigation_targets(db);
 
@@ -128,8 +125,8 @@ pub(crate) enum GotoTarget<'a> {
     },
 }
 
-impl<'db> GotoTarget<'db> {
-    pub(crate) fn inferred_type(self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
+impl GotoTarget<'_> {
+    pub(crate) fn inferred_type<'db>(self, model: &SemanticModel<'db>) -> Option<Type<'db>> {
         let ty = match self {
             GotoTarget::Expression(expression) => expression.inferred_type(model),
             GotoTarget::FunctionDef(function) => function.inferred_type(model),
@@ -183,7 +180,10 @@ impl Ranged for GotoTarget<'_> {
     }
 }
 
-pub(crate) fn find_goto_target(parsed: &ParsedModule, offset: TextSize) -> Option<GotoTarget> {
+pub(crate) fn find_goto_target(
+    parsed: &ParsedModuleRef,
+    offset: TextSize,
+) -> Option<GotoTarget<'_>> {
     let token = parsed
         .tokens()
         .at_offset(offset)
@@ -197,7 +197,7 @@ pub(crate) fn find_goto_target(parsed: &ParsedModule, offset: TextSize) -> Optio
         })?;
 
     let covering_node = covering_node(parsed.syntax().into(), token.range())
-        .find(|node| node.is_identifier() || node.is_expression())
+        .find_first(|node| node.is_identifier() || node.is_expression())
         .ok()?;
 
     tracing::trace!("Covering node is of kind {:?}", covering_node.node().kind());
@@ -421,16 +421,16 @@ mod tests {
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r#"
         info[goto-type-definition]: Type definition
-           --> stdlib/builtins.pyi:445:7
+           --> stdlib/builtins.pyi:461:7
             |
-        443 |     def __getitem__(self, key: int, /) -> str | int | None: ...
-        444 |
-        445 | class str(Sequence[str]):
+        459 |     def __getitem__(self, key: int, /) -> str | int | None: ...
+        460 |
+        461 | class str(Sequence[str]):
             |       ^^^
-        446 |     @overload
-        447 |     def __new__(cls, object: object = ...) -> Self: ...
+        462 |     @overload
+        463 |     def __new__(cls, object: object = ...) -> Self: ...
             |
         info: Source
          --> main.py:4:13
@@ -440,7 +440,7 @@ mod tests {
         4 |             a
           |             ^
           |
-        "###);
+        "#);
     }
     #[test]
     fn goto_type_of_expression_with_literal_node() {
@@ -450,16 +450,16 @@ mod tests {
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r#"
         info[goto-type-definition]: Type definition
-           --> stdlib/builtins.pyi:445:7
+           --> stdlib/builtins.pyi:461:7
             |
-        443 |     def __getitem__(self, key: int, /) -> str | int | None: ...
-        444 |
-        445 | class str(Sequence[str]):
+        459 |     def __getitem__(self, key: int, /) -> str | int | None: ...
+        460 |
+        461 | class str(Sequence[str]):
             |       ^^^
-        446 |     @overload
-        447 |     def __new__(cls, object: object = ...) -> Self: ...
+        462 |     @overload
+        463 |     def __new__(cls, object: object = ...) -> Self: ...
             |
         info: Source
          --> main.py:2:22
@@ -467,7 +467,7 @@ mod tests {
         2 |             a: str = "test"
           |                      ^^^^^^
           |
-        "###);
+        "#);
     }
 
     #[test]
@@ -566,16 +566,16 @@ mod tests {
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r#"
         info[goto-type-definition]: Type definition
-           --> stdlib/builtins.pyi:445:7
+           --> stdlib/builtins.pyi:461:7
             |
-        443 |     def __getitem__(self, key: int, /) -> str | int | None: ...
-        444 |
-        445 | class str(Sequence[str]):
+        459 |     def __getitem__(self, key: int, /) -> str | int | None: ...
+        460 |
+        461 | class str(Sequence[str]):
             |       ^^^
-        446 |     @overload
-        447 |     def __new__(cls, object: object = ...) -> Self: ...
+        462 |     @overload
+        463 |     def __new__(cls, object: object = ...) -> Self: ...
             |
         info: Source
          --> main.py:4:18
@@ -585,7 +585,7 @@ mod tests {
         4 |             test(a= "123")
           |                  ^
           |
-        "###);
+        "#);
     }
 
     #[test]
@@ -601,16 +601,16 @@ mod tests {
         // TODO: This should jump to `str` and not `int` because
         //   the keyword is typed as a string. It's only the passed argument that
         //   is an int. Navigating to `str` would match pyright's behavior.
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r"
         info[goto-type-definition]: Type definition
-           --> stdlib/builtins.pyi:238:7
+           --> stdlib/builtins.pyi:244:7
             |
-        236 | _LiteralInteger = _PositiveInteger | _NegativeInteger | Literal[0]  # noqa: Y026  # TODO: Use TypeAlias once mypy bugs are fixed
-        237 |
-        238 | class int:
+        242 | _LiteralInteger = _PositiveInteger | _NegativeInteger | Literal[0]  # noqa: Y026  # TODO: Use TypeAlias once mypy bugs are fixed
+        243 |
+        244 | class int:
             |       ^^^
-        239 |     @overload
-        240 |     def __new__(cls, x: ConvertibleToInt = ..., /) -> Self: ...
+        245 |     @overload
+        246 |     def __new__(cls, x: ConvertibleToInt = ..., /) -> Self: ...
             |
         info: Source
          --> main.py:4:18
@@ -620,7 +620,7 @@ mod tests {
         4 |             test(a= 123)
           |                  ^
           |
-        "###);
+        ");
     }
 
     #[test]
@@ -635,16 +635,16 @@ f(**kwargs<CURSOR>)
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r#"
         info[goto-type-definition]: Type definition
-            --> stdlib/builtins.pyi:1096:7
+            --> stdlib/builtins.pyi:1136:7
              |
-        1094 |     def __class_getitem__(cls, item: Any, /) -> GenericAlias: ...
-        1095 |
-        1096 | class dict(MutableMapping[_KT, _VT]):
+        1134 |     def __class_getitem__(cls, item: Any, /) -> GenericAlias: ...
+        1135 |
+        1136 | class dict(MutableMapping[_KT, _VT]):
              |       ^^^^
-        1097 |     # __init__ should be kept roughly in line with `collections.UserDict.__init__`, which has similar semantics
-        1098 |     # Also multiprocessing.managers.SyncManager.dict()
+        1137 |     # __init__ should be kept roughly in line with `collections.UserDict.__init__`, which has similar semantics
+        1138 |     # Also multiprocessing.managers.SyncManager.dict()
              |
         info: Source
          --> main.py:6:5
@@ -654,7 +654,7 @@ f(**kwargs<CURSOR>)
         6 | f(**kwargs)
           |     ^^^^^^
           |
-        "###);
+        "#);
     }
 
     #[test]
@@ -666,16 +666,16 @@ f(**kwargs<CURSOR>)
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r"
         info[goto-type-definition]: Type definition
-           --> stdlib/builtins.pyi:445:7
+           --> stdlib/builtins.pyi:461:7
             |
-        443 |     def __getitem__(self, key: int, /) -> str | int | None: ...
-        444 |
-        445 | class str(Sequence[str]):
+        459 |     def __getitem__(self, key: int, /) -> str | int | None: ...
+        460 |
+        461 | class str(Sequence[str]):
             |       ^^^
-        446 |     @overload
-        447 |     def __new__(cls, object: object = ...) -> Self: ...
+        462 |     @overload
+        463 |     def __new__(cls, object: object = ...) -> Self: ...
             |
         info: Source
          --> main.py:3:17
@@ -684,7 +684,7 @@ f(**kwargs<CURSOR>)
         3 |                 a
           |                 ^
           |
-        "###);
+        ");
     }
 
     #[test]
@@ -759,16 +759,16 @@ f(**kwargs<CURSOR>)
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r"
         info[goto-type-definition]: Type definition
-           --> stdlib/builtins.pyi:445:7
+           --> stdlib/builtins.pyi:461:7
             |
-        443 |     def __getitem__(self, key: int, /) -> str | int | None: ...
-        444 |
-        445 | class str(Sequence[str]):
+        459 |     def __getitem__(self, key: int, /) -> str | int | None: ...
+        460 |
+        461 | class str(Sequence[str]):
             |       ^^^
-        446 |     @overload
-        447 |     def __new__(cls, object: object = ...) -> Self: ...
+        462 |     @overload
+        463 |     def __new__(cls, object: object = ...) -> Self: ...
             |
         info: Source
          --> main.py:4:27
@@ -778,7 +778,7 @@ f(**kwargs<CURSOR>)
         4 |                     print(a)
           |                           ^
           |
-        "###);
+        ");
     }
 
     #[test]
@@ -790,15 +790,15 @@ f(**kwargs<CURSOR>)
             "#,
         );
 
-        assert_snapshot!(test.goto_type_definition(), @r###"
+        assert_snapshot!(test.goto_type_definition(), @r"
         info[goto-type-definition]: Type definition
-           --> stdlib/types.pyi:680:11
+           --> stdlib/types.pyi:691:11
             |
-        678 | if sys.version_info >= (3, 10):
-        679 |     @final
-        680 |     class NoneType:
+        689 | if sys.version_info >= (3, 10):
+        690 |     @final
+        691 |     class NoneType:
             |           ^^^^^^^^
-        681 |         def __bool__(self) -> Literal[False]: ...
+        692 |         def __bool__(self) -> Literal[False]: ...
             |
         info: Source
          --> main.py:3:17
@@ -809,14 +809,14 @@ f(**kwargs<CURSOR>)
           |
 
         info[goto-type-definition]: Type definition
-           --> stdlib/builtins.pyi:445:7
+           --> stdlib/builtins.pyi:461:7
             |
-        443 |     def __getitem__(self, key: int, /) -> str | int | None: ...
-        444 |
-        445 | class str(Sequence[str]):
+        459 |     def __getitem__(self, key: int, /) -> str | int | None: ...
+        460 |
+        461 | class str(Sequence[str]):
             |       ^^^
-        446 |     @overload
-        447 |     def __new__(cls, object: object = ...) -> Self: ...
+        462 |     @overload
+        463 |     def __new__(cls, object: object = ...) -> Self: ...
             |
         info: Source
          --> main.py:3:17
@@ -825,12 +825,13 @@ f(**kwargs<CURSOR>)
         3 |                 a
           |                 ^
           |
-        "###);
+        ");
     }
 
     impl CursorTest {
         fn goto_type_definition(&self) -> String {
-            let Some(targets) = goto_type_definition(&self.db, self.file, self.cursor_offset)
+            let Some(targets) =
+                goto_type_definition(&self.db, self.cursor.file, self.cursor.offset)
             else {
                 return "No goto target found".to_string();
             };

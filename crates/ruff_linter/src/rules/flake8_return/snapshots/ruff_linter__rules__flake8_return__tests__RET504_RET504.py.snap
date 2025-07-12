@@ -1,6 +1,5 @@
 ---
 source: crates/ruff_linter/src/rules/flake8_return/mod.rs
-snapshot_kind: text
 ---
 RET504.py:6:12: RET504 [*] Unnecessary assignment to `a` before `return` statement
   |
@@ -258,3 +257,47 @@ RET504.py:423:16: RET504 [*] Unnecessary assignment to `services` before `return
 422     |-        services = a["services"]
 423     |-        return services
     422 |+        return a["services"]
+424 423 | 
+425 424 | 
+426 425 | # See: https://github.com/astral-sh/ruff/issues/14052
+
+RET504.py:458:12: RET504 [*] Unnecessary assignment to `x` before `return` statement
+    |
+456 |     (#=
+457 |     x) = 1
+458 |     return x
+    |            ^ RET504
+459 |
+460 | def f():
+    |
+    = help: Remove unnecessary assignment
+
+ℹ Unsafe fix
+453 453 | 
+454 454 | # See: https://github.com/astral-sh/ruff/issues/18411
+455 455 | def f():
+456     |-    (#=
+457     |-    x) = 1
+458     |-    return x
+    456 |+    return 1
+459 457 | 
+460 458 | def f():
+461 459 |     x = (1
+
+RET504.py:463:12: RET504 [*] Unnecessary assignment to `x` before `return` statement
+    |
+461 |     x = (1
+462 |               )
+463 |     return x
+    |            ^ RET504
+    |
+    = help: Remove unnecessary assignment
+
+ℹ Unsafe fix
+458 458 |     return x
+459 459 | 
+460 460 | def f():
+461     |-    x = (1
+    461 |+    return (1
+462 462 |               )
+463     |-    return x

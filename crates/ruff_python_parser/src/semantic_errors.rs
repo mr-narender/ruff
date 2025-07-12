@@ -118,7 +118,11 @@ impl SemanticSyntaxChecker {
                 // _ = *(p + q)
                 Self::invalid_star_expression(value, ctx);
             }
-            Stmt::Return(ast::StmtReturn { value, range }) => {
+            Stmt::Return(ast::StmtReturn {
+                value,
+                range,
+                node_index: _,
+            }) => {
                 if let Some(value) = value {
                     // test_err single_star_return
                     // def f(): return *x
@@ -638,6 +642,7 @@ impl SemanticSyntaxChecker {
                 range,
                 id,
                 ctx: expr_ctx,
+                node_index: _,
             }) => {
                 // test_err write_to_debug_expr
                 // del __debug__
@@ -769,16 +774,21 @@ impl SemanticSyntaxChecker {
         // We are intentionally not inspecting the async status of the scope for now to mimic F704.
         // await-outside-async is PLE1142 instead, so we'll end up emitting both syntax errors for
         // cases that trigger F704
+
+        if ctx.in_function_scope() {
+            return;
+        }
+
         if kind.is_await() {
-            if ctx.in_await_allowed_context() {
-                return;
-            }
             // `await` is allowed at the top level of a Jupyter notebook.
             // See: https://ipython.readthedocs.io/en/stable/interactive/autoawait.html.
             if ctx.in_module_scope() && ctx.in_notebook() {
                 return;
             }
-        } else if ctx.in_function_scope() {
+            if ctx.in_await_allowed_context() {
+                return;
+            }
+        } else if ctx.in_yield_allowed_context() {
             return;
         }
 
@@ -880,7 +890,7 @@ impl SemanticSyntaxChecker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub struct SemanticSyntaxError {
     pub kind: SemanticSyntaxErrorKind,
     pub range: TextRange,
@@ -942,6 +952,9 @@ impl Display for SemanticSyntaxError {
             SemanticSyntaxErrorKind::LoadBeforeGlobalDeclaration { name, start: _ } => {
                 write!(f, "name `{name}` is used prior to global declaration")
             }
+            SemanticSyntaxErrorKind::LoadBeforeNonlocalDeclaration { name, start: _ } => {
+                write!(f, "name `{name}` is used prior to nonlocal declaration")
+            }
             SemanticSyntaxErrorKind::InvalidStarExpression => {
                 f.write_str("Starred expression cannot be used here")
             }
@@ -967,11 +980,26 @@ impl Display for SemanticSyntaxError {
             SemanticSyntaxErrorKind::NonlocalDeclarationAtModuleLevel => {
                 write!(f, "nonlocal declaration not allowed at module level")
             }
+            SemanticSyntaxErrorKind::NonlocalAndGlobal(name) => {
+                write!(f, "name `{name}` is nonlocal and global")
+            }
+            SemanticSyntaxErrorKind::AnnotatedGlobal(name) => {
+                write!(f, "annotated name `{name}` can't be global")
+            }
+            SemanticSyntaxErrorKind::AnnotatedNonlocal(name) => {
+                write!(f, "annotated name `{name}` can't be nonlocal")
+            }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Ranged for SemanticSyntaxError {
+    fn range(&self) -> TextRange {
+        self.range
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum SemanticSyntaxErrorKind {
     /// Represents the use of a `__future__` import after the beginning of a file.
     ///
@@ -1191,6 +1219,24 @@ pub enum SemanticSyntaxErrorKind {
     /// [#111123]: https://github.com/python/cpython/issues/111123
     LoadBeforeGlobalDeclaration { name: String, start: TextSize },
 
+    /// Represents the use of a `nonlocal` variable before its `nonlocal` declaration.
+    ///
+    /// ## Examples
+    ///
+    /// ```python
+    /// def f():
+    ///     counter = 0
+    ///     def increment():
+    ///         print(f"Adding 1 to {counter}")
+    ///         nonlocal counter  # SyntaxError: name 'counter' is used prior to nonlocal declaration
+    ///         counter += 1
+    /// ```
+    ///
+    /// ## Known Issues
+    ///
+    /// See [`LoadBeforeGlobalDeclaration`][Self::LoadBeforeGlobalDeclaration].
+    LoadBeforeNonlocalDeclaration { name: String, start: TextSize },
+
     /// Represents the use of a starred expression in an invalid location, such as a `return` or
     /// `yield` statement.
     ///
@@ -1291,9 +1337,18 @@ pub enum SemanticSyntaxErrorKind {
 
     /// Represents a nonlocal declaration at module level
     NonlocalDeclarationAtModuleLevel,
+
+    /// Represents the same variable declared as both nonlocal and global
+    NonlocalAndGlobal(String),
+
+    /// Represents a type annotation on a variable that's been declared global
+    AnnotatedGlobal(String),
+
+    /// Represents a type annotation on a variable that's been declared nonlocal
+    AnnotatedNonlocal(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum AwaitOutsideAsyncFunctionKind {
     Await,
     AsyncFor,
@@ -1312,7 +1367,7 @@ impl Display for AwaitOutsideAsyncFunctionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum YieldOutsideFunctionKind {
     Yield,
     YieldFrom,
@@ -1335,7 +1390,7 @@ impl Display for YieldOutsideFunctionKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum InvalidExpressionPosition {
     TypeVarBound,
     TypeVarDefault,
@@ -1360,7 +1415,7 @@ impl Display for InvalidExpressionPosition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum InvalidExpressionKind {
     Yield,
     NamedExpr,
@@ -1377,7 +1432,7 @@ impl Display for InvalidExpressionKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub enum WriteToDebugKind {
     Store,
     Delete(PythonVersion),
@@ -1718,6 +1773,35 @@ pub trait SemanticSyntaxContext {
     ///
     /// See the trait-level documentation for more details.
     fn in_await_allowed_context(&self) -> bool;
+
+    /// Returns `true` if the visitor is currently in a context where `yield` and `yield from`
+    /// expressions are allowed.
+    ///
+    /// Yield expressions are allowed only in:
+    /// 1. Function definitions
+    /// 2. Lambda expressions
+    ///
+    /// Unlike `await`, yield is not allowed in:
+    /// - Comprehensions (list, set, dict)
+    /// - Generator expressions
+    /// - Class definitions
+    ///
+    /// This method should traverse parent scopes to check if the closest relevant scope
+    /// is a function or lambda, and that no disallowed context (class, comprehension, generator)
+    /// intervenes. For example:
+    ///
+    /// ```python
+    /// def f():
+    ///     yield 1  # okay, in a function
+    ///     lambda: (yield 1)  # okay, in a lambda
+    ///
+    ///     [(yield 1) for x in range(3)]  # error, in a comprehension
+    ///     ((yield 1) for x in range(3))  # error, in a generator expression
+    ///     class C:
+    ///         yield 1  # error, in a class within a function
+    /// ```
+    ///
+    fn in_yield_allowed_context(&self) -> bool;
 
     /// Returns `true` if the visitor is currently inside of a synchronous comprehension.
     ///

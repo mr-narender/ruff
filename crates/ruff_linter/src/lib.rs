@@ -14,6 +14,9 @@ pub use rule_selector::RuleSelector;
 pub use rule_selector::clap_completion::RuleSelectorParser;
 pub use rules::pycodestyle::rules::IOError;
 
+pub(crate) use ruff_diagnostics::{Applicability, Edit, Fix};
+pub use violation::{AlwaysFixableViolation, FixAvailability, Violation, ViolationMetadata};
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 mod checkers;
@@ -45,6 +48,7 @@ pub mod settings;
 pub mod source_kind;
 mod text_helpers;
 pub mod upstream_categories;
+mod violation;
 
 #[cfg(any(test, fuzzing))]
 pub mod test;

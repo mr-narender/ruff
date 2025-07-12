@@ -5,10 +5,13 @@ use std::fmt::{self, Display, Formatter, Write};
 use ruff_db::display::FormatterJoinExtension;
 use ruff_python_ast::str::{Quote, TripleQuotes};
 use ruff_python_literal::escape::AsciiEscape;
+use ruff_text_size::{TextRange, TextSize};
 
 use crate::types::class::{ClassLiteral, ClassType, GenericAlias};
+use crate::types::function::{FunctionType, OverloadLiteral};
 use crate::types::generics::{GenericContext, Specialization};
-use crate::types::signatures::{Parameter, Parameters, Signature};
+use crate::types::signatures::{CallableSignature, Parameter, Parameters, Signature};
+use crate::types::tuple::TupleSpec;
 use crate::types::{
     CallableType, IntersectionType, KnownClass, MethodWrapperKind, Protocol, StringLiteralType,
     SubclassOfInner, Type, TypeVarBoundOrConstraints, TypeVarInstance, UnionType,
@@ -110,35 +113,9 @@ impl Display for DisplayRepresentation<'_> {
                 SubclassOfInner::Class(class) => write!(f, "type[{}]", class.name(self.db)),
                 SubclassOfInner::Dynamic(dynamic) => write!(f, "type[{dynamic}]"),
             },
+            Type::SpecialForm(special_form) => special_form.fmt(f),
             Type::KnownInstance(known_instance) => known_instance.repr(self.db).fmt(f),
-            Type::FunctionLiteral(function) => {
-                let signature = function.signature(self.db);
-
-                // TODO: when generic function types are supported, we should add
-                // the generic type parameters to the signature, i.e.
-                // show `def foo[T](x: T) -> T`.
-
-                match signature.overloads.as_slice() {
-                    [signature] => {
-                        write!(
-                            f,
-                            // "def {name}{specialization}{signature}",
-                            "def {name}{signature}",
-                            name = function.name(self.db),
-                            signature = signature.display(self.db)
-                        )
-                    }
-                    signatures => {
-                        // TODO: How to display overloads?
-                        f.write_str("Overload[")?;
-                        let mut join = f.join(", ");
-                        for signature in signatures {
-                            join.entry(&signature.display(self.db));
-                        }
-                        f.write_str("]")
-                    }
-                }
-            }
+            Type::FunctionLiteral(function) => function.display(self.db).fmt(f),
             Type::Callable(callable) => callable.display(self.db).fmt(f),
             Type::BoundMethod(bound_method) => {
                 let function = bound_method.function(self.db);
@@ -215,16 +192,7 @@ impl Display for DisplayRepresentation<'_> {
 
                 escape.bytes_repr(TripleQuotes::No).write(f)
             }
-            Type::Tuple(tuple) => {
-                f.write_str("tuple[")?;
-                let elements = tuple.elements(self.db);
-                if elements.is_empty() {
-                    f.write_str("()")?;
-                } else {
-                    elements.display(self.db).fmt(f)?;
-                }
-                f.write_str("]")
-            }
+            Type::Tuple(specialization) => specialization.tuple(self.db).display(self.db).fmt(f),
             Type::TypeVar(typevar) => f.write_str(typevar.name(self.db)),
             Type::AlwaysTruthy => f.write_str("AlwaysTruthy"),
             Type::AlwaysFalsy => f.write_str("AlwaysFalsy"),
@@ -235,6 +203,141 @@ impl Display for DisplayRepresentation<'_> {
                     pivot = Type::from(bound_super.pivot_class(self.db)).display(self.db),
                     owner = bound_super.owner(self.db).into_type().display(self.db)
                 )
+            }
+            Type::TypeIs(type_is) => {
+                f.write_str("TypeIs[")?;
+                type_is.return_type(self.db).display(self.db).fmt(f)?;
+                if let Some(name) = type_is.place_name(self.db) {
+                    f.write_str(" @ ")?;
+                    f.write_str(&name)?;
+                }
+                f.write_str("]")
+            }
+        }
+    }
+}
+
+impl<'db> TupleSpec<'db> {
+    pub(crate) fn display(&'db self, db: &'db dyn Db) -> DisplayTuple<'db> {
+        DisplayTuple { tuple: self, db }
+    }
+}
+
+pub(crate) struct DisplayTuple<'db> {
+    tuple: &'db TupleSpec<'db>,
+    db: &'db dyn Db,
+}
+
+impl Display for DisplayTuple<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("tuple[")?;
+        match self.tuple {
+            TupleSpec::Fixed(tuple) => {
+                let elements = tuple.elements_slice();
+                if elements.is_empty() {
+                    f.write_str("()")?;
+                } else {
+                    elements.display(self.db).fmt(f)?;
+                }
+            }
+
+            // Decoder key for which snippets of text need to be included depending on whether
+            // the tuple contains a prefix and/or suffix:
+            //
+            // tuple[            yyy, ...      ]
+            // tuple[xxx, *tuple[yyy, ...]     ]
+            // tuple[xxx, *tuple[yyy, ...], zzz]
+            // tuple[     *tuple[yyy, ...], zzz]
+            //       PPPPPPPPPPPP        P
+            //            SSSSSSS        SSSSSS
+            //
+            // (Anything that appears above only a P is included only if there's a prefix; anything
+            // above only an S is included only if there's a suffix; anything about both a P and an
+            // S is included if there is either a prefix or a suffix. The initial `tuple[` and
+            // trailing `]` are printed elsewhere. The `yyy, ...` is printed no matter what.)
+            TupleSpec::Variable(tuple) => {
+                if !tuple.prefix.is_empty() {
+                    tuple.prefix.display(self.db).fmt(f)?;
+                    f.write_str(", ")?;
+                }
+                if !tuple.prefix.is_empty() || !tuple.suffix.is_empty() {
+                    f.write_str("*tuple[")?;
+                }
+                tuple.variable.display(self.db).fmt(f)?;
+                f.write_str(", ...")?;
+                if !tuple.prefix.is_empty() || !tuple.suffix.is_empty() {
+                    f.write_str("]")?;
+                }
+                if !tuple.suffix.is_empty() {
+                    f.write_str(", ")?;
+                    tuple.suffix.display(self.db).fmt(f)?;
+                }
+            }
+        }
+        f.write_str("]")
+    }
+}
+
+impl<'db> OverloadLiteral<'db> {
+    // Not currently used, but useful for debugging.
+    #[expect(dead_code)]
+    pub(crate) fn display(self, db: &'db dyn Db) -> DisplayOverloadLiteral<'db> {
+        DisplayOverloadLiteral { literal: self, db }
+    }
+}
+
+pub(crate) struct DisplayOverloadLiteral<'db> {
+    literal: OverloadLiteral<'db>,
+    db: &'db dyn Db,
+}
+
+impl Display for DisplayOverloadLiteral<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let signature = self.literal.signature(self.db, None);
+        write!(
+            f,
+            "def {name}{signature}",
+            name = self.literal.name(self.db),
+            signature = signature.display(self.db)
+        )
+    }
+}
+
+impl<'db> FunctionType<'db> {
+    pub(crate) fn display(self, db: &'db dyn Db) -> DisplayFunctionType<'db> {
+        DisplayFunctionType { ty: self, db }
+    }
+}
+
+pub(crate) struct DisplayFunctionType<'db> {
+    ty: FunctionType<'db>,
+    db: &'db dyn Db,
+}
+
+impl Display for DisplayFunctionType<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let signature = self.ty.signature(self.db);
+
+        // TODO: We should consider adding the type parameters to the signature of a generic
+        // function, i.e. `def foo[T](x: T) -> T`.
+
+        match signature.overloads.as_slice() {
+            [signature] => {
+                write!(
+                    f,
+                    "def {name}{signature}",
+                    name = self.ty.name(self.db),
+                    signature = signature.display(self.db)
+                )
+            }
+            signatures => {
+                // TODO: How to display overloads?
+                f.write_str("Overload[")?;
+                let mut join = f.join(", ");
+                for signature in signatures {
+                    join.entry(&signature.display(self.db));
+                }
+                f.write_str("]")
             }
         }
     }
@@ -258,15 +361,19 @@ pub(crate) struct DisplayGenericAlias<'db> {
 
 impl Display for DisplayGenericAlias<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{origin}{specialization}",
-            origin = self.origin.name(self.db),
-            specialization = self.specialization.display_short(
-                self.db,
-                TupleSpecialization::from_class(self.db, self.origin)
-            ),
-        )
+        if self.origin.is_known(self.db, KnownClass::Tuple) {
+            self.specialization.tuple(self.db).display(self.db).fmt(f)
+        } else {
+            write!(
+                f,
+                "{origin}{specialization}",
+                origin = self.origin.name(self.db),
+                specialization = self.specialization.display_short(
+                    self.db,
+                    TupleSpecialization::from_class(self.db, self.origin)
+                ),
+            )
+        }
     }
 }
 
@@ -413,13 +520,13 @@ impl<'db> CallableType<'db> {
 }
 
 pub(crate) struct DisplayCallableType<'db> {
-    signatures: &'db [Signature<'db>],
+    signatures: &'db CallableSignature<'db>,
     db: &'db dyn Db,
 }
 
 impl Display for DisplayCallableType<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.signatures {
+        match self.signatures.overloads.as_slice() {
             [signature] => signature.display(self.db).fmt(f),
             signatures => {
                 // TODO: How to display overloads?
@@ -451,44 +558,191 @@ pub(crate) struct DisplaySignature<'db> {
     db: &'db dyn Db,
 }
 
-impl Display for DisplaySignature<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_char('(')?;
+impl DisplaySignature<'_> {
+    /// Get detailed display information including component ranges
+    pub(crate) fn to_string_parts(&self) -> SignatureDisplayDetails {
+        let mut writer = SignatureWriter::Details(SignatureDetailsWriter::new());
+        self.write_signature(&mut writer).unwrap();
+
+        match writer {
+            SignatureWriter::Details(details) => details.finish(),
+            SignatureWriter::Formatter(_) => unreachable!("Expected Details variant"),
+        }
+    }
+
+    /// Internal method to write signature with the signature writer
+    fn write_signature(&self, writer: &mut SignatureWriter) -> fmt::Result {
+        // Opening parenthesis
+        writer.write_char('(')?;
 
         if self.parameters.is_gradual() {
             // We represent gradual form as `...` in the signature, internally the parameters still
             // contain `(*args, **kwargs)` parameters.
-            f.write_str("...")?;
+            writer.write_str("...")?;
         } else {
             let mut star_added = false;
             let mut needs_slash = false;
-            let mut join = f.join(", ");
+            let mut first = true;
 
             for parameter in self.parameters.as_slice() {
+                // Handle special separators
                 if !star_added && parameter.is_keyword_only() {
-                    join.entry(&'*');
+                    if !first {
+                        writer.write_str(", ")?;
+                    }
+                    writer.write_char('*')?;
                     star_added = true;
+                    first = false;
                 }
                 if parameter.is_positional_only() {
                     needs_slash = true;
                 } else if needs_slash {
-                    join.entry(&'/');
+                    if !first {
+                        writer.write_str(", ")?;
+                    }
+                    writer.write_char('/')?;
                     needs_slash = false;
+                    first = false;
                 }
-                join.entry(&parameter.display(self.db));
+
+                // Add comma before parameter if not first
+                if !first {
+                    writer.write_str(", ")?;
+                }
+
+                // Write parameter with range tracking
+                let param_name = parameter.display_name();
+                writer.write_parameter(&parameter.display(self.db), param_name.as_deref())?;
+
+                first = false;
             }
+
             if needs_slash {
-                join.entry(&'/');
+                if !first {
+                    writer.write_str(", ")?;
+                }
+                writer.write_char('/')?;
             }
-            join.finish()?;
         }
 
-        write!(
-            f,
-            ") -> {}",
-            self.return_ty.unwrap_or(Type::unknown()).display(self.db)
-        )
+        // Closing parenthesis
+        writer.write_char(')')?;
+
+        // Return type
+        let return_ty = self.return_ty.unwrap_or_else(Type::unknown);
+        writer.write_return_type(&return_ty.display(self.db))?;
+
+        Ok(())
     }
+}
+
+impl Display for DisplaySignature<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut writer = SignatureWriter::Formatter(f);
+        self.write_signature(&mut writer)
+    }
+}
+
+/// Writer for building signature strings with different output targets
+enum SignatureWriter<'a, 'b> {
+    /// Write directly to a formatter (for Display trait)
+    Formatter(&'a mut Formatter<'b>),
+    /// Build a string with range tracking (for `to_string_parts`)
+    Details(SignatureDetailsWriter),
+}
+
+/// Writer that builds a string with range tracking
+struct SignatureDetailsWriter {
+    label: String,
+    parameter_ranges: Vec<TextRange>,
+    parameter_names: Vec<String>,
+}
+
+impl SignatureDetailsWriter {
+    fn new() -> Self {
+        Self {
+            label: String::new(),
+            parameter_ranges: Vec::new(),
+            parameter_names: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> SignatureDisplayDetails {
+        SignatureDisplayDetails {
+            label: self.label,
+            parameter_ranges: self.parameter_ranges,
+            parameter_names: self.parameter_names,
+        }
+    }
+}
+
+impl SignatureWriter<'_, '_> {
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        match self {
+            SignatureWriter::Formatter(f) => f.write_char(c),
+            SignatureWriter::Details(details) => {
+                details.label.push(c);
+                Ok(())
+            }
+        }
+    }
+
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        match self {
+            SignatureWriter::Formatter(f) => f.write_str(s),
+            SignatureWriter::Details(details) => {
+                details.label.push_str(s);
+                Ok(())
+            }
+        }
+    }
+
+    fn write_parameter<T: Display>(&mut self, param: &T, param_name: Option<&str>) -> fmt::Result {
+        match self {
+            SignatureWriter::Formatter(f) => param.fmt(f),
+            SignatureWriter::Details(details) => {
+                let param_start = details.label.len();
+                let param_display = param.to_string();
+                details.label.push_str(&param_display);
+
+                // Use TextSize::try_from for safe conversion, falling back to empty range on overflow
+                let start = TextSize::try_from(param_start).unwrap_or_default();
+                let length = TextSize::try_from(param_display.len()).unwrap_or_default();
+                details.parameter_ranges.push(TextRange::at(start, length));
+
+                // Store the parameter name if available
+                if let Some(name) = param_name {
+                    details.parameter_names.push(name.to_string());
+                } else {
+                    details.parameter_names.push(String::new());
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    fn write_return_type<T: Display>(&mut self, return_ty: &T) -> fmt::Result {
+        match self {
+            SignatureWriter::Formatter(f) => write!(f, " -> {return_ty}"),
+            SignatureWriter::Details(details) => {
+                let return_display = format!(" -> {return_ty}");
+                details.label.push_str(&return_display);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Details about signature display components, including ranges for parameters and return type
+#[derive(Debug, Clone)]
+pub(crate) struct SignatureDisplayDetails {
+    /// The full signature string
+    pub label: String,
+    /// Ranges for each parameter within the label
+    pub parameter_ranges: Vec<TextRange>,
+    /// Names of the parameters in order
+    pub parameter_names: Vec<String>,
 }
 
 impl<'db> Parameter<'db> {
@@ -754,7 +1008,7 @@ mod tests {
 
     use crate::Db;
     use crate::db::tests::setup_db;
-    use crate::symbol::typing_extensions_symbol;
+    use crate::place::typing_extensions_symbol;
     use crate::types::{KnownClass, Parameter, Parameters, Signature, StringLiteralType, Type};
 
     #[test]
@@ -793,7 +1047,7 @@ mod tests {
         );
 
         let iterator_synthesized = typing_extensions_symbol(&db, "Iterator")
-            .symbol
+            .place
             .ignore_possibly_unbound()
             .unwrap()
             .to_instance(&db)

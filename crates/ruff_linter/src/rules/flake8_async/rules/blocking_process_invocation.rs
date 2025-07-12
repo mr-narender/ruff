@@ -1,12 +1,11 @@
-use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{ViolationMetadata, derive_message_formats};
 use ruff_python_ast::{self as ast, Expr};
 use ruff_python_semantic::SemanticModel;
 use ruff_python_semantic::analyze::typing::find_assigned_value;
 use ruff_text_size::Ranged;
 
+use crate::Violation;
 use crate::checkers::ast::Checker;
-use crate::registry::AsRule;
 
 /// ## What it does
 /// Checks that async functions do not create subprocesses with blocking methods.
@@ -22,12 +21,18 @@ use crate::registry::AsRule;
 ///
 /// ## Example
 /// ```python
+/// import os
+///
+///
 /// async def foo():
 ///     os.popen(cmd)
 /// ```
 ///
 /// Use instead:
 /// ```python
+/// import asyncio
+///
+///
 /// async def foo():
 ///     asyncio.create_subprocess_shell(cmd)
 /// ```
@@ -55,12 +60,18 @@ impl Violation for CreateSubprocessInAsyncFunction {
 ///
 /// ## Example
 /// ```python
+/// import subprocess
+///
+///
 /// async def foo():
 ///     subprocess.run(cmd)
 /// ```
 ///
 /// Use instead:
 /// ```python
+/// import asyncio
+///
+///
 /// async def foo():
 ///     asyncio.create_subprocess_shell(cmd)
 /// ```
@@ -88,12 +99,19 @@ impl Violation for RunProcessInAsyncFunction {
 ///
 /// ## Example
 /// ```python
+/// import os
+///
+///
 /// async def foo():
 ///     os.waitpid(0)
 /// ```
 ///
 /// Use instead:
 /// ```python
+/// import asyncio
+/// import os
+///
+///
 /// def wait_for_process():
 ///     os.waitpid(0)
 ///
@@ -125,17 +143,17 @@ pub(crate) fn blocking_process_invocation(checker: &Checker, call: &ast::ExprCal
     };
 
     let range = call.func.range();
-    let diagnostic = match qualified_name.segments() {
+    match qualified_name.segments() {
         ["subprocess", "Popen"] | ["os", "popen"] => {
-            Diagnostic::new(CreateSubprocessInAsyncFunction, range)
+            checker.report_diagnostic_if_enabled(CreateSubprocessInAsyncFunction, range)
         }
         ["os", "system" | "posix_spawn" | "posix_spawnp"]
         | [
             "subprocess",
             "run" | "call" | "check_call" | "check_output" | "getoutput" | "getstatusoutput",
-        ] => Diagnostic::new(RunProcessInAsyncFunction, range),
+        ] => checker.report_diagnostic_if_enabled(RunProcessInAsyncFunction, range),
         ["os", "wait" | "wait3" | "wait4" | "waitid" | "waitpid"] => {
-            Diagnostic::new(WaitForProcessInAsyncFunction, range)
+            checker.report_diagnostic_if_enabled(WaitForProcessInAsyncFunction, range)
         }
         [
             "os",
@@ -143,17 +161,13 @@ pub(crate) fn blocking_process_invocation(checker: &Checker, call: &ast::ExprCal
             | "spawnvpe",
         ] => {
             if is_p_wait(call, checker.semantic()) {
-                Diagnostic::new(RunProcessInAsyncFunction, range)
+                checker.report_diagnostic_if_enabled(RunProcessInAsyncFunction, range)
             } else {
-                Diagnostic::new(CreateSubprocessInAsyncFunction, range)
+                checker.report_diagnostic_if_enabled(CreateSubprocessInAsyncFunction, range)
             }
         }
         _ => return,
     };
-
-    if checker.enabled(diagnostic.rule()) {
-        checker.report_diagnostic(diagnostic);
-    }
 }
 
 fn is_p_wait(call: &ast::ExprCall, semantic: &SemanticModel) -> bool {

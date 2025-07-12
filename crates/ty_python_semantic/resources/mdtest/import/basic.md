@@ -176,3 +176,47 @@ emitted for the `import from` statement:
 # error: [unresolved-import]
 from does_not_exist import foo, bar, baz
 ```
+
+## Attempting to import a stdlib module that's not yet been added
+
+<!-- snapshot-diagnostics -->
+
+```toml
+[environment]
+python-version = "3.10"
+```
+
+```py
+import tomllib  # error: [unresolved-import]
+from string.templatelib import Template  # error: [unresolved-import]
+from importlib.resources import abc  # error: [unresolved-import]
+```
+
+## Attempting to import a stdlib module that was previously removed
+
+<!-- snapshot-diagnostics -->
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+import aifc  # error: [unresolved-import]
+from distutils import sysconfig  # error: [unresolved-import]
+```
+
+## Cannot shadow core standard library modules
+
+`types.py`:
+
+```py
+x: int
+```
+
+```py
+# error: [unresolved-import]
+from types import x
+
+from types import FunctionType
+```

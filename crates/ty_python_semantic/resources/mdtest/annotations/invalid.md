@@ -91,9 +91,48 @@ async def outer():  # avoid unrelated syntax errors on yield, yield from, and aw
         reveal_type(p)  # revealed: Unknown
         reveal_type(q)  # revealed: int | Unknown
         reveal_type(r)  # revealed: @Todo(unknown type subscript)
+
+class Mat:
+    def __init__(self, value: int):
+        self.value = value
+
+    def __matmul__(self, other) -> int:
+        return 42
+
+def invalid_binary_operators(
+    a: "1" + "2",  # error: [invalid-type-form] "Invalid binary operator `+` in type annotation"
+    b: 3 - 5.0,  # error: [invalid-type-form] "Invalid binary operator `-` in type annotation"
+    c: 4 * -2,  # error: [invalid-type-form] "Invalid binary operator `*` in type annotation"
+    d: Mat(4) @ Mat(2),  # error: [invalid-type-form] "Invalid binary operator `@` in type annotation"
+    e: 10 / 2,  # error: [invalid-type-form] "Invalid binary operator `/` in type annotation"
+    f: 10 % 3,  # error: [invalid-type-form] "Invalid binary operator `%` in type annotation"
+    g: 2**-0.5,  # error: [invalid-type-form] "Invalid binary operator `**` in type annotation"
+    h: 10 // 3,  # error: [invalid-type-form] "Invalid binary operator `//` in type annotation"
+    i: 1 << 2,  # error: [invalid-type-form] "Invalid binary operator `<<` in type annotation"
+    j: 4 >> 42,  # error: [invalid-type-form] "Invalid binary operator `>>` in type annotation"
+    k: 5 ^ 3,  # error: [invalid-type-form] "Invalid binary operator `^` in type annotation"
+    l: 5 & 3,  # error: [invalid-type-form] "Invalid binary operator `&` in type annotation"
+):
+    reveal_type(a)  # revealed: Unknown
+    reveal_type(b)  # revealed: Unknown
+    reveal_type(c)  # revealed: Unknown
+    reveal_type(d)  # revealed: Unknown
+    reveal_type(e)  # revealed: Unknown
+    reveal_type(f)  # revealed: Unknown
+    reveal_type(g)  # revealed: Unknown
+    reveal_type(h)  # revealed: Unknown
+    reveal_type(i)  # revealed: Unknown
+    reveal_type(j)  # revealed: Unknown
+    reveal_type(k)  # revealed: Unknown
+    reveal_type(l)  # revealed: Unknown
 ```
 
 ## Invalid Collection based AST nodes
+
+```toml
+[environment]
+python-version = "3.12"
+```
 
 ```py
 def _(
@@ -103,7 +142,11 @@ def _(
     d: [k for k in [1, 2]],  # error: [invalid-type-form] "List comprehensions are not allowed in type expressions"
     e: {k for k in [1, 2]},  # error: [invalid-type-form] "Set comprehensions are not allowed in type expressions"
     f: (k for k in [1, 2]),  # error: [invalid-type-form] "Generator expressions are not allowed in type expressions"
-    g: [int, str],  # error: [invalid-type-form] "List literals are not allowed in this context in a type expression"
+    # error: [invalid-type-form] "List literals are not allowed in this context in a type expression: Did you mean `tuple[int, str]`?"
+    g: [int, str],
+    # error: [invalid-type-form] "Tuple literals are not allowed in this context in a type expression: Did you mean `tuple[int, str]`?"
+    h: (int, str),
+    i: (),  # error: [invalid-type-form] "Tuple literals are not allowed in this context in a type expression: Did you mean `tuple[()]`?"
 ):
     reveal_type(a)  # revealed: Unknown
     reveal_type(b)  # revealed: Unknown
@@ -112,4 +155,86 @@ def _(
     reveal_type(e)  # revealed: Unknown
     reveal_type(f)  # revealed: Unknown
     reveal_type(g)  # revealed: Unknown
+    reveal_type(h)  # revealed: Unknown
+    reveal_type(i)  # revealed: Unknown
+
+# error: [invalid-type-form] "List literals are not allowed in this context in a type expression: Did you mean `list[int]`?"
+class name_0[name_2: [int]]:
+    pass
+
+# error: [invalid-type-form] "List literals are not allowed in this context in a type expression"
+# error: [invalid-type-form] "Dict literals are not allowed in type expressions"
+class name_4[name_1: [{}]]:
+    pass
+```
+
+## Diagnostics for common errors
+
+<!-- snapshot-diagnostics -->
+
+### Module-literal used when you meant to use a class from that module
+
+It's pretty common in Python to accidentally use a module-literal type in a type expression when you
+*meant* to use a class by the same name that comes from that module. We emit a nice subdiagnostic
+for this case:
+
+`foo.py`:
+
+```py
+import datetime
+
+def f(x: datetime): ...  # error: [invalid-type-form]
+```
+
+`PIL/Image.py`:
+
+```py
+class Image: ...
+```
+
+`bar.py`:
+
+```py
+from PIL import Image
+
+def g(x: Image): ...  # error: [invalid-type-form]
+```
+
+### List-literal used when you meant to use a list or tuple
+
+```py
+def _(
+    x: [int],  # error: [invalid-type-form]
+) -> [int]:  # error: [invalid-type-form]
+    return x
+```
+
+```py
+def _(
+    x: [int, str],  # error: [invalid-type-form]
+) -> [int, str]:  # error: [invalid-type-form]
+    return x
+```
+
+### Tuple-literal used when you meant to use a tuple
+
+```py
+def _(
+    x: (),  # error: [invalid-type-form]
+) -> ():  # error: [invalid-type-form]
+    return x
+```
+
+```py
+def _(
+    x: (int,),  # error: [invalid-type-form]
+) -> (int,):  # error: [invalid-type-form]
+    return x
+```
+
+```py
+def _(
+    x: (int, str),  # error: [invalid-type-form]
+) -> (int, str):  # error: [invalid-type-form]
+    return x
 ```

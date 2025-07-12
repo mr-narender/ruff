@@ -1,9 +1,9 @@
-use ruff_diagnostics::{Diagnostic, Violation};
 use ruff_macros::{ViolationMetadata, derive_message_formats};
 use ruff_python_ast::helpers::{AwaitVisitor, any_over_body};
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{Expr, StmtWith, WithItem};
 
+use crate::Violation;
 use crate::checkers::ast::Checker;
 use crate::rules::flake8_async::helpers::MethodName;
 
@@ -21,6 +21,9 @@ use crate::rules::flake8_async::helpers::MethodName;
 ///
 /// ## Example
 /// ```python
+/// import asyncio
+///
+///
 /// async def func():
 ///     async with asyncio.timeout(2):
 ///         do_something()
@@ -28,6 +31,9 @@ use crate::rules::flake8_async::helpers::MethodName;
 ///
 /// Use instead:
 /// ```python
+/// import asyncio
+///
+///
 /// async def func():
 ///     async with asyncio.timeout(2):
 ///         do_something()
@@ -100,8 +106,5 @@ pub(crate) fn cancel_scope_no_checkpoint(
         return;
     }
 
-    checker.report_diagnostic(Diagnostic::new(
-        CancelScopeNoCheckpoint { method_name },
-        with_stmt.range,
-    ));
+    checker.report_diagnostic(CancelScopeNoCheckpoint { method_name }, with_stmt.range);
 }

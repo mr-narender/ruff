@@ -1,15 +1,15 @@
 use lsp_types::notification::DidOpenTextDocument;
 use lsp_types::{DidOpenTextDocumentParams, TextDocumentItem};
 
-use ruff_db::Db;
-use ty_project::watch::ChangeEvent;
-
 use crate::TextDocument;
 use crate::server::Result;
+use crate::server::api::diagnostics::publish_diagnostics;
 use crate::server::api::traits::{NotificationHandler, SyncNotificationHandler};
-use crate::server::client::{Notifier, Requester};
 use crate::session::Session;
-use crate::system::{AnySystemPath, url_to_any_system_path};
+use crate::session::client::Client;
+use crate::system::AnySystemPath;
+use ruff_db::Db;
+use ty_project::watch::ChangeEvent;
 
 pub(crate) struct DidOpenTextDocumentHandler;
 
@@ -20,9 +20,10 @@ impl NotificationHandler for DidOpenTextDocumentHandler {
 impl SyncNotificationHandler for DidOpenTextDocumentHandler {
     fn run(
         session: &mut Session,
-        _notifier: Notifier,
-        _requester: &mut Requester,
-        DidOpenTextDocumentParams {
+        client: &Client,
+        params: DidOpenTextDocumentParams,
+    ) -> Result<()> {
+        let DidOpenTextDocumentParams {
             text_document:
                 TextDocumentItem {
                     uri,
@@ -30,30 +31,34 @@ impl SyncNotificationHandler for DidOpenTextDocumentHandler {
                     version,
                     language_id,
                 },
-        }: DidOpenTextDocumentParams,
-    ) -> Result<()> {
-        let Ok(path) = url_to_any_system_path(&uri) else {
-            return Ok(());
+        } = params;
+
+        let key = match session.key_from_url(uri) {
+            Ok(key) => key,
+            Err(uri) => {
+                tracing::debug!("Failed to create document key from URI: {}", uri);
+                return Ok(());
+            }
         };
 
         let document = TextDocument::new(text, version).with_language_id(&language_id);
-        session.open_text_document(uri, document);
+        session.open_text_document(key.path(), document);
 
-        match path {
-            AnySystemPath::System(path) => {
-                let db = match session.project_db_for_path_mut(path.as_std_path()) {
+        match key.path() {
+            AnySystemPath::System(system_path) => {
+                let db = match session.project_db_for_path_mut(system_path) {
                     Some(db) => db,
                     None => session.default_project_db_mut(),
                 };
-                db.apply_changes(vec![ChangeEvent::Opened(path)], None);
+                db.apply_changes(vec![ChangeEvent::Opened(system_path.clone())], None);
             }
             AnySystemPath::SystemVirtual(virtual_path) => {
                 let db = session.default_project_db_mut();
-                db.files().virtual_file(db, &virtual_path);
+                db.files().virtual_file(db, virtual_path);
             }
         }
 
-        // TODO(dhruvmanila): Publish diagnostics if the client doesn't support pull diagnostics
+        publish_diagnostics(session, &key, client);
 
         Ok(())
     }
