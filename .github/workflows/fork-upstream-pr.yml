@@ -1,0 +1,165 @@
+# I am just a bot. You are interacting with a bot.
+# PR-only upstream updates: no checkout, branch resets, force-pushes or auto-merges.
+name: Daily upstream PR
+
+'on':
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Check for upstream updates without opening a PR
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: daily-upstream-pr
+  cancel-in-progress: false
+
+jobs:
+  upstream-pr:
+    if: github.repository_owner == 'mr-narender' && github.event.repository.fork
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Open or reuse the upstream PR without modifying branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          """Open/reuse an upstream PR without changing either repository's branches."""
+          import json
+          import os
+          import subprocess
+          from urllib.parse import quote, urlencode
+          
+          OWNER = "mr-narender"
+          MARKER = "<!-- managed-upstream-sync:v1 -->"
+          
+          
+          class APIError(RuntimeError):
+              def __init__(self, status, operation):
+                  self.status = status
+                  super().__init__(f"GitHub API HTTP {status}: {operation}")
+          
+          
+          def request(path, method="GET", body=None, paginate=False):
+              if not os.environ.get("GH_TOKEN"):
+                  raise RuntimeError("GH_TOKEN is missing")
+              args = ["gh", "api", "--hostname", "github.com", "--method", method]
+              args += ["--paginate", "--slurp"] if paginate else ["--include"]
+              args.append(path)
+              if body is not None:
+                  args += ["--input", "-"]
+              process = subprocess.run(args, input=json.dumps(body) if body is not None else None,
+                                       capture_output=True, text=True, timeout=90)
+              if paginate:
+                  if process.returncode:
+                      raise RuntimeError("Paginated API request failed; credential fallback is disabled")
+                  pages = json.loads(process.stdout)
+                  if not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
+                      raise RuntimeError("Unexpected paginated API response")
+                  return [item for page in pages for item in page]
+              header, separator, raw = process.stdout.partition("\n\n")
+              first_line = header.splitlines()[0] if header else ""
+              parts = first_line.split()
+              if not separator or len(parts) < 2 or not parts[1].isdigit():
+                  raise RuntimeError("API response unavailable; raw output suppressed")
+              status = int(parts[1])
+              if not 200 <= status < 300:
+                  raise APIError(status, f"{method} {path}")
+              return json.loads(raw) if raw.strip() else None
+          
+          
+          def synchronize(repository, dry_run=False, api=request, keepalive=False):
+              if len(repository.split("/")) != 2 or repository.split("/")[0] != OWNER:
+                  raise RuntimeError("Repository is outside the configured owner")
+              repo = api(f"repos/{repository}")
+              if repo.get("full_name") != repository or repo.get("owner", {}).get("login") != OWNER:
+                  raise RuntimeError("Repository ownership changed")
+              if not repo.get("fork"):
+                  return {"repository": repository, "status": "not_a_fork"}
+              if repo.get("archived") or repo.get("disabled"):
+                  return {"repository": repository, "status": "inactive"}
+              if keepalive and not dry_run:
+                  # Refresh only this schedule; never manufacture commits to keep a fork active.
+                  api(f"repos/{repository}/actions/workflows/fork-upstream-pr.yml/enable", "PUT")
+              parent = repo.get("parent") or {}
+              upstream_name = parent.get("full_name")
+              if not upstream_name:
+                  raise RuntimeError("Upstream repository metadata is missing")
+              upstream = api(f"repos/{upstream_name}")
+              if upstream.get("private") or upstream.get("disabled"):
+                  raise RuntimeError("Private or disabled upstream needs a separate access review")
+              base, head = repo["default_branch"], upstream["default_branch"]
+              upstream_owner = upstream["owner"]["login"]
+              comparison_path = f"repos/{repository}/compare/{quote(base, safe='')}...{quote(upstream_owner + ':' + head, safe=':')}"
+              try:
+                  comparison = api(comparison_path)
+              except APIError as exc:
+                  if exc.status == 404:
+                      raise RuntimeError("Upstream comparison unavailable: check branch names and shared history; no branch was reset") from None
+                  raise
+              ahead = comparison.get("ahead_by")
+              if not isinstance(ahead, int) or ahead < 0:
+                  raise RuntimeError("Upstream comparison has no valid ahead_by count")
+              result = {"repository": repository, "upstream": upstream_name,
+                        "base": base, "head": head, "upstream_commits": ahead,
+                        "fork_commits": comparison.get("behind_by")}
+              if ahead == 0:
+                  return dict(result, status="up_to_date")
+              query = urlencode({"state": "open", "head": f"{upstream_owner}:{head}", "per_page": 100})
+              prs = api(f"repos/{repository}/pulls?{query}", paginate=True)
+              existing = [p for p in prs if (p.get("head", {}).get("repo") or {}).get("full_name") == upstream_name
+                          and p.get("head", {}).get("ref") == head]
+              if len(existing) > 1:
+                  raise RuntimeError("Multiple upstream PRs exist; refusing to select or close one automatically")
+              if existing:
+                  pr = existing[0]
+                  if pr.get("base", {}).get("ref") != base:
+                      raise RuntimeError("Existing upstream PR targets another base; manual retargeting is required")
+                  status = "reused"
+              elif dry_run:
+                  return dict(result, status="would_open")
+              else:
+                  pr = api(f"repos/{repository}/pulls", "POST", {
+                      "title": f"chore: sync upstream {head} (preserve fork changes)",
+                      "base": base, "head": f"{upstream_owner}:{head}",
+                      "head_repo": upstream["name"], "maintainer_can_modify": False,
+                      "body": f"{MARKER}\n\nTracks `{upstream_name}:{head}` into `{repository}:{base}`.\n\n"
+                              "This is PR-only synchronization: no reset, force-push, automatic approval or automatic merge. "
+                              "A normal merge retains fork commits. Review upstream changes and CI before merging. "
+                              "Conflicts require explicit resolution; they are never resolved by discarding fork changes.\n\n"
+                              "The upstream branch updates this PR automatically; the daily workflow reuses it rather than creating duplicates."})
+                  status = "opened"
+              details = api(f"repos/{repository}/pulls/{pr['number']}")
+              mergeable = details.get("mergeable")
+              mergeability = "conflicting" if mergeable is False else "mergeable" if mergeable is True else "pending"
+              return dict(result, status=status, pr_url=pr["html_url"], pr_number=pr["number"], mergeability=mergeability)
+          
+          
+          def main():
+              repository = os.environ.get("GITHUB_REPOSITORY", "")
+              dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+              result = synchronize(repository, dry_run=dry_run,
+                                   keepalive=os.environ.get("GITHUB_ACTIONS") == "true")
+              print(json.dumps(result, sort_keys=True))
+              if result.get("mergeability") == "conflicting":
+                  print("::warning::The upstream PR has conflicts; fork changes were not overwritten.")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as output:
+                      output.write("### Daily upstream PR\n\n```json\n" + json.dumps(result, indent=2) + "\n```\n")
+          
+          
+          if __name__ == "__main__":
+              main()
+          PYTHON
