@@ -88,7 +88,7 @@ pub(crate) fn infer_narrowing_constraints<'db>(
     Option<NarrowingConstraint<'db>>,
 ) {
     let constraints = match predicate.node {
-        PredicateNode::Expression { expression, .. } | PredicateNode::Condition(expression) => {
+        PredicateNode::Expression(expression) => {
             let constraints = all_narrowing_constraints_for_expression(db, expression);
             (constraints.get(place, true), constraints.get(place, false))
         }
@@ -153,10 +153,7 @@ fn all_narrowing_constraints_for_expression<'db>(
     let python_file = program_file.python_file(db);
     let env = ProgramEnvironment::from_file(program_file);
     let module = parsed_module(db, python_file).load(db);
-    let predicate = PredicateNode::Expression {
-        expression,
-        truthiness_from_type: false,
-    };
+    let predicate = PredicateNode::Expression(expression);
     let mut positive = NarrowingConstraintsBuilder::new(db, &env, &module, predicate, true);
     let positive_constraints = positive.finish();
     let mut negative = NarrowingConstraintsBuilder::new(db, &env, &module, predicate, false);
@@ -691,18 +688,7 @@ impl<'db> ClassInfoConstraint<'_, 'db> {
                     env,
                     instance
                         .value_expression_types(db, env)
-                        .ok()?
-                        .map(|element| {
-                            // A special case is made for `None` at runtime
-                            // (it's implicitly converted to `NoneType` in `int | None`)
-                            // which means that `isinstance(x, int | None)` works even though
-                            // `None` is not a class literal.
-                            if element.is_none(db) {
-                                self.generate(db, KnownClass::NoneType.to_class_literal(db, env))
-                            } else {
-                                self.generate(db, element)
-                            }
-                        }),
+                        .map(|element| self.generate(db, element)),
                 )
             }
 
@@ -1731,7 +1717,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
 
     fn finish(&mut self) -> Option<FrozenNarrowingConstraints<'db>> {
         let constraints: Option<NarrowingConstraints<'db>> = match self.predicate {
-            PredicateNode::Expression { expression, .. } | PredicateNode::Condition(expression) => {
+            PredicateNode::Expression(expression) => {
                 self.evaluate_expression_predicate(expression, self.is_positive)
             }
             PredicateNode::Pattern(pattern) => {
@@ -2894,7 +2880,7 @@ impl<'db, 'pattern> PatternSuccessAnalyzer<'db, 'pattern> {
         else {
             return Some(Type::unknown());
         };
-        let default_ty = if self.mapping_pattern_uses_standard_get(subject_ty) {
+        let default_ty = if self.is_standard_mapping_get(get_method) {
             mapping_value_ty
         } else {
             Type::object()
@@ -2911,40 +2897,21 @@ impl<'db, 'pattern> PatternSuccessAnalyzer<'db, 'pattern> {
         )
     }
 
-    fn mapping_pattern_uses_standard_get(&self, subject_ty: Type<'db>) -> bool {
+    /// Identify `dict.get` and `Mapping.get` by their definitions, even when the receiver
+    /// has been narrowed to an intersection and no longer has a single nominal class.
+    fn is_standard_mapping_get(&self, get_method: Type<'db>) -> bool {
         let db = self.db;
-        let Some(class) = subject_ty.nominal_class(db, &self.env) else {
+        let Type::BoundMethod(method) = get_method else {
             return false;
         };
-        for base in class.iter_mro(db) {
-            let class = match base {
-                ClassBase::Class(class) => class,
-                ClassBase::Generic | ClassBase::Protocol => continue,
-                ClassBase::Any
-                | ClassBase::Dynamic(_)
-                | ClassBase::Divergent(_)
-                | ClassBase::TypedDict(_) => {
-                    return false;
-                }
-            };
-            if !class
-                .own_instance_member(db, &self.env, "get")
-                .is_undefined()
-            {
-                return false;
-            }
-            if class
-                .own_class_member(db, &self.env, None, "get")
-                .is_undefined()
-            {
-                continue;
-            }
-            return matches!(
-                class.known(db),
-                Some(KnownClass::Dict | KnownClass::Mapping)
-            );
-        }
-        false
+        let Some(function) = method.function(db) else {
+            return false;
+        };
+        function.name(db) == "get"
+            && [KnownClass::Dict, KnownClass::Mapping]
+                .into_iter()
+                .filter_map(|class| class.try_to_class_literal(db, &self.env))
+                .any(|class| class.body_scope(db) == function.definition(db).scope(db))
     }
 
     fn mapping_pattern_key_types(&self, kind: &MappingPatternPredicateKind<'db>) -> Vec<Type<'db>> {
@@ -3495,8 +3462,7 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
     fn scope(&self) -> ScopeId<'db> {
         let db = self.db;
         match self.predicate {
-            PredicateNode::Expression { expression, .. }
-            | PredicateNode::Condition(expression)
+            PredicateNode::Expression(expression)
             | PredicateNode::ContextManagerSuppresses { expression, .. } => expression.scope(db),
             PredicateNode::Pattern(pattern) => pattern.scope(db),
             PredicateNode::FinallyNormalPathImpossible { scope, .. } => scope,
