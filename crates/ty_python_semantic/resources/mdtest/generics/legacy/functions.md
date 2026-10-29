@@ -425,6 +425,25 @@ def consume_comparable(values: Iterable[ComparableT]) -> None: ...
 consume_comparable([None, 2])  # error: [invalid-argument-type]
 ```
 
+## Widening a lower bound to a hashable type
+
+The first tuple element can contribute `object` as a lower bound for `T`. Its union with the second
+element's `list[Any]` is `object`, which satisfies the `Hashable` bound.
+
+```py
+from collections.abc import Callable, Hashable
+from typing import Any, TypeVar
+
+T = TypeVar("T", bound=Hashable)
+
+def consume(callback: Callable[[], tuple[tuple[T] | T, T]]) -> T:
+    return callback()[1]
+
+def check(callback: Callable[[], tuple[tuple[object], list[Any]]]) -> None:
+    # TODO: Reject this call because the callback's second tuple element, `list[Any]`, is unhashable.
+    reveal_type(consume(callback))  # revealed: object
+```
+
 ## Inferring a bound from a caller's type variable
 
 An argument whose type is fixed by an enclosing function must satisfy the callee's bound for every
@@ -1064,6 +1083,60 @@ def _(x: int, y: str, a: list[int], b: list[str]) -> None:
     # error: [invalid-argument-type] "Expected `list[int | str]`, found `list[int]`"
     # error: [invalid-argument-type] "Expected `list[int | str]`, found `list[str]`"
     reveal_type(g(x, y, a, b))  # revealed: int | str
+```
+
+## Diagnostic recovery preserves gradual evidence
+
+The middle tuple element can match either `U` or `tuple[U]`. In both cases the last element
+contributes an incompatible `int` for `T`. The diagnostic also includes the `Any` inferred from the
+first element's `list[Any]`.
+
+```py
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+T = TypeVar("T", bound=list[Any])
+U = TypeVar("U")
+
+def consume(producer: Callable[[], tuple[list[T], U | tuple[U], T]]) -> None: ...
+def check(callback: Callable[[], tuple[list[Any], tuple[str], int]]) -> None:
+    # error: [invalid-argument-type] "Argument type `Any | int` does not satisfy upper bound `list[Any]` of type variable `T`"
+    consume(callback)
+```
+
+## Diagnostic recovery reports the shared lower bound
+
+Matching the first element against `T | tuple[T]` contributes either `tuple[str]` or `str`. The
+diagnostic reports the `int` from the second element, which violates the bound in both cases.
+
+```py
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+T = TypeVar("T", bound=list[Any])
+
+def consume(callback: Callable[[], tuple[T | tuple[T], T]]) -> None: ...
+def check(callback: Callable[[], tuple[tuple[str], int]]) -> None:
+    # error: [invalid-argument-type] "Argument type `int` does not satisfy upper bound `list[Any]` of type variable `T`"
+    consume(callback)
+```
+
+## Diagnostic recovery preserves independent type-variable evidence
+
+Both choices for the middle element violate `T`'s bound once the last `int` is included. The
+diagnostic identifies the violation in the first tuple element, where `U` is inferred as `bytes`.
+
+```py
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+T = TypeVar("T", bound=list[Any])
+U = TypeVar("U", bound=list[Any])
+
+def consume(producer: Callable[[], tuple[U, T | tuple[T], T]]) -> None: ...
+def check(callback: Callable[[], tuple[bytes, tuple[str], int]]) -> None:
+    # error: [invalid-argument-type] "Argument type `bytes` does not satisfy upper bound `list[Any]` of type variable `U`"
+    consume(callback)
 ```
 
 ## Diagnostic recovery with outer typevars
@@ -4771,6 +4844,33 @@ def identity_callback(value: I) -> Callable[[I], I]:
 def optional_callback(value: O) -> Callable[[O | None], O | None]:
     # revealed: (O@optional_callback | None, /) -> O@optional_callback | None
     return reveal_type(identity_callback(value))
+```
+
+## Inferring a recursive protocol from a factory's return context
+
+The annotated assignment supplies `Stream[int]` as the type argument to `make_result`. Comparing the
+return types of `first_or` reaches `Stream`, whose `window` method adds the layer of nesting that
+`flatten` removes.
+
+```py
+from typing import Protocol, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Result(Protocol[T_co]):
+    def first_or(self, default: U) -> T_co | U: ...
+
+class Stream(Protocol[T_co]):
+    def flatten(self: "Stream[Stream[U]]") -> "Stream[U]": ...
+    def window(self) -> "Stream[Stream[T_co]]": ...
+
+def make_result() -> Result[T]:
+    raise NotImplementedError
+
+result: Result[Stream[int]] = make_result()
+reveal_type(result)  # revealed: Result[Stream[int]]
 ```
 
 ## Generic property setter overrides
