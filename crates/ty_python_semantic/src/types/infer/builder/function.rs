@@ -1,11 +1,11 @@
 use crate::{
     Db, DisplaySettings, FxIndexMap, ProgramEnvironment,
-    reachability::ReachabilityConstraintsExtension,
+    reachability::is_end_of_scope_reachable,
     types::{
         Binding, CallArguments, CallableType, ClassBase, ClassLiteral, ClassType, DynamicType,
         IntersectionBuilder, KnownClass, KnownInstanceType, ParamSpecAttrKind, SpecialFormType,
         SubclassOfInner, SubclassOfType, Type, TypeContext, TypeVarBoundOrConstraints, TypeVarKind,
-        UnionBuilder, UnionType,
+        UnionBuilder, UnionType, UnionTypeInstance,
         callable::CallableTypeKind,
         constraints::ConstraintSetBuilder,
         context::InferContext,
@@ -18,7 +18,8 @@ use crate::{
             add_type_expression_reference_link, is_invalid_typed_dict_literal,
             report_bad_argument_to_get_protocol_members, report_bad_argument_to_protocol_interface,
             report_implicit_return_type, report_invalid_generator_function_return_type,
-            report_invalid_return_type, report_invalid_total_ordering_call,
+            report_invalid_return_type, report_invalid_runtime_checkable,
+            report_invalid_total_ordering_call,
             report_issubclass_check_against_protocol_with_non_method_members,
             report_runtime_check_against_non_runtime_checkable_protocol,
             report_runtime_check_against_typed_dict, report_shadowed_type_variable,
@@ -59,7 +60,7 @@ use ruff_diagnostics::{Edit, Fix};
 use ruff_python_edits::unwrapped_call_argument;
 use ty_module_resolver::{ImportingFile, ModuleName, resolve_module};
 use ty_python_core::{
-    Truthiness, UseDefMap,
+    Truthiness,
     definition::{Definition, DefinitionKind},
     scope::NodeWithScopeRef,
 };
@@ -207,23 +208,12 @@ impl<'db> ExpectedReturnType<'db> {
 
         check(self.public)
             .or(db, &builder, || check(self.lexical))
-            .is_always_satisfied(db, env)
+            .is_always_satisfied(db, env, TypeVarSet::None)
     }
 }
 
 impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     pub(super) fn infer_function_body(&mut self, function: &ast::StmtFunctionDef) {
-        fn can_implicitly_return_none<'db>(db: &'db dyn Db, use_def: &UseDefMap<'db>) -> bool {
-            !use_def
-                .reachability_constraints()
-                .evaluate(
-                    db,
-                    use_def.predicates(),
-                    use_def.end_of_scope_reachability(),
-                )
-                .is_always_false()
-        }
-
         let env = self.program_environment();
         let db = self.db();
 
@@ -337,9 +327,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         }
                     }
 
-                    let use_def = self.index.use_def_map(scope_id);
-
-                    if can_implicitly_return_none(db, use_def)
+                    if is_end_of_scope_reachable(db, self.scope())
                         && !Type::none(db, env).is_assignable_to(db, env, expected_return_ty)
                     {
                         let no_return = self.return_types_and_ranges.is_empty();
@@ -406,8 +394,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 }
             }
 
-            let use_def = self.index.use_def_map(scope_id);
-            if can_implicitly_return_none(db, use_def)
+            if is_end_of_scope_reachable(db, self.scope())
                 && !Type::none(db, env).is_assignable_to(db, env, expected_ty)
             {
                 let no_return = self.return_types_and_ranges.is_empty();
@@ -449,14 +436,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let decorator_inference =
             (!decorator_list.is_empty()).then(|| function_known_decorators(self.db(), definition));
         if let Some(decorator_inference) = decorator_inference.as_ref() {
-            self.context.extend(decorator_inference.diagnostics());
+            self.context.extend(decorator_inference.context_result());
             self.expressions
                 .extend(decorator_inference.expression_types());
             self.bindings.extend(decorator_inference.bindings());
             self.called_functions
                 .extend(decorator_inference.called_functions().iter().copied());
-            self.implicit_aliases
-                .extend(decorator_inference.implicit_aliases().iter().copied());
+            self.legacy_aliases
+                .extend(decorator_inference.legacy_aliases().iter().copied());
         }
 
         let mut decorator_types_and_nodes = Vec::with_capacity(decorator_list.len());
@@ -839,7 +826,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             let annotation = param_with_default
                 .annotation()
                 .map(|annotation| function_signature_expression_type(db, definition, annotation));
-            self.infer_expression(default, TypeContext::new(annotation));
+            self.infer_expression(default, TypeContext::declared(annotation));
         }
 
         self.deferred_state = previous_deferred_state;
@@ -1813,7 +1800,10 @@ impl KnownFunction {
                         .is_none_or(|value_expr| {
                             builder
                                 .speculate_without_diagnostics()
-                                .infer_expression(value_expr, TypeContext::new(Some(casted_type)))
+                                .infer_expression(
+                                    value_expr,
+                                    TypeContext::declared(Some(casted_type)),
+                                )
                                 .is_disjoint_from(db, env, casted_type)
                         })
                     && let Some(diagnostic) =
@@ -1903,6 +1893,14 @@ impl KnownFunction {
                     source_type
                         .disjointness_error_context(db, env, casted_type)
                         .attach_to(db, env, &mut diagnostic);
+                }
+            }
+
+            KnownFunction::RuntimeCheckable => {
+                if let [Some(Type::ClassLiteral(class))] = parameter_types
+                    && !class.is_protocol(builder.db())
+                {
+                    report_invalid_runtime_checkable(&builder.context, call_expression, *class);
                 }
             }
 
@@ -2224,13 +2222,13 @@ fn check_classinfo_in_isinstance<'db>(
             diagnostic
                 .set_primary_annotation_message("This call will raise `TypeError` at runtime");
         }
-        Type::KnownInstance(KnownInstanceType::UnionType(_)) => {
+        Type::KnownInstance(KnownInstanceType::UnionType(union)) => {
             report_invalid_union_type_elements(
                 db,
                 context,
                 call_expression,
                 function,
-                classinfo,
+                union,
                 classinfo_expr,
             );
         }
@@ -2485,42 +2483,22 @@ fn report_invalid_union_type_elements<'db>(
     context: &InferContext<'db, '_>,
     call_expression: &ast::ExprCall,
     function: KnownFunction,
-    union_type: Type<'db>,
+    union: UnionTypeInstance<'db>,
     union_type_expr: Option<&ast::Expr>,
 ) {
-    fn find_invalid_elements<'db>(
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        function: KnownFunction,
-        ty: Type<'db>,
-        invalid_elements: &mut Vec<Type<'db>>,
-    ) {
-        match ty {
-            Type::ClassLiteral(_) => {}
-            Type::NominalInstance(instance)
-                if instance.has_known_class(db, KnownClass::NoneType) => {}
-            Type::SpecialForm(special_form) if special_form.is_valid_isinstance_target() => {}
-            // `Any` can be used in `issubclass()` calls but not `isinstance()` calls
-            Type::SpecialForm(SpecialFormType::Any) if function == KnownFunction::IsSubclass => {}
-            Type::KnownInstance(KnownInstanceType::UnionType(instance)) => {
-                match instance.value_expression_types(db, env) {
-                    Ok(value_expression_types) => {
-                        for element in value_expression_types {
-                            find_invalid_elements(db, env, function, element, invalid_elements);
-                        }
-                    }
-                    Err(_) => {
-                        invalid_elements.push(ty);
-                    }
-                }
-            }
-            _ => invalid_elements.push(ty),
-        }
-    }
-
-    let mut invalid_elements = vec![];
     let env = context.program_environment();
-    find_invalid_elements(db, env, function, union_type, &mut invalid_elements);
+    let invalid_elements: Vec<_> = union
+        .value_expression_types(db, env)
+        .filter(|element| match element {
+            Type::ClassLiteral(_) => false,
+            Type::SpecialForm(special_form) if special_form.is_valid_isinstance_target() => false,
+            // `Any` can be used in `issubclass()` calls but not `isinstance()` calls.
+            Type::SpecialForm(SpecialFormType::Any) if function == KnownFunction::IsSubclass => {
+                false
+            }
+            _ => true,
+        })
+        .collect();
 
     let Some((first_invalid_element, other_invalid_elements)) = invalid_elements.split_first()
     else {
@@ -2548,15 +2526,12 @@ fn report_invalid_union_type_elements<'db>(
 
     // When we have a secondary annotation pointing at the UnionType expression,
     // "the union" is unambiguous. Otherwise, spell out the union type in the message.
-    let env = context.program_environment();
-    let union_suffix = match (&union_type_expr, union_type) {
-        (None, Type::KnownInstance(KnownInstanceType::UnionType(instance))) => {
-            match instance.union_type(db) {
-                Ok(ty) => format!(" `{}`", ty.display(db, env)),
-                Err(_) => String::new(),
-            }
-        }
-        _ => String::new(),
+    let union_suffix = if union_type_expr.is_none()
+        && let Ok(ty) = union.union_type(db, env)
+    {
+        format!(" `{}`", ty.display(db, env))
+    } else {
+        String::new()
     };
 
     match other_invalid_elements {

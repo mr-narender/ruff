@@ -862,7 +862,7 @@ pub struct UseDefMap<'db> {
     ///
     /// Function `f` may implicitly return `None`, but `g` cannot.
     ///
-    /// This is used by `can_implicitly_return_none` in the `ty_python_semantic` crate.
+    /// This is used by `is_end_of_scope_reachable` in the `ty_python_semantic` crate.
     end_of_scope_reachability: ScopedReachabilityConstraintId,
 }
 
@@ -2193,7 +2193,8 @@ impl<'db> UseDefMapBuilder<'db> {
     }
 
     pub(super) fn add_place(&mut self, place: ScopedPlaceId) {
-        self.checkpoint_state.record_binding_change();
+        // Earlier snapshots restore new places as undefined. The first definition
+        // changes the bindings visible to an exception handler.
         match place {
             ScopedPlaceId::Symbol(symbol) => {
                 let new_place = self.symbol_states.push(PendingPlaceState::new(
