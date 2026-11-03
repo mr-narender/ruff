@@ -28,6 +28,7 @@ use crate::types::signatures::{Parameters, ReturnCallableTypeVarScope, Signature
 use crate::types::tuple::{
     TupleSpec, TupleSpecBuilder, TupleType, VariableSegment, walk_tuple_type,
 };
+use crate::types::type_alias::walk_type_alias_arguments;
 use crate::types::typevar::{
     BoundTypeVarIdentity, TypeVarConstraints, TypeVarDomain, TypeVarIdentity, TypeVarInstance,
     TypeVarSet,
@@ -836,6 +837,10 @@ impl<'db> GenericContext<'db> {
                 } else {
                     walk_callable_type(db, callable, self);
                 }
+            }
+
+            fn visit_type_alias_object(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
+                walk_type_alias_arguments(db, alias, self);
             }
 
             fn visit_type_alias_type(&self, db: &'db dyn Db, type_alias: TypeAliasType<'db>) {
@@ -5017,6 +5022,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 return self.infer_from_constraint_set(when);
             }
 
+            (formal @ Type::TypedDict(_), actual) => {
+                let when = self.constraint_for_relation(formal, actual, relation_polarity);
+                return self.infer_from_constraint_set(when);
+            }
+
             (Type::Callable(formal_callable), _) => {
                 let Some(actual_callables) = actual.try_upcast_to_callable(db, self.env) else {
                     return Ok(());
@@ -5053,7 +5063,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(crate) enum SpecializationError<'db> {
     MismatchedBound {
         bound_typevar: BoundTypeVarInstance<'db>,
