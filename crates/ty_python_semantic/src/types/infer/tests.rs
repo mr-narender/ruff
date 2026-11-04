@@ -123,7 +123,7 @@ fn same_file_at_different_python_versions() -> anyhow::Result<()> {
     settings.python_version.version = PythonVersion::PY312;
     let py312 = Program::from_settings(&db, &settings).program_file(&db, file);
 
-    let check = |file, expected_type, expect_invalid_syntax, expect_unresolved_import| {
+    let check = |file, expected_type, expect_invalid_syntax, expect_import_not_found| {
         let diagnostics = crate::check_file_unwrap(&db, file);
 
         assert_eq!(
@@ -137,7 +137,7 @@ fn same_file_at_different_python_versions() -> anyhow::Result<()> {
             diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.headline_message().contains("zipfile._path")),
-            expect_unresolved_import,
+            expect_import_not_found,
             "{diagnostics:#?}"
         );
 
@@ -149,7 +149,7 @@ fn same_file_at_different_python_versions() -> anyhow::Result<()> {
         assert_eq!(revealed, Some(expected_type), "{diagnostics:#?}");
         assert_eq!(
             diagnostics.len(),
-            1 + usize::from(expect_invalid_syntax) + usize::from(expect_unresolved_import),
+            1 + usize::from(expect_invalid_syntax) + usize::from(expect_import_not_found),
             "{diagnostics:#?}"
         );
     };
@@ -344,6 +344,28 @@ fn multiplied_literal_string() -> anyhow::Result<()> {
             assert_type((-100)*"{y}", Literal[""])
             "#,
         y = "a".repeat(TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE + 1),
+    );
+    db.write_dedented("src/a.py", &content)?;
+
+    assert_file_diagnostics(&db, "src/a.py", &[]);
+
+    Ok(())
+}
+
+#[test]
+fn concatenated_bytes_literal_size_limit() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let limit = TypeInferenceBuilder::MAX_STRING_LITERAL_SIZE;
+    let content = format!(
+        r#"
+            from typing_extensions import Literal, assert_type
+
+            value = b"{prefix}" + b"x"
+            assert_type(len(value), Literal[{limit}])
+            value += b"x"
+            assert_type(value, bytes)
+            "#,
+        prefix = "x".repeat(limit - 1),
     );
     db.write_dedented("src/a.py", &content)?;
 
