@@ -23,8 +23,8 @@ use crate::types::{
     Type, TypeContext, TypeVarBoundOrConstraints, UnfoldResult, UnionBuilder, binding_type,
     class_pattern_positional_sources, definite_match_pattern_type_for_subject,
     exact_sequence_pattern_type, infer_expression_types, mapping_pattern_type,
-    pattern_binding_fallthrough_type, sequence_pattern_type_builder, singleton_pattern_type,
-    starred_sequence_pattern_type, typed_dict_matches_class_pattern,
+    pattern_binding_fallthrough_type, same_enum_or_pattern_type, sequence_pattern_type_builder,
+    singleton_pattern_type, starred_sequence_pattern_type, typed_dict_matches_class_pattern,
 };
 use crate::{Db, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
@@ -637,29 +637,16 @@ impl<'db> ClassInfoConstraint<'_, 'db> {
             }
             Type::Dynamic(_) | Type::Divergent(_) => Some(classinfo),
             Type::Intersection(intersection) => {
-                if intersection.negative(db).is_empty() {
-                    let mut builder = IntersectionBuilder::new(db, env);
-                    let mut any_member = false;
-                    for element in intersection.positive(db) {
-                        // A member that yields no constraint (e.g. a parametrized
-                        // generic alias, which is not a valid runtime isinstance
-                        // target) should be SKIPPED, not abort narrowing on the
-                        // whole intersection. Narrowing on the remaining members
-                        // is still sound.
-                        if let Some(c) = self.generate(db, *element) {
-                            builder.add_positive_in_place(c);
-                            any_member = true;
-                        }
-                    }
-                    if any_member {
-                        Some(builder.build())
-                    } else {
-                        None
-                    }
-                } else {
-                    // TODO: can we do better here?
-                    None
+                // The positive members bound what can match even when negative members rule out
+                // some class-info values. That bound does not tell us what must match.
+                if !is_positive && !intersection.negative(db).is_empty() {
+                    return None;
                 }
+
+                // A member such as a parameterized generic alias may yield no constraint.
+                // The remaining members can still narrow the subject.
+                intersection
+                    .bounded_filter_map_positive(db, env, |element| self.generate(db, element))
             }
             Type::Union(union) => union.try_map(db, env, |element| self.generate(db, *element)),
             Type::TypeVar(bound_typevar) => {
@@ -1993,6 +1980,19 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             PatternPredicateKind::Value(expr) => PatternNarrowingResult::Possible(
                 self.evaluate_match_pattern_value(subject, *expr, false),
             ),
+            // A match on an attribute or subscript can also narrow the receiver, which requires
+            // evaluating the alternatives individually.
+            PatternPredicateKind::Or(patterns)
+                if matches!(patterns.first(), Some(PatternPredicateKind::Value(_)))
+                    && matches!(
+                        subject.node_ref(self.db).node(self.module),
+                        ast::Expr::Name(_)
+                    )
+                    && let Some(constraints) =
+                        self.evaluate_negative_match_pattern(subject, pattern_predicate_kind) =>
+            {
+                PatternNarrowingResult::Possible(Some(constraints))
+            }
             PatternPredicateKind::Or(predicates) => PatternNarrowingResult::merge_alternatives(
                 predicates.iter().map(|predicate| {
                     self.evaluate_negative_pattern_predicate_kind(predicate, subject)
@@ -4798,8 +4798,12 @@ impl<'db> NarrowingConstraintsBuilder<'db, '_> {
         let subject_place = PlaceExpr::try_from_expr(subject.node_ref(db).node(self.module))?;
         let place = self.expect_place(&subject_place);
         let subject_ty = infer_same_file_expression_type(db, subject, TypeContext::default());
-        let definitely_matched =
-            definite_match_pattern_type_for_subject(db, &self.env, pattern, subject_ty);
+        let definitely_matched = match pattern {
+            PatternPredicateKind::Or(patterns) => {
+                same_enum_or_pattern_type(db, &self.env, patterns, subject_ty)?
+            }
+            _ => definite_match_pattern_type_for_subject(db, &self.env, pattern, subject_ty),
+        };
         if definitely_matched.is_never() {
             return None;
         }

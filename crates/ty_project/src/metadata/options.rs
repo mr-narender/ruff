@@ -25,11 +25,10 @@ use ruff_options_metadata::{OptionSet, OptionSetKind, OptionsMetadata, Visit};
 use ruff_python_ast::PythonVersion;
 use ruff_ranged_value::{RangedValue, ValueSource, ValueSourceGuard};
 use ruff_text_size::TextRange;
-use rustc_hash::{FxHashMap, FxHasher};
-use serde::{Deserialize, Deserializer, Serialize};
+use rustc_hash::FxHasher;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::fmt::{self, Debug, Display, Write as _};
+use std::fmt::{self, Debug, Display};
 use std::hash::BuildHasherDefault;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -41,7 +40,7 @@ use ty_module_resolver::{
 };
 use ty_python_core::platform::PythonPlatform;
 use ty_python_core::program::{MisconfigurationStrategy, ProgramSettings, PythonEnvironmentError};
-use ty_python_semantic::lint::{Level, LintSource, RuleSelection};
+use ty_python_semantic::lint::{Level, LintRegistry, LintSource, RuleSelection};
 use ty_python_semantic::{
     AnalysisSettings, PythonEnvironment, PythonVersionFileSource, PythonVersionSource,
     PythonVersionWithSource, ReturnTypeInference, SitePackagesDiscoveryError, SitePackagesPaths,
@@ -99,6 +98,8 @@ pub struct Options {
     ///
     /// By default, ty exits with code 1 if it emits any warning or error diagnostics.
     /// Set `terminal.error-on-warning` to `false` to exit with code 0 if all diagnostics have `warning` severity.
+    ///
+    /// If the same table specifies both a rule's current name and an alias, the current name takes precedence.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[option(
         default = r#"{...}"#,
@@ -133,7 +134,7 @@ impl Options {
     pub fn from_toml_str(content: &str, source: ValueSource) -> Result<Self, TyTomlError> {
         let _guard = ValueSourceGuard::new(source, true);
         let mut options: Self = toml::from_str(content)?;
-        options.prioritize_all_selectors();
+        options.order_rule_selectors(ty_python_semantic::default_lint_registry());
         Ok(options)
     }
 
@@ -159,23 +160,26 @@ impl Options {
         Ok(())
     }
 
-    /// Ensures that the `all` selector is applied before per-rule selectors
-    /// in all rule tables (top-level and overrides).
+    /// Sorts rule selectors according to their precedence.
     ///
-    /// This must be called after deserializing from TOML and before any
-    /// [`Combine::combine`] calls, because TOML tables are unordered and the
-    /// `toml` crate sorts keys lexicographically.
-    pub(crate) fn prioritize_all_selectors(&mut self) {
-        // Stable sort that moves all `all` selectors before non-`all` selectors
-        // while preserving relative order among non-`all` entries.
+    /// From highest to lowest precedence
+    /// * normal rule names
+    /// * An alias for another rule (the new name wins over the old name)
+    /// * `all`
+    ///
+    /// TOML tables are unordered. Establish the order before merging so an alias in a
+    /// higher-precedence table can still override the current name in a lower-precedence table.
+    pub(crate) fn order_rule_selectors(&mut self, registry: &LintRegistry) {
         let sort = |rules: &mut Rules| {
-            rules.inner.sort_by(
-                |key_a, _, key_b, _| match (**key_a == "all", **key_b == "all") {
-                    (true, false) => Ordering::Less,
-                    (false, true) => Ordering::Greater,
-                    _ => Ordering::Equal,
-                },
-            );
+            rules.inner.sort_by_cached_key(|name, _| {
+                if name.as_str() == "all" {
+                    0
+                } else if registry.is_alias(name) {
+                    1
+                } else {
+                    2
+                }
+            });
         };
 
         if let Some(rules) = &mut self.rules {
@@ -190,12 +194,18 @@ impl Options {
         }
     }
 
-    pub fn deserialize_with<'de, D>(source: ValueSource, deserializer: D) -> Result<Self, D::Error>
+    pub fn deserialize_with<'de, D>(
+        source: ValueSource,
+        deserializer: D,
+        registry: &LintRegistry,
+    ) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let _guard = ValueSourceGuard::new(source, false);
-        Self::deserialize(deserializer)
+        let mut options = Self::deserialize(deserializer)?;
+        options.order_rule_selectors(registry);
+        Ok(options)
     }
 
     /// Resolve configured paths and discover defaults according to the project or script context.
@@ -506,7 +516,7 @@ impl Options {
         strategy: &Strategy,
     ) -> Result<(Settings, Vec<OptionDiagnostic>), Strategy::Error<ToSettingsError>> {
         let mut diagnostics = Vec::new();
-        let rules = self.to_rule_selection(db, &mut diagnostics);
+        let rules = self.rules.or_default().to_rule_selection(db);
 
         let terminal_options = self.terminal.or_default();
         let terminal = TerminalSettings {
@@ -571,13 +581,24 @@ impl Options {
         Ok((settings, diagnostics))
     }
 
-    #[must_use]
-    fn to_rule_selection(
-        &self,
-        db: &dyn Db,
-        diagnostics: &mut Vec<OptionDiagnostic>,
-    ) -> RuleSelection {
-        self.rules.or_default().to_rule_selection(db, diagnostics)
+    /// Lint options from one source, such as `ty.toml`, `pyproject.toml`, CLI arguments, or editor settings.
+    ///
+    /// When resolving project settings, lint each source separately so unknown or renamed rules
+    /// are reported even if a higher-priority source overrides them. When resolving a script,
+    /// only its inline options need linting because the project already checked the shared sources.
+    ///
+    /// Checks that depend on the merged settings belong in [`Self::to_settings`].
+    pub(crate) fn lint_unmerged(&self, db: &dyn Db) -> Vec<OptionDiagnostic> {
+        let mut diagnostics = Vec::new();
+        if let Some(rules) = &self.rules {
+            rules.lint(db, &mut diagnostics);
+        }
+        if let Some(overrides) = &self.overrides {
+            for section in &overrides.0 {
+                OverrideOptions::lint(db, section, &mut diagnostics);
+            }
+        }
+        diagnostics
     }
 
     fn to_overrides_settings(
@@ -612,7 +633,7 @@ impl Options {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum OptionsContext<'a> {
     Project(&'a SystemPath),
-    /// The directory containing a standalone script, or the working directory for a virtual script.
+    /// The directory used to resolve relative settings for the script.
     Script(&'a SystemPath),
 }
 
@@ -860,7 +881,8 @@ pub struct EnvironmentOptions {
     /// * `./python`
     ///
     /// Scripts with inline metadata have no first-party roots by default because they are
-    /// single-file programs. Set `root = ["."]` to allow importing local modules.
+    /// single-file programs. Set `root = ["."]` in the script's `[tool.ty.environment]` table
+    /// to import sibling modules.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[option(
         default = r#"null"#,
@@ -890,8 +912,8 @@ pub struct EnvironmentOptions {
     ///    and attempt to infer the Python version of that environment
     /// 3. Fall back to the default value (see below)
     ///
-    /// Scripts with inline metadata use their `requires-python` field instead of
-    /// `project.requires-python`. They do not inherit the Python version of the enclosing project.
+    /// A script uses its inline `environment.python-version` first, then `requires-python`.
+    /// It falls back to the project's version if it has no inline `[tool.ty]` table.
     ///
     /// For some language features, ty can also understand conditionals based on comparisons
     /// with `sys.version_info`. These are commonly found in typeshed, for example,
@@ -1158,48 +1180,16 @@ impl SrcOptions {
     }
 }
 
-#[derive(Debug, Default, Clone, Eq, PartialEq, Combine, Serialize, Hash, get_size2::GetSize)]
-#[serde(rename_all = "kebab-case", transparent)]
+#[derive(
+    Debug, Default, Clone, Eq, PartialEq, Combine, Serialize, Deserialize, Hash, get_size2::GetSize,
+)]
+#[serde(transparent)]
 pub struct Rules {
     /// The rules with their severity. Entries coming later in the map take precedence over
     /// earlier entries (e.g. a `all` selector earlier in the hash map will be overridden
     /// by a specific rule selector coming after it but if `all` is the last selector, then it
     /// overrides even specific rule codes).
     inner: OrderMap<RangedValue<String>, RangedValue<Level>, BuildHasherDefault<FxHasher>>,
-}
-
-impl<'de> Deserialize<'de> for Rules {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let rules = Self {
-            inner: OrderMap::deserialize(deserializer)?,
-        };
-        // Check each table before merging so a separate config file or override can change the level.
-        let registry = ty_python_semantic::default_lint_registry();
-        let mut seen = FxHashMap::default();
-        for (name, level) in &rules.inner {
-            if let Ok(lint) = registry.get(name)
-                && let Some((other_name, other_level)) = seen.insert(lint, (name, level))
-                && level != other_level
-            {
-                let mut message = format!(
-                    "Conflicting levels for the same rule: `{other_name} = \"{other_level}\"` and \
-                     `{name} = \"{level}\"`"
-                );
-                let canonical = lint.name();
-                for spelling in [other_name, name] {
-                    if spelling.as_str() != canonical.as_str() {
-                        message.push('\n');
-                        let _ = write!(
-                            message,
-                            "note: `{spelling}` is a legacy alias for `{canonical}`"
-                        );
-                    }
-                }
-                return Err(serde::de::Error::custom(message));
-            }
-        }
-        Ok(rules)
-    }
 }
 
 impl FromIterator<(RangedValue<String>, RangedValue<Level>)> for Rules {
@@ -1217,12 +1207,31 @@ impl FromIterator<(RangedValue<String>, RangedValue<Level>)> for Rules {
 }
 
 impl Rules {
-    /// Convert the rules to a `RuleSelection` with diagnostics.
-    pub(crate) fn to_rule_selection(
-        &self,
-        db: &dyn Db,
-        diagnostics: &mut Vec<OptionDiagnostic>,
-    ) -> RuleSelection {
+    fn lint(&self, db: &dyn Db, diagnostics: &mut Vec<OptionDiagnostic>) {
+        let registry = db.lint_registry();
+        for name in self.inner.keys() {
+            if name.as_str() == "all" {
+                continue;
+            }
+            let diagnostic = match registry.get(name) {
+                Ok(lint) if lint.name().as_str() != name.as_str() => OptionDiagnostic::new(
+                    DiagnosticId::RenamedRule,
+                    format!("Rule `{name}` has been renamed to `{}`", lint.name()),
+                    Severity::Warning,
+                ),
+                Ok(_) => continue,
+                // TODO: Add a note if the value was configured on the CLI.
+                Err(error) => OptionDiagnostic::new(
+                    DiagnosticId::UnknownRule,
+                    error.to_string(),
+                    Severity::Warning,
+                ),
+            };
+            diagnostics.push(diagnostic.at(db, name, None));
+        }
+    }
+
+    pub(crate) fn to_rule_selection(&self, db: &dyn Db) -> RuleSelection {
         let registry = db.lint_registry();
 
         // Initialize the selection with the defaults
@@ -1251,30 +1260,8 @@ impl Rules {
                 for lint in registry.lints() {
                     set_lint_level(*lint);
                 }
-                continue;
-            }
-
-            match registry.get(rule_name) {
-                Ok(lint) => {
-                    set_lint_level(lint);
-                }
-                Err(error) => {
-                    // The file may have been deleted since its configuration was read. In that
-                    // case, report the diagnostic without a configuration-file annotation.
-                    let file = source.file(db);
-
-                    // TODO: Add a note if the value was configured on the CLI
-                    let diagnostic = OptionDiagnostic::new(
-                        DiagnosticId::UnknownRule,
-                        error.to_string(),
-                        Severity::Warning,
-                    );
-
-                    let annotation = file.map(Span::from).map(|span| {
-                        Annotation::primary(span.with_optional_range(rule_name.range()))
-                    });
-                    diagnostics.push(diagnostic.with_annotation(annotation));
-                }
+            } else if let Ok(lint) = registry.get(rule_name) {
+                set_lint_level(lint);
             }
         }
 
@@ -2096,38 +2083,19 @@ pub struct OverrideOptions {
     analysis: Option<AnalysisOptions>,
 }
 
-trait ToOverride {
-    fn to_override(
-        &self,
-        db: &dyn Db,
-        project_root: &SystemPath,
-        global_rules: Option<&Rules>,
-        global_analysis: Option<&AnalysisOptions>,
-        diagnostics: &mut Vec<OptionDiagnostic>,
-    ) -> Result<Option<Override>, Box<OptionDiagnostic>>;
-}
-
-impl ToOverride for RangedValue<OverrideOptions> {
-    fn to_override(
-        &self,
-        db: &dyn Db,
-        project_root: &SystemPath,
-        global_rules: Option<&Rules>,
-        global_analysis: Option<&AnalysisOptions>,
-        diagnostics: &mut Vec<OptionDiagnostic>,
-    ) -> Result<Option<Override>, Box<OptionDiagnostic>> {
-        let rules = self.rules.or_default();
-        let analysis = self.analysis.or_default();
-
-        // First, warn about incorrect or useless overrides.
-        if rules.is_empty() && *analysis == AnalysisOptions::default() {
+impl OverrideOptions {
+    fn lint(db: &dyn Db, section: &RangedValue<Self>, diagnostics: &mut Vec<OptionDiagnostic>) {
+        if let Some(rules) = &section.rules {
+            rules.lint(db, diagnostics);
+        }
+        if section.is_empty() {
             let mut diagnostic = OptionDiagnostic::new(
                 DiagnosticId::UselessOverridesSection,
                 "Useless `overrides` section".to_string(),
                 Severity::Warning,
             );
 
-            diagnostic = if self.rules.is_none() && self.analysis.is_none() {
+            diagnostic = if section.rules.is_none() && section.analysis.is_none() {
                 diagnostic = diagnostic.sub(SubDiagnostic::new(
                     SubDiagnosticSeverity::Info,
                     "It has no `rules` or `analysis` table",
@@ -2137,7 +2105,7 @@ impl ToOverride for RangedValue<OverrideOptions> {
                     "Add a `[overrides.rules]` or `[overrides.analysis]` table...",
                 ))
             } else {
-                if self.rules.is_some() && rules.is_empty() {
+                if section.rules.is_some() {
                     diagnostic = diagnostic.sub(SubDiagnostic::new(
                         SubDiagnosticSeverity::Info,
                         "The `rules` table is empty",
@@ -2148,7 +2116,7 @@ impl ToOverride for RangedValue<OverrideOptions> {
                     ));
                 }
 
-                if self.analysis.is_some() && *analysis == AnalysisOptions::default() {
+                if section.analysis.is_some() {
                     diagnostic = diagnostic.sub(SubDiagnostic::new(
                         SubDiagnosticSeverity::Info,
                         "The `analysis` table is empty",
@@ -2163,21 +2131,16 @@ impl ToOverride for RangedValue<OverrideOptions> {
                 "or remove the `[[overrides]]` section if there's nothing to override",
             ));
 
-            // Add source annotation if we have source information
-            if let Some(file) = self.source().file(db) {
-                let annotation =
-                    Annotation::primary(Span::from(file).with_optional_range(self.range()))
-                        .message("This overrides section overrides no settings");
-                diagnostic = diagnostic.with_annotation(Some(annotation));
-            }
-
-            diagnostics.push(diagnostic);
-            // Return `None`, because this override doesn't override anything
-            return Ok(None);
+            diagnostics.push(diagnostic.at(
+                db,
+                section,
+                Some("This overrides section overrides no settings"),
+            ));
+            return;
         }
 
-        let include_missing = self.include.is_none();
-        let exclude_empty = self
+        let include_missing = section.include.is_none();
+        let exclude_empty = section
             .exclude
             .as_ref()
             .is_none_or(|exclude| exclude.is_empty());
@@ -2190,7 +2153,7 @@ impl ToOverride for RangedValue<OverrideOptions> {
                 Severity::Warning,
             );
 
-            diagnostic = if self.exclude.is_none() {
+            diagnostic = if section.exclude.is_none() {
                 diagnostic.sub(SubDiagnostic::new(
                     SubDiagnosticSeverity::Info,
                     "It has no `include` or `exclude` option restricting the files",
@@ -2214,19 +2177,34 @@ impl ToOverride for RangedValue<OverrideOptions> {
                 if the configuration should apply to all files",
             ));
 
-            // Add source annotation if we have source information
-            if let Some(file) = self.source().file(db) {
-                let annotation =
-                    Annotation::primary(Span::from(file).with_optional_range(self.range()))
-                        .message("This overrides section applies to all files");
-                diagnostic = diagnostic.with_annotation(Some(annotation));
-            }
+            diagnostics.push(diagnostic.at(
+                db,
+                section,
+                Some("This overrides section applies to all files"),
+            ));
+        }
+    }
 
-            diagnostics.push(diagnostic);
+    fn is_empty(&self) -> bool {
+        self.rules.as_ref().is_none_or(Rules::is_empty)
+            && self
+                .analysis
+                .as_ref()
+                .is_none_or(|analysis| *analysis == AnalysisOptions::default())
+    }
+
+    fn to_override(
+        &self,
+        db: &dyn Db,
+        project_root: &SystemPath,
+        global_rules: Option<&Rules>,
+        global_analysis: Option<&AnalysisOptions>,
+        diagnostics: &mut Vec<OptionDiagnostic>,
+    ) -> Result<Option<Override>, Box<OptionDiagnostic>> {
+        if self.is_empty() {
+            return Ok(None);
         }
 
-        // The override is at least (partially) valid.
-        // Construct the matcher and resolve the settings.
         let include = build_include_filter(
             db,
             project_root,
@@ -2246,16 +2224,16 @@ impl ToOverride for RangedValue<OverrideOptions> {
         let files = IncludeExcludeFilter::new(include, exclude);
 
         // Merge global rules with override rules, with override rules taking precedence
-        let mut merged_rules = rules.into_owned();
+        let mut merged_rules = self.rules.clone().unwrap_or_default();
 
         if let Some(global_rules) = global_rules {
             merged_rules = merged_rules.combine(global_rules.clone());
         }
 
         // Convert merged rules to rule selection
-        let rule_selection = merged_rules.to_rule_selection(db, diagnostics);
+        let rule_selection = merged_rules.to_rule_selection(db);
 
-        let mut merged_analysis = analysis.into_owned();
+        let mut merged_analysis = self.analysis.clone().unwrap_or_default();
 
         if let Some(global_analysis) = global_analysis {
             merged_analysis = merged_analysis.combine(global_analysis.clone());
@@ -2507,6 +2485,19 @@ impl OptionDiagnostic {
     #[must_use]
     fn with_annotation(self, annotation: Option<Annotation>) -> Self {
         OptionDiagnostic { annotation, ..self }
+    }
+
+    fn at<T>(self, db: &dyn Db, value: &RangedValue<T>, label: Option<&'static str>) -> Self {
+        let annotation = value.source().file(db).map(|file| {
+            let annotation =
+                Annotation::primary(Span::from(file).with_optional_range(value.range()));
+            if let Some(label) = label {
+                annotation.message(label)
+            } else {
+                annotation
+            }
+        });
+        self.with_annotation(annotation)
     }
 
     fn with_source_sub<T>(

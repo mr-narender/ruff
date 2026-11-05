@@ -132,8 +132,9 @@ impl Override {
 /// Resolves the settings for a given file.
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
 pub(crate) fn file_settings(db: &dyn Db, file: File) -> FileSettings {
-    if let Some(script) = Script::for_file(db, file) {
-        let settings = script.settings(db);
+    if let Some(script) = Script::for_file(db, file)
+        && let Some(settings) = script.inline_settings(db)
+    {
         return FileSettings::File(Arc::new(OverrideSettings {
             rules: settings.rules().clone(),
             analysis: settings.analysis().clone(),
@@ -226,9 +227,8 @@ fn merge_overrides(db: &dyn Db, overrides: Vec<Arc<InnerOverrideOptions>>, _: ()
     let rules = merged.rules.unwrap_or_default();
     let analysis = merged.analysis.unwrap_or_default();
 
-    // It's okay to ignore the errors here because the rules are eagerly validated
-    // during `overrides.to_settings()`.
-    let rules = rules.to_rule_selection(db, &mut Vec::new());
+    let rules = rules.to_rule_selection(db);
+    // The analysis options were already validated when building the individual overrides.
     let analysis = analysis.to_settings(db, Severity::Warning, &mut Vec::new());
 
     FileSettings::File(Arc::new(OverrideSettings { rules, analysis }))

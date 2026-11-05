@@ -46,6 +46,8 @@ Valid severities are:
 By default, ty exits with code 1 if it emits any warning or error diagnostics.
 Set `terminal.error-on-warning` to `false` to exit with code 0 if all diagnostics have `warning` severity.
 
+If the same table specifies both a rule's current name and an alias, the current name takes precedence.
+
 **Default value**: `{...}`
 
 **Type**: `dict[RuleName | "all", "ignore" | "warn" | "error"]`
@@ -520,8 +522,8 @@ to determine a value:
    and attempt to infer the Python version of that environment
 3. Fall back to the default value (see below)
 
-Scripts with inline metadata use their `requires-python` field instead of
-`project.requires-python`. They do not inherit the Python version of the enclosing project.
+A script uses its inline `environment.python-version` first, then `requires-python`.
+It falls back to the project's version if it has no inline `[tool.ty]` table.
 
 For some language features, ty can also understand conditionals based on comparisons
 with `sys.version_info`. These are commonly found in typeshed, for example,
@@ -564,7 +566,8 @@ if they exist and are not packages (i.e. they do not contain `__init__.py` or `_
 * `./python`
 
 Scripts with inline metadata have no first-party roots by default because they are
-single-file programs. Set `root = ["."]` to allow importing local modules.
+single-file programs. Set `root = ["."]` in the script's `[tool.ty.environment]` table
+to import sibling modules.
 
 **Default value**: `null`
 
