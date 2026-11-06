@@ -42,7 +42,7 @@ pub(crate) use self::infer::{
     InferredDeclaration, TypeContext, infer_complete_scope_types, infer_deferred_types,
     infer_definition_types, infer_expression_type, infer_expression_types,
     infer_predicate_truthiness, infer_same_file_expression_type, infer_scope_types,
-    is_discarded_dict_key_assignment,
+    is_discarded_dict_key_assignment, original_class_type,
 };
 use self::infer::{
     infer_function_default_types, infer_legacy_type_alias, legacy_type_alias_parameters,
@@ -99,7 +99,7 @@ pub use crate::types::method::{BoundMethodType, KnownBoundMethodType, WrapperDes
 use crate::types::mro::{MroIterator, StaticMroError};
 pub(crate) use crate::types::narrow::{NarrowingConstraint, infer_narrowing_constraints};
 use crate::types::newtype::NewType;
-use crate::types::signatures::{ConcatenateTail, walk_signature};
+use crate::types::signatures::{CallableSignature, ConcatenateTail, walk_signature};
 pub(crate) use crate::types::signatures::{Parameter, Parameters};
 use crate::types::special_form::TypeQualifier;
 use crate::types::tuple::TupleSpec;
@@ -5698,6 +5698,23 @@ impl<'db> Type<'db> {
         let fallback_properties = fallback_member.deprecated_properties(db);
         let fallback_member = fallback_member.member(db);
 
+        // We do explicitly allow instance attributes to shadow methods defined on the class.
+        // If we see a definitely-bound meta-attribute (the method), and if the fallback is
+        // an instance attribute (e.g. `self.method = ...`) with a compatible type, we pretend
+        // that there is no fallback, i.e. attribute lookup simply yields the meta-attribute
+        // (the actual method on the class).
+        let fallback_member = if meta_attr.is_definitely_bound()
+            && let Place::Defined(DefinedPlace { origin, ty, .. }) = fallback_member.place
+            && !origin.is_declared()
+            && let Some(contract) =
+                meta_attr_ty.and_then(|method| method.method_shadowing_contract(db, env, receiver))
+            && ty.is_assignable_to(db, env, contract)
+        {
+            PlaceAndQualifiers::unbound()
+        } else {
+            fallback_member
+        };
+
         // A slot stores the same instance attribute described by the receiver's declarations.
         // Unlike an arbitrary data descriptor, its inherited getter must not hide a more precise
         // declaration established by the receiver's class.
@@ -9581,6 +9598,73 @@ impl<'db> Type<'db> {
         }
     }
 
+    /// Freshens a member's method binders to avoid capturing typevars in incoming class arguments.
+    /// Constructor lookup must do this before adding the inherited class generic context.
+    fn freshen_member_for_owner_specialization(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        specialization: Option<Specialization<'db>>,
+    ) -> Self {
+        let Some(specialization) = specialization else {
+            return self;
+        };
+        let freshen = |signatures: &CallableSignature<'db>| {
+            signatures.freshen_for_owner_specialization(db, env, specialization)
+        };
+        match self {
+            Type::FunctionLiteral(function) => {
+                Type::FunctionLiteral(function.map_signatures(db, freshen))
+            }
+            Type::Callable(callable) => {
+                Type::Callable(callable.with_signatures(db, freshen(callable.signatures(db))))
+            }
+            Type::BoundMethod(method) => Type::BoundMethod(method.with_func(
+                db,
+                method.func(db).freshen_member_for_owner_specialization(
+                    db,
+                    env,
+                    Some(specialization),
+                ),
+            )),
+            Type::PropertyInstance(property) => {
+                let freshen = |ty: Type<'db>| {
+                    ty.freshen_member_for_owner_specialization(db, env, Some(specialization))
+                };
+                Type::PropertyInstance(PropertyInstanceType::new_internal(
+                    db,
+                    property.getter(db).map(freshen),
+                    property.setter(db).map(freshen),
+                    property.deleter(db).map(freshen),
+                    property.instance_class(db),
+                    property.accessor_definitions(db),
+                ))
+            }
+            Type::Union(union) => union.map(db, env, |ty| {
+                ty.freshen_member_for_owner_specialization(db, env, Some(specialization))
+            }),
+            Type::Intersection(intersection) => {
+                let mut builder = IntersectionBuilder::new(db, env).preserve_positive_aliases(true);
+                for ty in intersection.positive(db) {
+                    builder.add_positive_in_place(ty.freshen_member_for_owner_specialization(
+                        db,
+                        env,
+                        Some(specialization),
+                    ));
+                }
+                for ty in intersection.negative(db) {
+                    builder.add_negative_in_place(ty.freshen_member_for_owner_specialization(
+                        db,
+                        env,
+                        Some(specialization),
+                    ));
+                }
+                builder.build()
+            }
+            _ => self,
+        }
+    }
+
     /// Projects a member from its generic owner, applying the owner's specialization to both
     /// ordinary occurrences and the domain of any retained synthetic `Self` variable.
     ///
@@ -11503,7 +11587,7 @@ pub enum TypeMapping<'a, 'db> {
         materialization_kind: MaterializationKind,
     },
     /// A structural substitution constructed only by the recursive-type binder.
-    ApplyRecursiveSubstitution(RecursiveMapping<'db>),
+    ApplyRecursiveSubstitution(RecursiveMapping<'a, 'db>),
     /// Replaces any literal types with their corresponding promoted type form (e.g. `Literal["string"]`
     /// to `str`, or `def _() -> int` to `Callable[[], int]`).
     Promote(PromotionMode, PromotionKind),
@@ -11582,17 +11666,20 @@ impl<'db> TypeMapping<'_, 'db> {
     fn update_signature_generic_context(
         &self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
         context: GenericContext<'db>,
+        visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Option<GenericContext<'db>> {
+        let env = visitor.env;
         match self {
             TypeMapping::FreshenBoundTypeVars { .. } => {
+                // A default can refer back to this signature, so keep the enclosing
+                // traversal's recursion guard when mapping its generic context.
                 Some(GenericContext::from_typevar_instances(
                     db,
                     env,
                     context.variables(db).map(|bound_typevar| {
                         Type::TypeVar(bound_typevar)
-                            .apply_type_mapping(db, env, self, TypeContext::default())
+                            .apply_type_mapping_impl(db, self, TypeContext::default(), visitor)
                             .as_typevar()
                             .unwrap_or(bound_typevar)
                     }),
@@ -11817,13 +11904,6 @@ impl DynamicType<'_> {
 
     fn is_todo(&self) -> bool {
         matches!(self, Self::Todo(_))
-    }
-
-    const fn is_provisional_marker(self) -> bool {
-        matches!(
-            self,
-            Self::UnspecializedTypeVar | Self::UnknownLambdaParameter
-        )
     }
 }
 

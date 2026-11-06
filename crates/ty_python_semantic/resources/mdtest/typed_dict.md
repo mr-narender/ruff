@@ -3614,22 +3614,7 @@ def set_and_get(value: SetAndGet[Key, Value], key: Key, item: Value) -> Value:
 
 def takes_int(value: int) -> None: ...
 def _(value: CorrelatedA | CorrelatedB) -> None:
-    # TODO: This should not error.
-    # snapshot: invalid-argument-type
-    takes_int(set_and_get(value, "a", 1))
-```
-
-```snapshot
-error[invalid-argument-type]: Argument to function `takes_int` is incorrect
-   --> src/mdtest_snippet.py:346:15
-    |
-346 |     takes_int(set_and_get(value, "a", 1))
-    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^ Expected `int`, found `object`
-info: Function defined here
-   --> src/mdtest_snippet.py:342:5
-    |
-342 | def takes_int(value: int) -> None: ...
-    |     ^^^^^^^^^ ---------- Parameter declared here
+    takes_int(set_and_get(value, "a", 1))  # ok
 ```
 
 Generic protocols that use `keys()` and `__getitem__()` can infer their type variables from a
@@ -4716,8 +4701,8 @@ reveal_type(IntBound(value=1))  # revealed: IntBound[int]
 
 ### Constructor inference with callable parameters
 
-Like other generic constructors, a callback must accept the promoted type inferred from another
-field.
+A callback that accepts a literal type can prevent literal promotion for other arguments to a
+constructor:
 
 ```toml
 [environment]
@@ -4733,7 +4718,8 @@ class Box[T](TypedDict):
 
 def accepts_one(value: Literal[1]) -> None: ...
 
-Box(value=1, callback=accepts_one)  # error: [invalid-argument-type]
+box = Box(value=1, callback=accepts_one)
+reveal_type(box)  # revealed: Box[Literal[1]]
 ```
 
 ### Constructor inference with an expected type
@@ -4833,12 +4819,13 @@ def accepts_dog(value: Dog) -> None: ...
 dog_consumer: Consumer[Dog] = Consumer(callback=accepts_animal)
 ```
 
-An incompatible callback reports its argument error without producing an additional assignment
+An incompatible callback reports an assignability error without producing an additional argument
 error.
 
 ```py
+# error: [invalid-assignment]
 animal_consumer: Consumer[Animal] = Consumer(
-    callback=accepts_dog,  # error: [invalid-argument-type]
+    callback=accepts_dog,
 )
 ```
 
