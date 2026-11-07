@@ -1275,6 +1275,42 @@ fn redundant_elif_fix_preserves_line_endings_and_checks_cleanly() -> anyhow::Res
 }
 
 #[test]
+fn overload_signatures_track_imported_annotations() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    db.write_dedented(
+        "/src/api.pyi",
+        r#"
+        from typing import overload
+        from payload import Result
+
+        @overload
+        def parse(value: int) -> Result: ...
+        @overload
+        def parse(value: bytes) -> bytes: ...
+        "#,
+    )?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import reveal_type
+        from api import parse
+
+        reveal_type((parse(1), parse(b"x")))
+        "#,
+    )?;
+
+    for (payload, expected) in [
+        ("int", "tuple[int, bytes]"),
+        ("str", "tuple[str, bytes]"),
+        ("int", "tuple[int, bytes]"),
+    ] {
+        db.write_file("/src/payload.py", format!("Result = {payload}"))?;
+        assert_revealed_type(&db, "/src/main.py", expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn function_inference_regions_are_disjoint() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(
@@ -1623,6 +1659,44 @@ fn dependency_unrelated_symbol() -> anyhow::Result<()> {
         first_public_binding(&db, a, "x"),
         &events,
     );
+    Ok(())
+}
+
+#[test]
+fn specialized_alias_values_track_imported_types() -> anyhow::Result<()> {
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY312)
+        .build()?;
+    db.write_dedented(
+        "/src/aliases.py",
+        r#"
+        from typing import TypeAliasType, TypeVar
+        from payload import Payload
+
+        type Declared[T] = tuple[T, Payload]
+        T = TypeVar("T")
+        Manual = TypeAliasType("Manual", tuple[T, Payload], type_params=(T,))
+        "#,
+    )?;
+    db.write_dedented(
+        "/src/main.py",
+        r#"
+        from typing import reveal_type
+        from aliases import Declared, Manual
+
+        def check(declared: Declared[int], manual: Manual[bytes]):
+            reveal_type((declared[1], manual[1]))
+        "#,
+    )?;
+
+    for (payload, expected) in [
+        ("int", "tuple[int, int]"),
+        ("str", "tuple[str, str]"),
+        ("int", "tuple[int, int]"),
+    ] {
+        db.write_file("/src/payload.py", format!("Payload = {payload}"))?;
+        assert_revealed_type(&db, "/src/main.py", expected);
+    }
     Ok(())
 }
 

@@ -1494,7 +1494,7 @@ class TwoTag(TypedDict):
 def equal_dictionary_tags(value: FalseTag | TwoTag, other: T):
     if value["tag"] == other:
         reveal_type(value)  # revealed: FalseTag | TwoTag
-        value["two_only"]  # error: [invalid-key] "Unknown key "two_only" for TypedDict `FalseTag`"
+        value["two_only"]  # error: [invalid-typed-dict-key] "Unknown key "two_only" for TypedDict `FalseTag`"
 ```
 
 ## Constraints containing `Any`
@@ -2552,16 +2552,16 @@ from typing import Any, Callable, Generic, TypeVar
 F = TypeVar("F", bound=Callable[..., Any])
 
 def my_decorator(f: F) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     f.whatever = 1
 
 class Box(Generic[F]):
     cls: type[F]
 
 def specialized(box: Box[Callable[..., Any]]) -> None:
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     box.cls.whatever
 ```
 
@@ -4329,8 +4329,8 @@ def _(unknown, any_: Any) -> None:
     reveal_type(unknown_result)  # revealed: Literal[1] | str
     # TODO: revealed: Literal[1] | (Any & str)
     reveal_type(any_result)  # revealed: Literal[1] | str
-    unknown_result.bit_length()  # error: [unresolved-attribute]
-    any_result.bit_length()  # error: [unresolved-attribute]
+    unknown_result.bit_length()  # error: [missing-union-attribute]
+    any_result.bit_length()  # error: [missing-union-attribute]
 ```
 
 Gradual specializations inherited through concrete subclasses can satisfy bounds and constraints

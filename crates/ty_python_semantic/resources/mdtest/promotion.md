@@ -219,6 +219,15 @@ mapping_segments = {**get_segments_by_name(), "start": (1, 2), "end": (3, 4, 5)}
 reveal_type(mapping_segments)  # revealed: dict[str, tuple[int, int] | tuple[int, int, int]]
 ```
 
+A non-literal tuple also preserves its length when the preceding literal has the same element type
+and length.
+
+```py
+def segments_with_pair(pair: tuple[int, int]):
+    segments = [(1, 2), pair, (3, 4, 5)]
+    reveal_type(segments)  # revealed: list[tuple[int, int] | tuple[int, int, int]]
+```
+
 This also applies when the non-literal tuple type is hidden behind a type alias or a type variable,
 or when it is subsumed by one of the literal tuple types while building the union.
 
@@ -1038,5 +1047,5 @@ import module1
 
 my_modules = [module1]
 reveal_type(my_modules)  # revealed: list[<module 'module1'>]
-my_modules[0].flibbertigibbet  # error: [unresolved-attribute]
+my_modules[0].flibbertigibbet  # error: [missing-attribute]
 ```

@@ -178,7 +178,7 @@ for _ in range(2):
     record = {"value": 1}
     inspect(record)
     reveal_type(record)  # revealed: Record
-    record["missing"]  # error: [invalid-key]
+    record["missing"]  # error: [invalid-typed-dict-key]
 
 class Record(TypedDict):
     value: int
@@ -2829,7 +2829,7 @@ def consume[T](callback: Callable[[T, int], int]) -> None:
     pass
 
 consume(id(lambda x, y: reveal_type(y)))  # revealed: int
-consume(id(lambda x, y: y.upper()))  # error: [unresolved-attribute]
+consume(id(lambda x, y: y.upper()))  # error: [missing-attribute]
 ```
 
 ## Lambda contextual inference through type aliases
