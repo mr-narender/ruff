@@ -594,13 +594,13 @@ reveal_type(Protocol())  # revealed: Unknown
 class MyProtocol(Protocol):
     x: int
 
-# error: [call-non-callable] "Cannot instantiate class `MyProtocol`"
+# error: [abstract-class-instantiation] "Cannot instantiate class `MyProtocol`"
 reveal_type(MyProtocol())  # revealed: MyProtocol
 
 class GenericProtocol[T](Protocol):
     x: T
 
-# error: [call-non-callable] "Cannot instantiate class `GenericProtocol`"
+# error: [abstract-class-instantiation] "Cannot instantiate class `GenericProtocol`"
 reveal_type(GenericProtocol[int]())  # revealed: GenericProtocol[int]
 ```
 
@@ -3030,7 +3030,7 @@ class MetaWithOverloadedSetAttr(type):
     def __setattr__(cls, attr: Literal["x"], value: Any) -> None: ...
     @overload
     def __setattr__(cls, attr: Literal["y"], value: int) -> None: ...
-    # error: [invalid-method-override]
+    # error: [incompatible-method-override]
     def __setattr__(cls, attr: str, value: object) -> None: ...
 
 class ClassWithOverloadedSetAttr(metaclass=MetaWithOverloadedSetAttr): ...
@@ -3320,7 +3320,7 @@ from ty_extensions import static_assert
 from ty_extensions._internal import is_equivalent_to
 
 class ReturnsSelf(Protocol):
-    # error: [invalid-method-override]
+    # error: [incompatible-method-override]
     def __eq__(self, other: object) -> Self: ...
 
 static_assert(not is_equivalent_to(ReturnsSelf, object))
@@ -4890,7 +4890,7 @@ class Compatible(SupportsMethod[T_co]):
         raise NotImplementedError
 
 class Incompatible(SupportsMethod[T_co]):
-    def method(self: "Incompatible[T]", value: int) -> Result[T]:  # error: [invalid-method-override]
+    def method(self: "Incompatible[T]", value: int) -> Result[T]:  # error: [incompatible-method-override]
         raise NotImplementedError
 ```
 
@@ -5997,7 +5997,7 @@ class NObject:
 
 class NStaticMethodShadowed(NStaticMethodGood):
     def __init__(self) -> None:
-        self.x: int = 1  # error: [invalid-attribute-override]
+        self.x: int = 1  # error: [incompatible-attribute-override]
 
 class PFactory(Protocol):
     @classmethod
@@ -6736,9 +6736,8 @@ class SequenceMaker(Protocol[T]):
 
 static_assert(is_subtype_of(TypeOf[list[int]], SequenceMaker[int]))
 
-# TODO: these should pass
-static_assert(is_subtype_of(TypeOf[tuple[str, ...]], SequenceMaker[str]))  # error: [static-assert-error]
-static_assert(is_subtype_of(TypeOf[tuple[str, ...]], SequenceMaker[int | str]))  # error: [static-assert-error]
+static_assert(is_subtype_of(TypeOf[tuple[str, ...]], SequenceMaker[str]))
+static_assert(not is_subtype_of(TypeOf[tuple[str, ...]], SequenceMaker[int | str]))
 ```
 
 Specializing a type variable to `Any` does not make variadic parameters gradual. The gradual form
@@ -6907,11 +6906,11 @@ class X(Protocol):
     x: int
 
 class YProto(X, Protocol):
-    x: None = None  # error: [invalid-attribute-override]
+    x: None = None  # error: [incompatible-attribute-override]
 
 @final
 class YNominal(X):
-    x: None = None  # error: [invalid-attribute-override]
+    x: None = None  # error: [incompatible-attribute-override]
 
 static_assert(is_subtype_of(YProto, X))
 static_assert(is_subtype_of(YNominal, X))
@@ -8172,15 +8171,15 @@ from ty_extensions import static_assert
 from ty_extensions._internal import is_subtype_of, is_equivalent_to, is_disjoint_from
 
 class HasRepr(Protocol):
-    # error: [invalid-method-override]
+    # error: [incompatible-method-override]
     def __repr__(self) -> object: ...
 
 class HasReprRecursive(Protocol):
-    # error: [invalid-method-override]
+    # error: [incompatible-method-override]
     def __repr__(self) -> "HasReprRecursive": ...
 
 class HasReprRecursiveAndFoo(Protocol):
-    # error: [invalid-method-override]
+    # error: [incompatible-method-override]
     def __repr__(self) -> "HasReprRecursiveAndFoo": ...
     foo: int
 

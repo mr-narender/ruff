@@ -932,6 +932,17 @@ StrictFields(strict_int=1, strict_str="foo")
 StrictFields(strict_int="1", strict_str="foo")  # error: [invalid-argument-type]
 StrictFields(strict_int=1, strict_str=b"foo")  # error: [invalid-argument-type]
 
+type Direct = Annotated[int, Strict()]
+type Indirect = StrictInt
+
+class AliasedStrictFields(BaseModel):
+    direct: Direct
+    indirect: Indirect
+
+AliasedStrictFields(direct=1, indirect=1)  # ok
+AliasedStrictFields(direct="1", indirect=1)  # error: [invalid-argument-type]
+AliasedStrictFields(direct=1, indirect="1")  # error: [invalid-argument-type]
+
 class StrictMetadataOrder(BaseModel):
     field_then_lax: Annotated[int, Field(strict=True), Strict(False)]
     lax_then_field: Annotated[int, Strict(False), Field(strict=True)]
@@ -1941,7 +1952,7 @@ class Parent(BaseModel):
     name: str
 
 class Child(Parent):
-    params: ClassVar[int] = 1  # error: [invalid-attribute-override]
+    params: ClassVar[int] = 1  # error: [incompatible-attribute-override]
 
 reveal_type(Child.__init__)  # revealed: (self: Child, *, name: LaxStr, **extra: Any) -> None
 Child(name="child")  # ok
@@ -1963,7 +1974,7 @@ A `ClassVar` declaration without a value also excludes the inherited field.
 
 ```py
 class AnnotationOnly(Parent):
-    params: ClassVar[int]  # error: [invalid-attribute-override]
+    params: ClassVar[int]  # error: [incompatible-attribute-override]
 
 reveal_type(AnnotationOnly.__init__)  # revealed: (self: AnnotationOnly, *, name: LaxStr, **extra: Any) -> None
 AnnotationOnly(name="child")  # ok
@@ -1981,7 +1992,7 @@ class Parent:
     params: int
 
 class Child(BaseModel, Parent):
-    params: ClassVar[int] = 1  # error: [invalid-attribute-override]
+    params: ClassVar[int] = 1  # error: [incompatible-attribute-override]
 
 reveal_type(Child.__init__)  # revealed: (self: Child, **extra: Any) -> None
 child = Child()  # ok
@@ -1992,7 +2003,7 @@ The overriding `ClassVar` can itself be inherited from an ordinary class.
 
 ```py
 class Mixin(Parent):
-    params: ClassVar[int] = 1  # error: [invalid-attribute-override]
+    params: ClassVar[int] = 1  # error: [incompatible-attribute-override]
 
 class Model(BaseModel, Mixin):
     pass

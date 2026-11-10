@@ -23,7 +23,7 @@ use crate::types::class::{
 };
 use crate::types::function::{FunctionDecorators, FunctionType, KnownFunction, OverloadLiteral};
 use crate::types::infer::UnsupportedComparisonError;
-use crate::types::overrides::MethodKind;
+use crate::types::overrides::{MethodKind, MethodOverrideViolation};
 use crate::types::protocol_class::ProtocolMember;
 use crate::types::special_form::TypeQualifier;
 use crate::types::string_annotation::{
@@ -120,6 +120,11 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&MISMATCHED_SENTINEL_NAME);
     registry.register_lint(&INVALID_METACLASS);
     registry.register_lint(&INVALID_OVERLOAD);
+    registry.register_lint(&SINGLE_OVERLOAD);
+    registry.register_lint(&INCONSISTENT_OVERLOAD_DECORATOR);
+    registry.register_lint(&MISPLACED_OVERLOAD_DECORATOR);
+    registry.register_lint(&MISSING_OVERLOAD_IMPLEMENTATION);
+    registry.register_lint(&INCONSISTENT_OVERLOAD_IMPLEMENTATION);
     registry.register_lint(&USELESS_OVERLOAD_BODY);
     registry.register_lint(&INVALID_PARAMETER_DEFAULT);
     registry.register_lint(&INVALID_PROTOCOL);
@@ -160,6 +165,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&ABSTRACT_AND_FINAL_METHOD);
     registry.register_lint(&ABSTRACT_METHOD_IN_FINAL_CLASS);
     registry.register_lint(&CALL_ABSTRACT_METHOD);
+    registry.register_lint(&ABSTRACT_CLASS_INSTANTIATION);
     registry.register_lint(&TYPE_ASSERTION_FAILURE);
     registry.register_lint(&ASSERT_TYPE_UNSPELLABLE_SUBTYPE);
     registry.register_lint(&TOO_MANY_POSITIONAL_ARGUMENTS);
@@ -190,10 +196,27 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&INVALID_TYPED_DICT_STATEMENT);
     registry.register_lint(&INVALID_TYPED_DICT_FIELD);
     registry.register_lint(&INVALID_TYPED_DICT_HEADER);
-    registry.register_lint(&INVALID_ATTRIBUTE_OVERRIDE);
-    registry.register_lint(&INVALID_PROPERTY_TYPE_OVERRIDE);
-    registry.register_lint(&INVALID_MUTABLE_OVERRIDE);
-    registry.register_lint(&INVALID_METHOD_OVERRIDE);
+    registry.register_lint(&INCOMPATIBLE_ATTRIBUTE_OVERRIDE);
+    registry.register_alias(
+        LintName::of("invalid-attribute-override"),
+        &INCOMPATIBLE_ATTRIBUTE_OVERRIDE,
+    );
+    registry.register_lint(&INCOMPATIBLE_PROPERTY_OVERRIDE);
+    registry.register_alias(
+        LintName::of("invalid-property-type-override"),
+        &INCOMPATIBLE_PROPERTY_OVERRIDE,
+    );
+    registry.register_lint(&INCOMPATIBLE_MUTABLE_OVERRIDE);
+    registry.register_alias(
+        LintName::of("invalid-mutable-override"),
+        &INCOMPATIBLE_MUTABLE_OVERRIDE,
+    );
+    registry.register_lint(&INCOMPATIBLE_METHOD_OVERRIDE);
+    registry.register_alias(
+        LintName::of("invalid-method-override"),
+        &INCOMPATIBLE_METHOD_OVERRIDE,
+    );
+    registry.register_lint(&LOST_KEYWORD_FOR_REGULAR_PARAMETER);
     registry.register_lint(&INVALID_EXPLICIT_OVERRIDE);
     registry.register_lint(&MISSING_OVERRIDE_DECORATOR);
     registry.register_lint(&SUPER_CALL_IN_NAMED_TUPLE_METHOD);
@@ -693,10 +716,10 @@ declare_lint! {
 }
 
 declare_lint! {
-    #[doc = include_str!("../../resources/lint_docs/invalid-overload.md")]
-    pub(crate) static INVALID_OVERLOAD = {
-        summary: "detects invalid `@overload` usages",
-        status: LintStatus::stable("0.0.1-alpha.1"),
+    #[doc = include_str!("../../resources/lint_docs/single-overload.md")]
+    pub(crate) static SINGLE_OVERLOAD = {
+        summary: "detects functions with only one overload declaration",
+        status: LintStatus::stable("0.0.100"),
         default_level: Level::Error,
     }
 }
@@ -1084,6 +1107,15 @@ declare_lint! {
 }
 
 declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/abstract-class-instantiation.md")]
+    pub(crate) static ABSTRACT_CLASS_INSTANTIATION = {
+        summary: "detects direct instantiation of abstract classes and protocols",
+        status: LintStatus::stable("0.0.100"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
     #[doc = include_str!("../../resources/lint_docs/invalid-explicit-override.md")]
     pub(crate) static INVALID_EXPLICIT_OVERRIDE = {
         summary: "detects methods that are decorated with `@override` but do not override any method in a superclass",
@@ -1362,8 +1394,8 @@ declare_lint! {
 }
 
 declare_lint! {
-    #[doc = include_str!("../../resources/lint_docs/invalid-attribute-override.md")]
-    pub(crate) static INVALID_ATTRIBUTE_OVERRIDE = {
+    #[doc = include_str!("../../resources/lint_docs/incompatible-attribute-override.md")]
+    pub(crate) static INCOMPATIBLE_ATTRIBUTE_OVERRIDE = {
         summary: "detects attribute overrides that violate inherited type or access requirements",
         status: LintStatus::stable("0.0.33"),
         default_level: Level::Error,
@@ -1371,8 +1403,8 @@ declare_lint! {
 }
 
 declare_lint! {
-    #[doc = include_str!("../../resources/lint_docs/invalid-property-type-override.md")]
-    pub(crate) static INVALID_PROPERTY_TYPE_OVERRIDE = {
+    #[doc = include_str!("../../resources/lint_docs/incompatible-property-override.md")]
+    pub(crate) static INCOMPATIBLE_PROPERTY_OVERRIDE = {
         summary: "detects incompatible overrides involving properties",
         status: LintStatus::stable("0.0.81"),
         default_level: Level::Error,
@@ -1380,8 +1412,8 @@ declare_lint! {
 }
 
 declare_lint! {
-    #[doc = include_str!("../../resources/lint_docs/invalid-mutable-override.md")]
-    pub(crate) static INVALID_MUTABLE_OVERRIDE = {
+    #[doc = include_str!("../../resources/lint_docs/incompatible-mutable-override.md")]
+    pub(crate) static INCOMPATIBLE_MUTABLE_OVERRIDE = {
         summary: "detects overrides that narrow writable attribute types",
         status: LintStatus::stable("0.0.81"),
         default_level: Level::Error,
@@ -1389,10 +1421,19 @@ declare_lint! {
 }
 
 declare_lint! {
-    #[doc = include_str!("../../resources/lint_docs/invalid-method-override.md")]
-    pub(crate) static INVALID_METHOD_OVERRIDE = {
+    #[doc = include_str!("../../resources/lint_docs/incompatible-method-override.md")]
+    pub(crate) static INCOMPATIBLE_METHOD_OVERRIDE = {
         summary: "detects method definitions that violate the Liskov Substitution Principle",
         status: LintStatus::stable("0.0.1-alpha.20"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/lost-keyword-for-regular-parameter.md")]
+    pub(crate) static LOST_KEYWORD_FOR_REGULAR_PARAMETER = {
+        summary: "detects method overrides that drop a positional parameter's keyword name",
+        status: LintStatus::stable("0.0.100"),
         default_level: Level::Error,
     }
 }
@@ -1492,6 +1533,55 @@ declare_lint! {
     pub(crate) static UNKNOWN_TYPED_DICT_CONSTRUCTOR_KEY = {
         summary: "detects unknown keys when constructing a TypedDict",
         status: LintStatus::stable("0.0.100"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/missing-overload-implementation.md")]
+    pub(crate) static MISSING_OVERLOAD_IMPLEMENTATION = {
+        summary: "detects overloaded functions missing a required implementation",
+        status: LintStatus::stable("0.0.100"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/inconsistent-overload-implementation.md")]
+    pub(crate) static INCONSISTENT_OVERLOAD_IMPLEMENTATION = {
+        summary: "detects implementations that are inconsistent with their overloads",
+        status: LintStatus::stable("0.0.100"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/inconsistent-overload-decorator.md")]
+    pub(crate) static INCONSISTENT_OVERLOAD_DECORATOR = {
+        summary: "detects inconsistent use of `@staticmethod` or `@classmethod` on overloaded methods",
+        status: LintStatus::stable("0.0.100"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/misplaced-overload-decorator.md")]
+    pub(crate) static MISPLACED_OVERLOAD_DECORATOR = {
+        summary: "detects misplaced `@final` or `@override` decorators on overloaded methods",
+        status: LintStatus::stable("0.0.100"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    /// Overload declarations and their implementations now have separate rules.
+    static INVALID_OVERLOAD = {
+        summary: "detects invalid `@overload` usages",
+        status: LintStatus::removed(
+            "0.0.100",
+            "Use `single-overload`, `inconsistent-overload-decorator`, `misplaced-overload-decorator`, \
+             `missing-overload-implementation`, or `inconsistent-overload-implementation`.",
+        ),
         default_level: Level::Error,
     }
 }
@@ -3963,7 +4053,7 @@ pub(crate) fn report_attempted_protocol_instantiation(
     call: &ast::ExprCall,
     protocol: ProtocolClass,
 ) {
-    let Some(builder) = context.report_lint(&CALL_NON_CALLABLE, call) else {
+    let Some(builder) = context.report_lint(&ABSTRACT_CLASS_INSTANTIATION, call) else {
         return;
     };
     let db = context.db();
@@ -4018,7 +4108,7 @@ pub(crate) fn report_attempted_instantiation_of_abstract_class<'db>(
     let Some(first_name) = abstract_methods.first_name() else {
         return;
     };
-    let Some(builder) = context.report_lint(&CALL_NON_CALLABLE, call) else {
+    let Some(builder) = context.report_lint(&ABSTRACT_CLASS_INSTANTIATION, call) else {
         return;
     };
     let class_name = class.name(db);
@@ -5127,8 +5217,9 @@ pub(crate) fn report_shadowed_type_variable<'db>(
 // I tried refactoring this function to placate Clippy,
 // but it did not improve readability! -- AW.
 #[expect(clippy::too_many_arguments)]
-pub(super) fn report_invalid_method_override<'db>(
+pub(super) fn report_incompatible_method_override<'db>(
     context: &InferContext<'db, '_>,
+    violation: MethodOverrideViolation,
     member: &str,
     subclass: ClassType<'db>,
     subclass_definition: Definition<'db>,
@@ -5160,7 +5251,7 @@ pub(super) fn report_invalid_method_override<'db>(
         subclass_definition.full_range(db, context.module()).range()
     };
 
-    let Some(builder) = context.report_lint(&INVALID_METHOD_OVERRIDE, diagnostic_range) else {
+    let Some(builder) = context.report_lint(violation.rule(), diagnostic_range) else {
         return;
     };
 
@@ -5174,8 +5265,14 @@ pub(super) fn report_invalid_method_override<'db>(
         format!("{superclass_name}.{member}")
     };
 
-    let mut diagnostic =
-        builder.into_diagnostic(format_args!("Invalid override of method `{member}`"));
+    let mut diagnostic = match violation {
+        MethodOverrideViolation::General => {
+            builder.into_diagnostic(format_args!("Invalid override of method `{member}`"))
+        }
+        MethodOverrideViolation::DroppedKeywordParameter => builder.into_diagnostic(format_args!(
+            "Override of method `{member}` disallows keyword arguments allowed by the method on the base class"
+        )),
+    };
 
     diagnostic.set_primary_annotation_message(format_args!(
         "Definition is incompatible with `{overridden_method}`"
@@ -5324,6 +5421,7 @@ pub(super) fn report_invalid_method_override<'db>(
 /// Reports an incompatible pair of source-defined methods in a resolved MRO.
 pub(super) fn report_incompatible_base_method<'db>(
     context: &InferContext<'db, '_>,
+    violation: MethodOverrideViolation,
     class: StaticClassLiteral<'db>,
     member: &str,
     selected: (ClassType<'db>, Definition<'db>, MethodDecorator),
@@ -5331,8 +5429,7 @@ pub(super) fn report_incompatible_base_method<'db>(
     error_context: impl FnOnce() -> ErrorContextTree<'db>,
 ) {
     let db = context.db();
-    let Some(builder) = context.report_lint(&INVALID_METHOD_OVERRIDE, class.header_range(db))
-    else {
+    let Some(builder) = context.report_lint(violation.rule(), class.header_range(db)) else {
         return;
     };
 
@@ -5350,9 +5447,14 @@ pub(super) fn report_incompatible_base_method<'db>(
         .class_literal(db)
         .display_with(db, settings.clone());
     let contract_name = contract_owner.class_literal(db).display_with(db, settings);
-    let mut diagnostic = builder.into_diagnostic(format_args!(
-        "Base classes for class `{class_name}` define method `{member}` incompatibly",
-    ));
+    let mut diagnostic = match violation {
+        MethodOverrideViolation::General => builder.into_diagnostic(format_args!(
+            "Base classes for class `{class_name}` define method `{member}` incompatibly",
+        )),
+        MethodOverrideViolation::DroppedKeywordParameter => builder.into_diagnostic(format_args!(
+            "Base classes for class `{class_name}` disagree on keywords for method `{member}`",
+        )),
+    };
     diagnostic.set_primary_annotation_message(format_args!(
         "`{selected_name}.{member}` is incompatible with `{contract_name}.{member}`"
     ));

@@ -1,6 +1,7 @@
 //! Tests the interaction of the `lint` configuration section
 
 use std::fs;
+use std::io;
 use std::process::Command;
 use std::str;
 
@@ -19,6 +20,27 @@ impl CliTest {
         command.args(STDIN_BASE_OPTIONS);
         command
     }
+}
+
+#[test]
+fn verbose_logging_with_closed_stderr() -> Result<()> {
+    let case = CliTest::with_file("test.py", "import os\n")?;
+    let (reader, writer) = io::pipe()?;
+    drop(reader);
+
+    assert_cmd_snapshot!(case.check_command()
+        .args(["--isolated", "--verbose", "test.py"])
+        .stderr(writer), @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    test.py:1:8: F401 [*] `os` imported but unused
+    Found 1 error.
+    [*] 1 fixable with `--fix`.
+
+    ----- stderr -----
+    ");
+    Ok(())
 }
 
 #[test]
@@ -5460,6 +5482,32 @@ fn ruff_toml_is_linted() -> Result<()> {
 
     ----- stderr -----
     "#,
+    );
+
+    Ok(())
+}
+
+#[test]
+fn fix_redirected_selectors_with_rule_names() -> Result<()> {
+    let test = CliTest::with_file("ruff.toml", "lint.select = ['TCH002', 'TCH']\n")?;
+
+    assert_cmd_snapshot!(
+        test.check_command()
+            .args(["--preview", "--extend-select", "RUF201,RUF202", "--diff", "ruff.toml"]),
+        @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    --- ruff.toml
+    +++ ruff.toml
+    @@ -1 +1 @@
+    -lint.select = ['TCH002', 'TCH']
+    +lint.select = ['typing-only-third-party-import', 'TC']
+
+    Would fix 3 errors.
+
+    ----- stderr -----
+    "
     );
 
     Ok(())
