@@ -102,7 +102,7 @@ from typing_extensions import deprecated
 
 class C:
     @deprecated  # error: [invalid-argument-type] "LiteralString"
-    def __new__() -> T:  # error: [empty-body] "TypeVar"
+    def __new__() -> T:  # error: [invalid-implicit-return-in-function-with-stub-body] "TypeVar"
         pass
 
 C()
@@ -702,11 +702,11 @@ def _(flag: bool) -> None:
     class Foo:
         __new__ = Callable()
 
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo(1))  # revealed: Foo
     # TODO should be - error: [missing-argument] "No argument provided for required parameter `x` of bound method `__call__`"
     # but we currently infer the signature of `__call__` as unknown, so it accepts any arguments
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo())  # revealed: Foo
 ```
 
@@ -2225,11 +2225,11 @@ def _(flag: bool) -> None:
     class Foo:
         __init__ = Callable()
 
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo(1))  # revealed: Foo
     # TODO should be - error: [missing-argument] "No argument provided for required parameter `x` of bound method `__call__`"
     # but we currently infer the signature of `__call__` as unknown, so it accepts any arguments
-    # error: [call-non-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
+    # error: [not-callable] "Object of type `Callable` is not callable (possibly missing `__call__` method)"
     reveal_type(Foo())  # revealed: Foo
 ```
 
