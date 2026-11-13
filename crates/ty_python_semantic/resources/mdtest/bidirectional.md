@@ -851,6 +851,49 @@ unannotated(reveal_type(identity(1)))  # revealed: Literal[1]
 annotated(reveal_type(identity(1)))  # revealed: Unknown
 ```
 
+A generic call in a bare `Final` initializer infers its return type from its argument.
+
+```py
+from typing import Final
+
+ONE: Final = reveal_type(identity(1))  # revealed: Literal[1]
+```
+
+A call through an unannotated parameter supplies no expected type for its arguments. A callable with
+a parameter annotated as `Any` supplies `Any` as context.
+
+```py
+from collections.abc import Callable
+from typing import Any
+
+def call(sink, typed_sink: Callable[[Any], None]):
+    sink(reveal_type(identity(1)))  # revealed: Literal[1]
+    typed_sink(reveal_type(identity(1)))  # revealed: Any
+```
+
+A generator without a return annotation leaves the operands of `yield` and `yield from` to
+inference. An explicit return annotation supplies its declared element type, including `Any` or
+`Unknown`.
+
+```py
+from collections.abc import Iterator
+
+def singleton[T](x: T) -> list[T]:
+    return [x]
+
+def values():
+    yield reveal_type(identity(1))  # revealed: Literal[1]
+    yield from reveal_type(singleton(1))  # revealed: list[int]
+
+def annotated_values() -> Iterator[Any]:
+    yield reveal_type(identity(1))  # revealed: Any
+    yield from reveal_type(singleton(1))  # revealed: list[Any]
+
+def unknown_values() -> Iterator[Unknown]:
+    yield reveal_type(identity(1))  # revealed: Unknown
+    yield from reveal_type(singleton(1))  # revealed: list[Unknown]
+```
+
 ## Upper-bound type context
 
 The declared upper bound of a type variable provides type context for a nested generic call:
@@ -1094,6 +1137,24 @@ from typing import Any
 # string keys for keyword arguments. We special-case it to match the literal form.
 x1: dict[Hashable, Callable[..., object]] = {"x": lambda: 1}
 x2: dict[Hashable, Callable[..., object]] = dict(x=lambda: 1)
+```
+
+## Preserving literal element types in a generic call
+
+`max(..., key=len)` returns one of its input tuples. When the result is annotated as `Colors`, ty
+preserves the literal element types while inferring the list passed to `max`.
+
+```py
+from typing import Literal
+
+Colors = tuple[Literal["red", "blue"], ...]
+left = ("red",)
+right = ("blue", "red")
+
+named: Colors = max([left, right], key=len)  # ok
+extended: Colors = max([(*left, "blue"), (*right, "red")], key=len)  # ok
+# error: [invalid-assignment]
+invalid: Colors = max([(*left, "blue"), (*right, "green")], key=len)
 ```
 
 ## Covariant constructors with outer return contexts
@@ -1877,6 +1938,60 @@ class MultiPath[T]:
 # fmt: off
 x10: Callable[[list[int]], MultiPath[int] | MultiPath[list[int]]] = reveal_type(MultiPath)  # revealed: <class 'MultiPath'>
 # fmt: on
+```
+
+## Type context and explicitly annotated `self`
+
+When `self` is explicitly annotated with a concrete specialization, ty uses it when inferring the
+type of unspecialized constructor calls:
+
+```py
+class Reader[T]:
+    def __init__(self: "Reader[int]") -> None: ...
+    def read(self) -> T:
+        raise NotImplementedError
+
+reveal_type(Reader())  # revealed: Reader[int]
+```
+
+When trying to specialize explicitly, the call will fail:
+
+```py
+Reader[str]()  # error: [invalid-argument-type]
+```
+
+`Reader[int]` is also inferred if it is assignable to the assignment context (`Reader` is covariant
+in `T`):
+
+```py
+# revealed: Reader[int]
+reader: Reader[int] = reveal_type(Reader())
+
+# revealed: Reader[int]
+reader: Reader[int | str] = reveal_type(Reader())
+```
+
+The assignment context can also narrow the inferred type argument from `int` to `bool`. Since
+`Reader` is covariant, `Reader[bool]` is a valid argument for `self: Reader[int]`.
+
+```py
+# TODO: this should not be an error, and Reader[bool] should be inferred (see https://github.com/astral-sh/ty/issues/4993)
+# revealed: Reader[int]
+narrow_reader: Reader[bool] = reveal_type(Reader())  # error: [invalid-assignment]
+```
+
+The same is also true if the receiver is annotated with a union:
+
+```py
+class ReaderUnion[T]:
+    def __init__(self: "ReaderUnion[int | str]") -> None: ...
+
+# revealed: ReaderUnion[int | str]
+reader: ReaderUnion[int | str] = reveal_type(ReaderUnion())
+# revealed: ReaderUnion[int | str]
+reader: ReaderUnion[int | str | None] = reveal_type(ReaderUnion())
+# revealed: ReaderUnion[int]
+narrow_union: ReaderUnion[int] = reveal_type(ReaderUnion())
 ```
 
 ## Generic class specialization through recursive callable aliases
