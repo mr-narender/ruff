@@ -1756,7 +1756,7 @@ from enum import Enum, auto
 from ty_extensions._internal import enum_members
 from typing import Any, Literal, cast
 
-def external_generate_next_value(*args: Any) -> Any: ...
+def external_generate_next_value(*args: Any, **kwargs: Any) -> Any: ...
 
 class ReassignedGenerator(Enum):
     @staticmethod
@@ -2163,6 +2163,21 @@ for color in Color:
 reveal_type(list(Color))  # revealed: list[Color]
 ```
 
+## Combining flag members
+
+Flag operators accept other members of the same enum. A member's literal type does not restrict the
+other operand to that same member.
+
+```py
+from enum import Flag
+
+class Flags(Flag):
+    A = 1
+    B = 2
+
+Flags.A | Flags.B  # ok
+```
+
 ## Methods / non-member attributes
 
 Methods and non-member attributes defined in the enum class can be accessed on enum members:
@@ -2227,12 +2242,13 @@ def _(answer: type[Answer]) -> None:
     reveal_type(answer.NO)  # revealed: Literal[Answer.NO]
 ```
 
-## Reassigning enum members
+## Reassigning and deleting enum members
 
 ### Class attributes
 
-Enum members cannot be reassigned on the class, even to their original value or to the member
-itself. This also applies to aliases, including aliases declared with the same value.
+Enum members cannot be deleted or reassigned on the class, even if the assignment uses the original
+value or the member itself. This also applies to aliases, including aliases declared with the same
+value.
 
 ```py
 from enum import Enum
@@ -2248,6 +2264,7 @@ Answer.NO = 0  # error: [invalid-assignment]
 Answer.NO = Answer.NO  # error: [invalid-assignment]
 Answer.ALIAS = 0  # error: [invalid-assignment]
 Answer.SAME_VALUE = 0  # error: [invalid-assignment]
+del Answer.NO  # error: [invalid-assignment] "Cannot delete read-only attribute `NO`"
 ```
 
 The assigned expression is still checked when the target is read-only:
@@ -2427,7 +2444,7 @@ bound. Their `Self` type preserves the particular member at call sites.
 python-version = "3.11"
 
 [rules]
-unsound-return-statement = "error"
+unsound-return = "error"
 ```
 
 ```py
@@ -2466,7 +2483,7 @@ An ordinary type variable bounded by an enum has the same special attributes as 
 
 ```toml
 [rules]
-unsound-return-statement = "error"
+unsound-return = "error"
 ```
 
 ```py
@@ -2494,7 +2511,7 @@ from every possible enum.
 
 ```toml
 [rules]
-unsound-return-statement = "error"
+unsound-return = "error"
 ```
 
 ```py
@@ -2656,9 +2673,9 @@ reveal_type(EnumWithSubclassOfEnumMetaMetaclass.NO)  # revealed: Literal[EnumWit
 
 # Attributes `.value` and `.name` can *not* be accessed on members of these enums:
 
-# error: [unresolved-attribute]
+# error: [missing-attribute]
 EnumWithSubclassOfEnumMetaMetaclass.NO.value
-# error: [unresolved-attribute]
+# error: [missing-attribute]
 EnumWithSubclassOfEnumMetaMetaclass.NO.name
 
 # But the internal underscore attributes are available:
@@ -2667,9 +2684,9 @@ reveal_type(EnumWithSubclassOfEnumMetaMetaclass.NO._value_)  # revealed: Any
 reveal_type(EnumWithSubclassOfEnumMetaMetaclass.NO._name_)  # revealed: Literal["NO"]
 
 def _(x: EnumWithSubclassOfEnumMetaMetaclass):
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     x.value
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     x.name
     reveal_type(x._value_)  # revealed: Any
     reveal_type(x._name_)  # revealed: Literal["NO", "YES"]
@@ -2730,9 +2747,9 @@ reveal_type(EnumWithSubclassOfEnumMetaMetaclass.NO)  # revealed: Literal[EnumWit
 
 # Attributes `.value` and `.name` can *not* be accessed on members of these enums:
 
-# error: [unresolved-attribute]
+# error: [missing-attribute]
 EnumWithSubclassOfEnumMetaMetaclass.NO.value
-# error: [unresolved-attribute]
+# error: [missing-attribute]
 EnumWithSubclassOfEnumMetaMetaclass.NO.name
 
 # But the internal underscore attributes are available:
@@ -2741,9 +2758,9 @@ reveal_type(EnumWithSubclassOfEnumMetaMetaclass.NO._value_)  # revealed: Any
 reveal_type(EnumWithSubclassOfEnumMetaMetaclass.NO._name_)  # revealed: Literal["NO"]
 
 def _(x: EnumWithSubclassOfEnumMetaMetaclass):
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     x.value
-    # error: [unresolved-attribute]
+    # error: [missing-attribute]
     x.name
     reveal_type(x._value_)  # revealed: Any
     reveal_type(x._name_)  # revealed: Literal["NO", "YES"]
@@ -3554,7 +3571,7 @@ def color_name(color: Color) -> str:
     else:
         assert_never(color)
 
-# No `invalid-return-type` error here because the implicit `else` branch is detected as unreachable:
+# The implicit `else` branch is unreachable, so ty accepts this function's return type.
 def color_name_without_assertion(color: Color) -> str:
     if color is Color.RED:
         return "Red"

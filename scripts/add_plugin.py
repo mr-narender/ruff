@@ -4,12 +4,15 @@
 # requires-python = ">=3.12"
 # dependencies = []
 #
+# [tool.ty.analysis]
+# return-type-inference = "always"
+#
 # [tool.ty.rules]
 # truthiness-test-of-none-union = "warn"
 # blanket-ignore-comment = "warn"
 # missing-type-argument = "warn"
 # possibly-unresolved-reference = "warn"
-# unsound-return-statement = "warn"
+# unsound-return = "warn"
 # unsound-yield = "warn"
 # unsupported-dynamic-base = "warn"
 # division-by-zero = "warn"
@@ -22,6 +25,8 @@
 # [tool.uv]
 # no-build = true
 # exclude-newer = "P7D"
+# require-build-hashes = true
+# preview-features = ["build-dependency-hashes", "missing-exclude-newer-package-lock"]
 # ///
 
 """Generate boilerplate for a new Flake8 plugin.
@@ -53,7 +58,7 @@ def pascal_case(linter_name: str) -> str:
 
 
 def get_indent(line: str) -> str:
-    return re.match(r"^\s*", line).group()  # type: ignore[union-attr, ty:unresolved-attribute]
+    return re.match(r"^\s*", line).group()  # type: ignore[union-attr, ty:missing-union-attribute]
 
 
 def main(*, plugin: str, url: str, prefix_code: str) -> None:

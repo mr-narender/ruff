@@ -5,13 +5,14 @@
 use crate::lint::{LintRegistry, LintRegistryBuilder};
 use crate::suppression::{
     BLANKET_IGNORE_COMMENT, IGNORE_COMMENT_UNKNOWN_RULE, INVALID_IGNORE_COMMENT,
-    UNUSED_TYPE_IGNORE_COMMENT,
+    RENAMED_RULE_IN_IGNORE_COMMENT, UNUSED_TYPE_IGNORE_COMMENT,
 };
 use crate::types::check_types;
 pub use db::Db;
 pub(crate) use diagnostic::add_inferred_python_version_hint_to_diagnostic;
 pub use diagnostic::inferred_python_version_source_annotation;
 pub use fixes::{fix_all_diagnostics, suppress_all_diagnostics};
+pub use place::definitions::DefinitionResolution;
 use ruff_db::PythonFile;
 use ruff_db::diagnostic::{Annotation, Diagnostic, DiagnosticId, Severity, Span};
 use ruff_db::files::File;
@@ -38,6 +39,7 @@ use ty_python_core::{
 pub use ty_site_packages::{
     PythonEnvironment, PythonVersionFileSource, PythonVersionSource, PythonVersionWithSource,
     SitePackagesDiscoveryError, SitePackagesPaths, SysPrefixPathOrigin,
+    VirtualEnvironmentCandidates,
 };
 pub use types::ide_support::{
     ImplementationsFinder, ImportAliasResolution, ResolvedDefinition, TypeHierarchyClass,
@@ -48,7 +50,7 @@ pub use types::ide_support::{
 pub use types::{
     DisplaySettings, FixtureBinding, FixtureExposure, FixtureNameSource, ProgramEnvironment,
     PytestTest, TypeQualifiers, fixture_bindings_for_parameter, fixture_exposures_for_definition,
-    pytest_global_plugin_files, pytest_tests_in_file,
+    pytest_global_plugin_files, pytest_registered_plugin_files, pytest_tests_in_file,
 };
 
 mod db;
@@ -87,17 +89,21 @@ pub fn default_lint_registry() -> &'static LintRegistry {
 }
 
 /// Register all known semantic lints.
-fn register_lints(registry: &mut LintRegistryBuilder) {
+pub fn register_lints(registry: &mut LintRegistryBuilder) {
     types::register_lints(registry);
     registry.register_lint(&UNUSED_IGNORE_COMMENT);
     registry.register_lint(&UNUSED_TYPE_IGNORE_COMMENT);
     registry.register_lint(&IGNORE_COMMENT_UNKNOWN_RULE);
+    registry.register_lint(&RENAMED_RULE_IN_IGNORE_COMMENT);
     registry.register_lint(&INVALID_IGNORE_COMMENT);
     registry.register_lint(&BLANKET_IGNORE_COMMENT);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, get_size2::GetSize)]
 pub struct AnalysisSettings {
+    /// Whether to infer return types for functions without return annotations.
+    pub return_type_inference: ReturnTypeInference,
+
     /// Whether narrowing with generic classes uses the top materialization.
     pub strict_generic_narrowing: bool,
 
@@ -121,6 +127,7 @@ pub struct AnalysisSettings {
 impl Default for AnalysisSettings {
     fn default() -> Self {
         Self {
+            return_type_inference: ReturnTypeInference::default(),
             strict_generic_narrowing: false,
             strict_equality_semantics: false,
             respect_type_ignore_comments: true,
@@ -128,6 +135,30 @@ impl Default for AnalysisSettings {
             replace_imports_with_any: ModuleGlobSet::empty(),
         }
     }
+}
+
+/// Controls return type inference for functions without explicit return annotations.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum ReturnTypeInference {
+    /// Do not infer return types from function bodies. Unannotated functions
+    /// will have an inferred return type of `Unknown`.
+    #[default]
+    Never,
+    /// Infer return types for unannotated functions and methods.
+    Always,
+}
+
+impl ReturnTypeInference {
+    const fn is_active(self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
+impl ty_combine::Combine for ReturnTypeInference {
+    fn combine_with(&mut self, _other: Self) {}
 }
 
 /// Returns all attribute assignments (and their method scope IDs) with a symbol name matching
@@ -239,7 +270,11 @@ pub fn check_file(db: &dyn Db, file: ProgramFile<'_>) -> Result<Box<[Diagnostic]
 
     diagnostics.extend(check_types(db, file));
 
-    diagnostics.sort_unstable_by(|a, b| a.rendering_sort_key(db).cmp(&b.rendering_sort_key(db)));
+    let resolver: &dyn ruff_db::Db = db;
+    diagnostics.sort_unstable_by(|a, b| {
+        a.rendering_sort_key(&resolver)
+            .cmp(&b.rendering_sort_key(&resolver))
+    });
 
     Ok(diagnostics.into_boxed_slice())
 }
