@@ -14,7 +14,7 @@ use crate::types::diagnostic::{
 };
 use crate::types::special_form::TypeQualifier;
 use crate::types::typed_dict::{
-    TypedDictOpenness, TypedDictSchema, collect_guaranteed_keyword_keys,
+    TypedDictOpenness, TypedDictSchema, UnpackedTypedDictCache, collect_guaranteed_keyword_keys,
     functional_typed_dict_field, infer_unpacked_keyword_types, typed_dict_with_relaxed_keys,
     validate_typed_dict_constructor, validate_typed_dict_dict_literal,
 };
@@ -331,9 +331,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         typed_dict: TypedDictType<'db>,
         tcx: TypeContext<'db>,
         item_types: &mut FxHashMap<NodeIndex, Type<'db>>,
+        unpacked_cache: &mut UnpackedTypedDictCache<'db>,
     ) -> Option<Type<'db>> {
         self.infer_typed_dict_items(dict, typed_dict, tcx, item_types);
-        self.validate_typed_dict_items(dict, typed_dict, item_types)
+        self.validate_typed_dict_items(dict, typed_dict, item_types, unpacked_cache)
     }
 
     pub(super) fn infer_typed_dict_items(
@@ -386,13 +387,21 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         dict: &ast::ExprDict,
         typed_dict: TypedDictType<'db>,
         item_types: &FxHashMap<NodeIndex, Type<'db>>,
+        unpacked_cache: &mut UnpackedTypedDictCache<'db>,
     ) -> Option<Type<'db>> {
-        validate_typed_dict_dict_literal(&self.context, typed_dict, dict, dict.into(), |expr, _| {
-            item_types
-                .get(&expr.node_index().load())
-                .copied()
-                .unwrap_or_else(Type::unknown)
-        })
+        validate_typed_dict_dict_literal(
+            &self.context,
+            typed_dict,
+            dict,
+            dict.into(),
+            unpacked_cache,
+            |expr, _| {
+                item_types
+                    .get(&expr.node_index().load())
+                    .copied()
+                    .unwrap_or_else(Type::unknown)
+            },
+        )
         .ok()
         .map(|_| Type::TypedDict(typed_dict))
     }
