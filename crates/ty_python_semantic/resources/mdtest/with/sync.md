@@ -196,7 +196,7 @@ continue without returning a value:
 def may_raise() -> int:
     raise ValueError
 
-# error: [invalid-return-type] "Function can implicitly return `None`, which is not assignable to return type `int`"
+# error: [invalid-implicit-return] "Function can implicitly return `None`, which is not assignable to return type `int`"
 def interrupted_return() -> int:
     with suppress(ValueError):
         return may_raise()
@@ -262,7 +262,7 @@ from contextlib import suppress
 def may_raise() -> int:
     raise ValueError
 
-# error: [invalid-return-type] "Function can implicitly return `None`, which is not assignable to return type `int`"
+# error: [invalid-implicit-return] "Function can implicitly return `None`, which is not assignable to return type `int`"
 def eager_comprehension() -> int:
     with suppress(ValueError):
         [may_raise() for _ in [0]]
@@ -272,7 +272,7 @@ def eager_comprehension() -> int:
 Generator expressions are also assumed to run eagerly, so their exceptions can be suppressed:
 
 ```py
-# error: [invalid-return-type] "Function can implicitly return `None`, which is not assignable to return type `int`"
+# error: [invalid-implicit-return] "Function can implicitly return `None`, which is not assignable to return type `int`"
 def eager_generator() -> int:
     with suppress(ValueError):
         (may_raise() for _ in [0])
@@ -609,6 +609,28 @@ class Manager2:
 def _(context_expr: Manager1 | Manager2):
     with context_expr as f:
         reveal_type(f)  # revealed: str | int
+```
+
+## Context managers returning narrowed `Self`
+
+A context manager whose `__enter__` returns `Self` preserves narrowing of the context expression in
+the bound value.
+
+```py
+from typing_extensions import Self
+
+class Manager:
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None: ...
+
+class Excluded: ...
+
+def use(manager: Manager):
+    if not isinstance(manager, Excluded):
+        with manager as value:
+            reveal_type(value)  # revealed: Manager & ~Excluded
 ```
 
 ## Type aliases preserve context manager behavior

@@ -17,7 +17,7 @@ def _(flag: bool):
 ## Calling with an unknown union
 
 ```py
-from nonexistent import f  # error: [unresolved-import] "Cannot resolve imported module `nonexistent`"
+from nonexistent import f  # error: [import-not-found] "Cannot resolve imported module `nonexistent`"
 
 def coinflip() -> bool:
     return True
@@ -40,7 +40,7 @@ def _(flag: bool):
     else:
         def f() -> int:
             return 1
-    x = f()  # error: [call-non-callable] "Object of type `Literal[1]` is not callable"
+    x = f()  # error: [not-callable] "Object of type `Literal[1]` is not callable"
     reveal_type(x)  # revealed: Unknown | int
 ```
 
@@ -57,8 +57,8 @@ def _(flag: bool, flag2: bool):
     else:
         def f() -> int:
             return 1
-    # error: [call-non-callable] "Object of type `Literal[1]` is not callable"
-    # error: [call-non-callable] "Object of type `Literal["foo"]` is not callable"
+    # error: [not-callable] "Object of type `Literal[1]` is not callable"
+    # error: [not-callable] "Object of type `Literal["foo"]` is not callable"
     # revealed: Unknown | int
     reveal_type(f())
 ```
@@ -74,7 +74,7 @@ def _(flag: bool):
     else:
         f = "foo"
 
-    x = f()  # error: [call-non-callable] "Object of type `Literal[1, "foo"]` is not callable"
+    x = f()  # error: [not-callable] "Object of type `Literal[1, "foo"]` is not callable"
     reveal_type(x)  # revealed: Unknown
 ```
 
@@ -153,10 +153,7 @@ def construct(use_fancy: bool):
     factory = FancyDict if use_fancy else dict
     result = factory({"answer": 42})
 
-    # TODO(#27337): `T@FancyDict` should not escape the `FancyDict` constructor arm.
-    # TODO: revealed: FancyDict[int] | dict[str, int]
-    # revealed: FancyDict[int] | dict[str, T@FancyDict | int]
-    reveal_type(result)
+    reveal_type(result)  # revealed: dict[str, int]
 ```
 
 ## Constructor checking through `type[]` in a union
@@ -205,23 +202,27 @@ def _(factory: type[IntDiag] | type[StrDiag]):
 ## Any non-callable variant
 
 ```py
-def f1(a: int): ...
+from typing import Any
+
+def f1(a: int) -> Any: ...
 def _(flag: bool):
     if flag:
         f = f1
     else:
         f = "This is a string literal"
 
-    # error: [call-non-callable] "Object of type `Literal["This is a string literal"]` is not callable"
+    # error: [not-callable] "Object of type `Literal["This is a string literal"]` is not callable"
     x = f(3)
-    reveal_type(x)  # revealed: Unknown
+    reveal_type(x)  # revealed: Any
 ```
 
 ## Union of binding errors
 
 ```py
-def f1(): ...
-def f2(): ...
+from typing import Any
+
+def f1() -> Any: ...
+def f2() -> Any: ...
 def _(flag: bool):
     if flag:
         f = f1
@@ -231,15 +232,17 @@ def _(flag: bool):
     # error: [too-many-positional-arguments] "Too many positional arguments to function `f1`: expected 0, got 1"
     # error: [too-many-positional-arguments] "Too many positional arguments to function `f2`: expected 0, got 1"
     x = f(3)
-    reveal_type(x)  # revealed: Unknown
+    reveal_type(x)  # revealed: Any
 ```
 
 ## One not-callable, one wrong argument
 
 ```py
+from typing import Any
+
 class C: ...
 
-def f1(): ...
+def f1() -> Any: ...
 def _(flag: bool):
     if flag:
         f = f1
@@ -247,9 +250,9 @@ def _(flag: bool):
         f = C()
 
     # error: [too-many-positional-arguments] "Too many positional arguments to function `f1`: expected 0, got 1"
-    # error: [call-non-callable] "Object of type `C` is not callable"
+    # error: [not-callable] "Object of type `C` is not callable"
     x = f(3)
-    reveal_type(x)  # revealed: Unknown
+    reveal_type(x)  # revealed: Any
 ```
 
 ## Union including a special-cased function

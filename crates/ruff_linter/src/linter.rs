@@ -26,15 +26,14 @@ use crate::doc_lines::{doc_lines_from_ast, doc_lines_from_tokens};
 use crate::fix::{FixResult, fix_file};
 use crate::noqa::add_suppression;
 use crate::package::PackageRoot;
-use crate::preview::is_py315_support_enabled;
-use crate::registry::Rule;
+use crate::registry::{LintSource, Rule};
 #[cfg(any(feature = "test-rules", test))]
 use crate::rules::ruff::rules::test_rules::{self, TEST_RULES, TestRule};
 use crate::settings::types::UnsafeFixes;
 use crate::settings::{LinterSettings, TargetVersion, flags};
 use crate::source_kind::SourceKind;
 use crate::suppression::Suppressions;
-use crate::{Locator, SuppressionKind, directives, fs, warn_user_once};
+use crate::{Locator, SuppressionKind, directives, fs};
 
 pub(crate) mod float;
 
@@ -152,10 +151,7 @@ pub fn check_path(
     }
 
     // Run the token-based rules.
-    if context
-        .iter_enabled_rules()
-        .any(|rule_code| rule_code.lint_source().is_tokens())
-    {
+    if context.has_rules_for(LintSource::Tokens) {
         check_tokens(
             tokens,
             path,
@@ -169,10 +165,7 @@ pub fn check_path(
     }
 
     // Run the filesystem-based rules.
-    if context
-        .iter_enabled_rules()
-        .any(|rule_code| rule_code.lint_source().is_filesystem())
-    {
+    if context.has_rules_for(LintSource::Filesystem) {
         check_file_path(
             path,
             package,
@@ -185,10 +178,7 @@ pub fn check_path(
     }
 
     // Run the logical line-based rules.
-    if context
-        .iter_enabled_rules()
-        .any(|rule_code| rule_code.lint_source().is_logical_lines())
-    {
+    if context.has_rules_for(LintSource::LogicalLines) {
         crate::checkers::logical_lines::check_logical_lines(
             tokens, locator, indexer, stylist, settings, &context,
         );
@@ -216,10 +206,7 @@ pub fn check_path(
             &context,
         ));
 
-        let use_imports = !directives.isort.skip_file
-            && context
-                .iter_enabled_rules()
-                .any(|rule_code| rule_code.lint_source().is_imports());
+        let use_imports = !directives.isort.skip_file && context.has_rules_for(LintSource::Imports);
         if use_imports || use_doc_lines {
             if use_imports {
                 check_imports(
@@ -249,10 +236,7 @@ pub fn check_path(
     }
 
     // Run the lines-based rules.
-    if context
-        .iter_enabled_rules()
-        .any(|rule_code| rule_code.lint_source().is_physical_lines())
-    {
+    if context.has_rules_for(LintSource::PhysicalLines) {
         check_physical_lines(locator, stylist, indexer, &doc_lines, settings, &context);
     }
 
@@ -331,11 +315,7 @@ pub fn check_path(
     }
 
     // Enforce `noqa` directives.
-    if noqa.is_enabled()
-        || context
-            .iter_enabled_rules()
-            .any(|rule_code| rule_code.lint_source().is_noqa())
-    {
+    if noqa.is_enabled() || context.has_rules_for(LintSource::Noqa) {
         let ignored = check_noqa(
             &mut context,
             path,
@@ -455,14 +435,6 @@ pub fn lint_only(
 ) -> LinterResult {
     let target_version = settings.resolve_target_version(path);
 
-    if matches!(target_version.linter_version(), PythonVersion::PY315)
-        && !is_py315_support_enabled(settings)
-    {
-        warn_user_once!(
-            "Support for Python 3.15 is under development and may be unstable. Enable `preview` to remove this warning."
-        );
-    }
-
     let parsed = source.into_parsed(source_kind, source_type, target_version.parser_version());
 
     // Map row and column locations to byte slices (lazily).
@@ -568,14 +540,6 @@ pub fn lint_fix<'a>(
     let mut has_no_syntax_errors = false;
 
     let target_version = settings.resolve_target_version(path);
-
-    if matches!(target_version.linter_version(), PythonVersion::PY315)
-        && !is_py315_support_enabled(settings)
-    {
-        warn_user_once!(
-            "Support for Python 3.15 is under development and may be unstable. Enable `preview` to remove this warning."
-        );
-    }
 
     // Continuously fix until the source code stabilizes.
     loop {
@@ -818,7 +782,7 @@ mod tests {
     use ruff_python_trivia::textwrap::dedent;
     use test_case::test_case;
 
-    use ruff_db::diagnostic::Diagnostic;
+    use ruff_db::diagnostic::{Diagnostic, DummyFileResolver};
     use ruff_notebook::{Notebook, NotebookError};
 
     use crate::linter::{check_path, parse_unchecked_source};
@@ -1016,7 +980,10 @@ mod tests {
             target_version,
             &suppressions,
         );
-        diagnostics.sort_by(Diagnostic::ruff_start_ordering);
+        diagnostics.sort_by(|a, b| {
+            a.rendering_sort_key(&DummyFileResolver)
+                .cmp(&b.rendering_sort_key(&DummyFileResolver))
+        });
         diagnostics
     }
 

@@ -3,7 +3,9 @@ use crate::place::{
     ConsideredDefinitions, DefinedPlace, Place, PlaceAndQualifiers, RequiresExplicitReExport,
     TypeOrigin, place_by_id, place_from_bindings, place_from_declarations,
 };
-use crate::types::{ProgramEnvironment, Type, class::MroLookup, infer::nearest_enclosing_class};
+use crate::types::{
+    ProgramEnvironment, StaticClassLiteral, Type, class::MroLookup, infer::nearest_enclosing_class,
+};
 use ty_python_core::{
     place_table, scope::ScopeId, semantic_index, symbol::ScopedSymbolId, use_def_map,
 };
@@ -53,11 +55,28 @@ impl<'db> Member<'db> {
     }
 }
 
+/// A class-body annotation together with the class that declares it.
+///
+/// The declaring class is retained even when several declarations contribute to the member's
+/// type, or an unannotated default inherits the annotation through an intermediate base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
+pub(super) struct ClassBodyDeclaration<'db> {
+    pub(super) member: PlaceAndQualifiers<'db>,
+    pub(super) class: StaticClassLiteral<'db>,
+}
+
 /// Infer the public type of a class member/symbol (its type as seen from outside its scope) in the given
 /// `scope`.
 pub(super) fn class_member<'db>(db: &'db dyn Db, scope: ScopeId<'db>, name: &str) -> Member<'db> {
-    place_table(db, scope)
-        .symbol_id(name)
+    class_member_with_symbol(db, scope, place_table(db, scope).symbol_id(name))
+}
+
+pub(super) fn class_member_with_symbol<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    symbol: Option<ScopedSymbolId>,
+) -> Member<'db> {
+    symbol
         .map(|symbol_id| {
             let mut place_and_quals = place_by_id(
                 db,
@@ -70,17 +89,18 @@ pub(super) fn class_member<'db>(db: &'db dyn Db, scope: ScopeId<'db>, name: &str
             if let Place::Defined(ref mut place) = place_and_quals.place
                 && place.origin == TypeOrigin::Inferred
                 && let Some(inherited) = inherited_class_body_declaration(db, scope, symbol_id)
-                && let Place::Defined(declared) = inherited.place
             {
-                // The annotation determines the public type, but the value is still supplied
-                // by this class. Consumers such as Pydantic inspect that value's definition.
-                *place = DefinedPlace {
-                    ty: declared.ty,
-                    origin: declared.origin,
-                    public_type_policy: declared.public_type_policy,
-                    ..*place
-                };
-                place_and_quals.qualifiers = inherited.qualifiers;
+                if let Place::Defined(declared) = inherited.member.place {
+                    // The annotation determines the public type, but the value is still supplied
+                    // by this class. Consumers such as Pydantic inspect that value's definition.
+                    *place = DefinedPlace {
+                        ty: declared.ty,
+                        origin: declared.origin,
+                        public_type_policy: declared.public_type_policy,
+                        ..*place
+                    };
+                }
+                place_and_quals.qualifiers = inherited.member.qualifiers;
             }
 
             if !place_and_quals.is_undefined() && !place_and_quals.is_init_var() {
@@ -136,10 +156,8 @@ pub(super) fn inherited_class_body_declaration<'db>(
     db: &'db dyn Db,
     scope: ScopeId<'db>,
     symbol: ScopedSymbolId,
-) -> Option<PlaceAndQualifiers<'db>> {
+) -> Option<ClassBodyDeclaration<'db>> {
     scope.node(db).as_class()?;
-    let table = place_table(db, scope);
-    let name = table.symbol(symbol).name();
     let use_def = use_def_map(db, scope);
     let env = ProgramEnvironment::from_scope(scope);
     if !place_from_declarations(db, &env, use_def.end_of_scope_symbol_declarations(symbol))
@@ -150,10 +168,26 @@ pub(super) fn inherited_class_body_declaration<'db>(
     }
 
     let class = nearest_enclosing_class(db, semantic_index(db, scope.program_file(db)), scope)?;
-    MroLookup::new(
+    let table = place_table(db, scope);
+    class_body_declaration_from_bases(db, &env, class, table.symbol(symbol).name())
+}
+
+pub(super) fn class_body_declaration_from_bases<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    class: StaticClassLiteral<'db>,
+    name: &str,
+) -> Option<ClassBodyDeclaration<'db>> {
+    let mut inherited = MroLookup::new(
         db,
-        &env,
+        env,
         class.identity_specialization(db).iter_mro(db).skip(1),
     )
-    .class_body_declaration(name)
+    .class_body_declaration(name)?;
+    // Hash definitions are checked against the hash protocol, not inherited annotations.
+    // Retain qualifiers such as `ClassVar`, which still constrain instance assignments.
+    if name == "__hash__" {
+        inherited.member.place = Place::Undefined;
+    }
+    Some(inherited)
 }

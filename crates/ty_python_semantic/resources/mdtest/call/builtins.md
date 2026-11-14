@@ -220,15 +220,15 @@ def reveal_unsupported_tuple_results(x: A | B, items: list[int]):
     reveal_type(isinstance(x, (A | B,)))  # revealed: bool
     reveal_type(isinstance(items, (List,)))  # revealed: bool
 
-def partial_tuple(x: A | B) -> bool:  # error: [invalid-return-type]
+def partial_tuple(x: A | B) -> bool:  # error: [invalid-implicit-return]
     if isinstance(x, (A, bytes)):
         return True
 
-def variadic_tuple(x: A, targets: tuple[type[A], ...]) -> bool:  # error: [invalid-return-type]
+def variadic_tuple(x: A, targets: tuple[type[A], ...]) -> bool:  # error: [invalid-implicit-return]
     if isinstance(x, targets):
         return True
 
-def subclass_target(x: A, target: type[A]) -> bool:  # error: [invalid-return-type]
+def subclass_target(x: A, target: type[A]) -> bool:  # error: [invalid-implicit-return]
     if isinstance(x, (target,)):
         return True
 ```
@@ -392,7 +392,7 @@ def accepts_mutually_recursive_alias(x: RecursiveA) -> bool:
     if isinstance(x, (A, B)):
         return True
 
-def partial_mutually_recursive_alias(x: RecursivePartialA) -> bool:  # error: [invalid-return-type]
+def partial_mutually_recursive_alias(x: RecursivePartialA) -> bool:  # error: [invalid-implicit-return]
     reveal_type(isinstance(x, (A, B)))  # revealed: bool
     if isinstance(x, (A, B)):
         return True
@@ -401,10 +401,9 @@ def partial_mutually_recursive_alias(x: RecursivePartialA) -> bool:  # error: [i
 ## Generic builtins should not overfit upper-bound-only callback constraints
 
 These examples are minimized from ecosystem regressions seen while preserving explicit `Never` and
-`object` bounds through the constraint solver. The current solver picks callback parameter upper
-bounds as concrete solutions when the iterable argument is otherwise unknown. That overfits the
-result to `Sized` or `object`; ideally the element type would remain `Unknown`, while the callable
-return type would still be used where possible.
+`object` bounds through the constraint solver. Callback parameter upper bounds should not overfit
+the result when the iterable argument is otherwise unknown. The callable return type should still be
+used where possible.
 
 ```py
 from ty_extensions._internal import Unknown
@@ -413,12 +412,11 @@ def _(xs: Unknown):
     # TODO: should be `list[Unknown]`
     reveal_type(sorted(xs, key=len))  # revealed: list[Sized]
 
-    # TODO: should be `map[str]`
-    reveal_type(map("{}".format, xs))  # revealed: map[object]
+    reveal_type(map("{}".format, xs))  # revealed: map[str]
 
-    # TODO: should not emit an error and should reveal `str`
-    # error: [no-matching-overload]
-    reveal_type("".join(map("{}".format, xs)))  # revealed: Unknown
+    # TODO: This should reveal `str`. See https://github.com/astral-sh/ty/issues/4536.
+    # The lack of gradual constraints allows the `LiteralString` overload to be selected.
+    reveal_type("".join(map("{}".format, xs)))  # revealed: LiteralString
 ```
 
 ## Mapping methods accept arbitrary object types
@@ -449,12 +447,12 @@ def _(mapping: Mapping[str, int], dictionary: dict[str, int], key: object) -> No
 
 ```py
 def _():
-    # snapshot: call-non-callable
+    # snapshot: not-callable
     raise NotImplemented()
 ```
 
 ```snapshot
-error[call-non-callable]: `NotImplemented` is not callable
+error[not-callable]: `NotImplemented` is not callable
  --> src/mdtest_snippet.py:3:11
   |
 3 |     raise NotImplemented()
@@ -463,7 +461,7 @@ error[call-non-callable]: `NotImplemented` is not callable
   |           Did you mean `NotImplementedError`?
 help: Use `NotImplementedError` instead
   |
-2 |     # snapshot: call-non-callable
+2 |     # snapshot: not-callable
   -     raise NotImplemented()
 3 +     raise NotImplementedError()
 4 | def _():
@@ -473,12 +471,12 @@ note: This is an unsafe fix and may change runtime behavior
 
 ```py
 def _():
-    # snapshot: call-non-callable
+    # snapshot: not-callable
     raise NotImplemented("this module is not implemented yet!!!")
 ```
 
 ```snapshot
-error[call-non-callable]: `NotImplemented` is not callable
+error[not-callable]: `NotImplemented` is not callable
  --> src/mdtest_snippet.py:6:11
   |
 6 |     raise NotImplemented("this module is not implemented yet!!!")
@@ -487,7 +485,7 @@ error[call-non-callable]: `NotImplemented` is not callable
   |           Did you mean `NotImplementedError`?
 help: Use `NotImplementedError` instead
   |
-5 |     # snapshot: call-non-callable
+5 |     # snapshot: not-callable
   -     raise NotImplemented("this module is not implemented yet!!!")
 6 +     raise NotImplementedError("this module is not implemented yet!!!")
 7 | def _(NotImplementedError: object):
@@ -500,12 +498,12 @@ not necessarily produce an exception, so we omit the fix.
 
 ```py
 def _(NotImplementedError: object):
-    # snapshot: call-non-callable
+    # snapshot: not-callable
     raise NotImplemented()
 ```
 
 ```snapshot
-error[call-non-callable]: `NotImplemented` is not callable
+error[not-callable]: `NotImplemented` is not callable
  --> src/mdtest_snippet.py:9:11
   |
 9 |     raise NotImplemented()
@@ -575,7 +573,9 @@ from collections.abc import Mapping
 
 def copy(value: object) -> dict[str, str]:
     if isinstance(value, Mapping):
-        return dict(value)  # error: [no-matching-overload]
+        # TODO: This should error. See https://github.com/astral-sh/ty/issues/4645.
+        return dict(value)
+
     return {}
 ```
 
@@ -594,12 +594,18 @@ from collections.abc import Mapping
 
 def clean(value: dict[str, int] | str | None) -> None:
     if isinstance(value, Mapping):
-        value = dict(value)  # error: [no-matching-overload]
+        # TODO: This should error. See https://github.com/astral-sh/ty/issues/4645.
+        value = dict(value)
         for key, item in value.items():
             value[key] = item
 ```
 
 ## `dict` keyword arguments with a shadowed `typing` module
+
+```toml
+[environment]
+python-version = "3.10"
+```
 
 An empty first-party `typing` module hides the definitions that make `dict` generic. Calls with one
 or more named keyword arguments still check their values and recover with `Unknown`, just like

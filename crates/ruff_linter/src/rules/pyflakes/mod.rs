@@ -11,7 +11,7 @@ mod tests {
 
     use anyhow::Result;
     use regex::Regex;
-    use ruff_db::diagnostic::Diagnostic;
+    use ruff_db::diagnostic::{Diagnostic, DummyFileResolver};
     use ruff_python_parser::ParseOptions;
     use rustc_hash::FxHashMap;
     use test_case::test_case;
@@ -23,6 +23,7 @@ mod tests {
 
     use crate::linter::check_path;
     use crate::registry::{Linter, Rule};
+    use crate::rules::flake8_type_checking::settings::RuntimeSemantics;
     use crate::rules::isort;
     use crate::rules::pyflakes;
     use crate::settings::types::PreviewMode;
@@ -206,10 +207,13 @@ mod tests {
             Path::new("pyflakes").join(path).as_path(),
             &LinterSettings {
                 flake8_type_checking: crate::rules::flake8_type_checking::settings::Settings {
-                    runtime_required_base_classes: vec![
-                        "pydantic.BaseModel".to_string(),
-                        "sqlalchemy.orm.DeclarativeBase".to_string(),
-                    ],
+                    runtime_evaluated_base_classes: FxHashMap::from_iter([
+                        ("pydantic.BaseModel".to_string(), RuntimeSemantics::Required),
+                        (
+                            "sqlalchemy.orm.DeclarativeBase".to_string(),
+                            RuntimeSemantics::Required,
+                        ),
+                    ]),
                     ..Default::default()
                 },
                 ..LinterSettings::for_rule(rule_code)
@@ -1019,7 +1023,10 @@ mod tests {
             target_version,
             &suppressions,
         );
-        messages.sort_by(Diagnostic::ruff_start_ordering);
+        messages.sort_by(|a, b| {
+            a.rendering_sort_key(&DummyFileResolver)
+                .cmp(&b.rendering_sort_key(&DummyFileResolver))
+        });
         let actual = messages
             .iter()
             .filter(|msg| !msg.is_invalid_syntax())
@@ -2700,7 +2707,7 @@ mod tests {
         try: pass
         except Exception as fu: pass
         ",
-            &[Rule::UnusedVariable, Rule::RedefinedWhileUnused],
+            &[Rule::RedefinedWhileUnused, Rule::UnusedVariable],
         );
     }
 

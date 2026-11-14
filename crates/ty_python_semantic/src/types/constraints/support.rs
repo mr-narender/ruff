@@ -1,7 +1,6 @@
 //! Tracks the support of each constraint and interior node in a BDD.
 //!
-//! The support of a constraint is the set of typevars mentioned anywhere in the constraint
-//! (either the subject, or anywhere in the lower or upper bound).
+//! The support of a constraint is its subject typevars and the free typevars in its bound.
 //!
 //! The support of a node is the union of the supports of every constraint reachable from that
 //! node.
@@ -62,11 +61,7 @@ impl Support {
             .iter_mut()
             .enumerate()
             .find(|(_, chunk)| **chunk != 0)?;
-        let first_set_bit_in_chunk = first_nonempty_chunk.trailing_zeros() as usize;
-        debug_assert!(
-            first_set_bit_in_chunk != CHUNK_SIZE,
-            "nonempty chunk should not be empty"
-        );
+        let first_set_bit_in_chunk = first_nonempty_chunk.lowest_one()? as usize;
 
         // Clear out the bit we just found, and then return it
         *first_nonempty_chunk ^= 1 << first_set_bit_in_chunk;
@@ -91,10 +86,7 @@ impl Support {
             // Iterate through the set bits in this chunk
             std::iter::from_fn(move || {
                 // Find the lowest set bit, if there is one
-                let index = chunk.trailing_zeros() as usize;
-                if index == CHUNK_SIZE {
-                    return None;
-                }
+                let index = chunk.lowest_one()? as usize;
 
                 // Clear out the bit we just found.
                 chunk ^= 1 << index;

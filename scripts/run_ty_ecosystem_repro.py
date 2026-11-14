@@ -3,12 +3,15 @@
 # requires-python = ">=3.11"
 # dependencies = []
 #
+# [tool.ty.analysis]
+# return-type-inference = "always"
+#
 # [tool.ty.rules]
 # truthiness-test-of-none-union = "warn"
 # blanket-ignore-comment = "warn"
 # missing-type-argument = "warn"
 # possibly-unresolved-reference = "warn"
-# unsound-return-statement = "warn"
+# unsound-return = "warn"
 # unsound-yield = "warn"
 # unsupported-dynamic-base = "warn"
 # division-by-zero = "warn"
@@ -17,6 +20,10 @@
 # redundant-condition-strict = "warn"
 # disjoint-cast = "warn"
 # missing-direct-dependency = "warn"
+#
+# [tool.uv]
+# require-build-hashes = true
+# preview-features = ["build-dependency-hashes", "missing-exclude-newer-package-lock"]
 # ///
 
 """Run a reproduction command with the recorded environment and a supplied deadline."""
