@@ -1023,6 +1023,11 @@ class Bar(TypedDict):
 x2: Foo | Bar = {"foo": 1}
 reveal_type(x2)  # revealed: Foo
 
+# The literal matches `Foo`, but its value expression still has an error.
+def _(text: str) -> Foo | Bar:
+    # error: [too-many-positional-arguments] "Too many positional arguments to function `len`"
+    return {"foo": len(text, text)}
+
 x3: Foo | Bar = {"bar": 1}
 reveal_type(x3)  # revealed: Bar
 
@@ -1048,6 +1053,14 @@ class FooBar3(TypedDict):
     foo: int
     bar: int
     baz: NotRequired[int]
+
+# Both unpacks contribute different keys; the first candidate rejects the second key.
+def _(left: Foo, right: Bar):
+    merged: Foo | FooBar1 = {**left, **right}
+    reveal_type(merged)  # revealed: FooBar1
+
+    # error: [invalid-assignment]
+    neither: Foo | Bar = {**left, **right}
 
 x6: FooBar1 | FooBar2 = {"foo": 1, "bar": 1}
 reveal_type(x6)  # revealed: FooBar1 | FooBar2
