@@ -288,7 +288,7 @@ impl Options {
             }
         } else {
             tracing::debug!("No virtual environment found");
-            self_environment.map(|(paths, _)| paths).unwrap_or_default()
+            self_environment.map_or_default(|(paths, _)| paths)
         };
 
         let real_stdlib_path = python_environment.as_ref().and_then(|python_environment| {
@@ -1786,7 +1786,10 @@ pub struct AnalysisOptions {
     )]
     pub respect_type_ignore_comments: Option<bool>,
 
-    /// A list of module glob patterns for which `import-not-found` diagnostics should be suppressed.
+    /// A list of module glob patterns for which `import-not-found` and
+    /// `missing-module-member` diagnostics should be suppressed.
+    /// For `from pkg import name`, ty matches against `pkg` if the module cannot be resolved,
+    /// and against `pkg.name` if the module resolves but the name cannot be imported.
     ///
     /// Details on supported glob patterns:
     /// - `*` matches zero or more characters except `.`. For example, `foo.*` matches `foo.bar` but

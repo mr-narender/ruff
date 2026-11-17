@@ -77,6 +77,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&POSSIBLY_MISSING_IMPLICIT_CALL);
     registry.register_lint(&INVALID_DATACLASS_OVERRIDE);
     registry.register_lint(&INVALID_DATACLASS);
+    registry.register_lint(&INVALID_DATACLASS_POST_INIT);
     registry.register_lint(&CONFLICTING_DECLARATIONS);
     registry.register_lint(&CONFLICTING_METACLASS);
     registry.register_lint(&CYCLIC_CLASS_DEFINITION);
@@ -201,6 +202,7 @@ pub(crate) fn register_lints(registry: &mut LintRegistryBuilder) {
     registry.register_lint(&MISSING_SLOT);
     registry.register_lint(&IMPORT_NOT_FOUND);
     registry.register_alias(LintName::of("unresolved-import"), &IMPORT_NOT_FOUND);
+    registry.register_lint(&MISSING_MODULE_MEMBER);
     registry.register_lint(&UNRESOLVED_REFERENCE);
     registry.register_lint(&UNSUPPORTED_BASE);
     registry.register_lint(&UNSUPPORTED_DYNAMIC_BASE);
@@ -393,6 +395,15 @@ declare_lint! {
     pub(crate) static INVALID_DATACLASS = {
         summary: "detects invalid `@dataclass` applications",
         status: LintStatus::stable("0.0.12"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/invalid-dataclass-post-init.md")]
+    pub(crate) static INVALID_DATACLASS_POST_INIT = {
+        summary: "detects incompatible dataclass `__post_init__` signatures",
+        status: LintStatus::stable("0.0.105"),
         default_level: Level::Error,
     }
 }
@@ -1282,8 +1293,17 @@ declare_lint! {
 declare_lint! {
     #[doc = include_str!("../../resources/lint_docs/import-not-found.md")]
     pub(crate) static IMPORT_NOT_FOUND = {
-        summary: "detects unresolved imports",
+        summary: "detects imports of unresolved modules",
         status: LintStatus::stable("0.0.1-alpha.1"),
+        default_level: Level::Error,
+    }
+}
+
+declare_lint! {
+    #[doc = include_str!("../../resources/lint_docs/missing-module-member.md")]
+    pub(crate) static MISSING_MODULE_MEMBER = {
+        summary: "detects imports of missing names from resolved modules",
+        status: LintStatus::stable("0.0.105"),
         default_level: Level::Error,
     }
 }
