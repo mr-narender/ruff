@@ -3877,6 +3877,120 @@ def _(handlers: list[Callable[[str], str]]):
     register(handlers, lambda s: reveal_type(s))  # revealed: str
 ```
 
+## Nested calls with optional return context
+
+When checking a nested call like `first(wrap(value))`, we use the expected return type to infer a
+provisional specialization for the call, which we use to guide the inference of the call's
+arguments. If that expected return type is a union, we check each union element separately and only
+fall back to the union as a whole if no element succeeds.
+
+In this example, `T@find` is non-inferable, so the entire `first(wrap(value))` call needs to be
+valid for all possible specializations of `T@find`. The expected return type is `T | None` (from the
+assignment annotation), so we check a narrowed return type of `None`. With that narrowed type,
+`wrap(value)` would have a return type of `list[None]`, which is only valid when `T@find ≤ None`.
+The caller can choose (among many other choices) `T@find = int`, so the `None` attempt should fail.
+We should therefore _not_ use the narrowed return type to choose the provisional specialization for
+the inferred `T@wrap` and `T@first`.
+
+```py
+def first[T](items: list[T]) -> T | None:
+    return items[0] if items else None
+
+def wrap[T](value: T) -> list[T]:
+    return [value]
+
+def find[T](value: T) -> T | None:
+    result: T | None = reveal_type(first(wrap(value)))  # revealed: T@find | None
+    return result
+```
+
+The same applies to the iterator passed to `next` when the caller's type variable has a bound.
+
+```py
+def first_int[T: int](values: list[T]) -> T | None:
+    return reveal_type(next(iter(values), None))  # revealed: T@first_int | None
+```
+
+## Nested `TypedDict` constructors with optional return context
+
+A failed specialization of a generic `TypedDict` constructor cannot justify narrowing the outer
+call's return type to `None`.
+
+```py
+from typing import TypedDict
+
+class Box[T](TypedDict):
+    value: T
+
+def get[T](box: Box[T]) -> T | None:
+    return box["value"]
+
+def read[T](value: T) -> T | None:
+    return reveal_type(get(Box(value=value)))  # revealed: T@read | None
+```
+
+## Nested calls through a callable union
+
+```py
+def wrap[T](value: T) -> list[T]:
+    return [value]
+
+def first[T](items: list[T]) -> T | None:
+    return items[0] if items else None
+
+def last[T](items: list[T]) -> T | None:
+    return items[-1] if items else None
+
+def choose[T](value: T, reverse: bool) -> None:
+    pick = last if reverse else first
+    # TODO: Reveal `T@choose | None` once failed-call information is preserved across callable
+    # union inference contexts. https://github.com/astral-sh/ruff/pull/27942
+    result: T | None = reveal_type(pick(wrap(value)))  # revealed: None
+```
+
+## Failed calls in arguments unrelated to specialization
+
+A failed call in a non-generic parameter does not prevent narrowing an otherwise valid
+specialization. A failure in an argument that constrains the type variable still prevents narrowing.
+
+```py
+def head[T](items: list[T], note: object) -> T:
+    return items[0]
+
+def unrelated(value: object) -> int:
+    result: int | None = head([1], len(value))  # ty: ignore[invalid-argument-type]
+    reveal_type(result)  # revealed: int
+    return result + 1
+
+def related(value: object) -> int | None:
+    result: int | None = head([len(value)], None)  # ty: ignore[invalid-argument-type]
+    return reveal_type(result)  # revealed: int | None
+```
+
+## Suppressed argument errors do not justify union narrowing
+
+Disabling an argument diagnostic does not make a failed speculative specialization valid.
+
+```toml
+[environment]
+python-version = "3.12"
+
+[rules]
+invalid-argument-type = "ignore"
+```
+
+```py
+def first[T](items: list[T]) -> T | None:
+    return items[0] if items else None
+
+def wrap[T](value: T) -> list[T]:
+    return [value]
+
+def find[T](value: T) -> T | None:
+    result: T | None = reveal_type(first(wrap(value)))  # revealed: T@find | None
+    return result
+```
+
 ## Passing generic functions to generic functions
 
 `functions.pyi`:
@@ -6247,6 +6361,89 @@ def make_runner[X, Y](value: X, output: list[Y], visit: Callable[[X], None]) -> 
 
 def example(output: list[Literal["a", "b"]]):
     run: Callable[[Wrap], None] = make_runner("a", output, lambda item: output.append(item))
+```
+
+## Related type parameters in higher-order functions
+
+Both declaration orders preserve the output bound when the input tuple is empty.
+
+```py
+from collections.abc import Callable
+
+type Transform[A, B] = Callable[[tuple[A, ...]], tuple[B, ...]]
+
+def result_first[B: int, A](f: Transform[A, B]) -> Transform[A, B]:
+    return f
+
+def argument_first[A, B: int](f: Transform[A, B]) -> Transform[A, B]:
+    return f
+
+def identity[T](items: tuple[T, ...]) -> tuple[T, ...]:
+    return items
+
+ints1: tuple[int, ...] = result_first(identity)(())
+ints2: tuple[int, ...] = argument_first(identity)(())
+```
+
+The input bound `list[Any]` permits `list[int]`, so the output still accepts only integer elements.
+
+```py
+from typing import Any
+
+def bounded_lists[B: list[int], A: list[Any]](f: Transform[A, B]) -> Transform[A, B]:
+    return f
+
+for item in bounded_lists(identity)(()):
+    item.append(1)
+    item.append("bad")  # error: [invalid-argument-type]
+```
+
+The identity function uses the same element type for its input and output. When both type parameters
+are constrained, the only choice they share is `int`.
+
+```py
+from typing import assert_type
+
+def first[B: (int, str), A: (int, bytes)](f: Transform[A, B]) -> Transform[A, B]:
+    return f
+
+def swapped[A: (int, bytes), B: (int, str)](f: Transform[A, B]) -> Transform[A, B]:
+    return f
+
+out = first(identity)(())
+swapped_out = swapped(identity)(())
+assert_type(out, tuple[int, ...])
+assert_type(swapped_out, tuple[int, ...])
+```
+
+A decorator accepts a callback with an integer input and a result constrained to `int` or `str`.
+
+```py
+def decorate_value[A: int, B: (int, str)](f: Callable[[A], B]) -> Callable[[A], B]:
+    return f
+
+def identity_value[T](value: T) -> T:
+    return value
+
+# TODO: Since identity_value returns its argument, the decorated call should infer int.
+reveal_type(decorate_value(identity_value)(1))  # revealed: int | str
+```
+
+Composing two identity functions relates three type parameters without fixing a concrete element
+type.
+
+```py
+def compose[A, B, C](f: Transform[A, B], g: Transform[B, C]) -> Transform[A, C]:
+    return lambda items: g(f(items))
+
+def compose_reversed[C, B, A](f: Transform[A, B], g: Transform[B, C]) -> Transform[A, C]:
+    return lambda items: g(f(items))
+
+# TODO: The shared element type should be bound by the returned callable.
+# revealed: (tuple[B@compose, ...], /) -> tuple[B@compose, ...]
+reveal_type(compose(identity, identity))
+# revealed: (tuple[A@compose_reversed, ...], /) -> tuple[A@compose_reversed, ...]
+reveal_type(compose_reversed(identity, identity))
 ```
 
 ## Dictionary value context containing a bounded type variable

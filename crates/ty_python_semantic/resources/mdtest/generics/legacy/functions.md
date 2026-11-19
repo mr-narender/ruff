@@ -2758,6 +2758,137 @@ def _(handlers: list[Callable[[str], str]]):
     register(handlers, lambda s: reveal_type(s))  # revealed: str
 ```
 
+## Nested calls with optional return context
+
+When checking a nested call like `first(wrap(value))`, we use the expected return type to infer a
+provisional specialization for the call, which we use to guide the inference of the call's
+arguments. If that expected return type is a union, we check each union element separately and only
+fall back to the union as a whole if no element succeeds.
+
+In this example, `T@find` is non-inferable, so the entire `first(wrap(value))` call needs to be
+valid for all possible specializations of `T@find`. The expected return type is `T | None` (from the
+assignment annotation), so we check a narrowed return type of `None`. With that narrowed type,
+`wrap(value)` would have a return type of `list[None]`, which is only valid when `T@find ≤ None`.
+The caller can choose (among many other choices) `T@find = int`, so the `None` attempt should fail.
+We should therefore _not_ use the narrowed return type to choose the provisional specialization for
+the inferred `T@wrap` and `T@first`.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def first(items: list[T]) -> T | None:
+    return items[0] if items else None
+
+def wrap(value: T) -> list[T]:
+    return [value]
+
+def find(value: T) -> T | None:
+    result: T | None = reveal_type(first(wrap(value)))  # revealed: T@find | None
+    return result
+```
+
+The same applies to the iterator passed to `next` when the caller's type variable has a bound.
+
+```py
+Bounded = TypeVar("Bounded", bound=int)
+
+def first_int(values: list[Bounded]) -> Bounded | None:
+    return reveal_type(next(iter(values), None))  # revealed: Bounded@first_int | None
+```
+
+## Nested `TypedDict` constructors with optional return context
+
+A failed specialization of a generic `TypedDict` constructor cannot justify narrowing the outer
+call's return type to `None`.
+
+```py
+from typing import Generic, TypedDict, TypeVar
+
+T = TypeVar("T")
+
+class Box(TypedDict, Generic[T]):
+    value: T
+
+def get(box: Box[T]) -> T | None:
+    return box["value"]
+
+def read(value: T) -> T | None:
+    return reveal_type(get(Box(value=value)))  # revealed: T@read | None
+```
+
+## Nested calls through a callable union
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def wrap(value: T) -> list[T]:
+    return [value]
+
+def first(items: list[T]) -> T | None:
+    return items[0] if items else None
+
+def last(items: list[T]) -> T | None:
+    return items[-1] if items else None
+
+def choose(value: T, reverse: bool) -> None:
+    pick = last if reverse else first
+    # TODO: Reveal `T@choose | None` once failed-call information is preserved across callable
+    # union inference contexts. https://github.com/astral-sh/ruff/pull/27942
+    result: T | None = reveal_type(pick(wrap(value)))  # revealed: None
+```
+
+## Failed calls in arguments unrelated to specialization
+
+A failed call in a non-generic parameter does not prevent narrowing an otherwise valid
+specialization. A failure in an argument that constrains the type variable still prevents narrowing.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def head(items: list[T], note: object) -> T:
+    return items[0]
+
+def unrelated(value: object) -> int:
+    result: int | None = head([1], len(value))  # ty: ignore[invalid-argument-type]
+    reveal_type(result)  # revealed: int
+    return result + 1
+
+def related(value: object) -> int | None:
+    result: int | None = head([len(value)], None)  # ty: ignore[invalid-argument-type]
+    return reveal_type(result)  # revealed: int | None
+```
+
+## Suppressed argument errors do not justify union narrowing
+
+Disabling an argument diagnostic does not make a failed speculative specialization valid.
+
+```toml
+[rules]
+invalid-argument-type = "ignore"
+```
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def first(items: list[T]) -> T | None:
+    return items[0] if items else None
+
+def wrap(value: T) -> list[T]:
+    return [value]
+
+def find(value: T) -> T | None:
+    result: T | None = reveal_type(first(wrap(value)))  # revealed: T@find | None
+    return result
+```
+
 ## Passing generic functions to generic functions
 
 ```py
@@ -5909,6 +6040,70 @@ def make_runner(value: X, output: list[Y], visit: Callable[[X], None]) -> Runner
 
 def example(output: list[Literal["a", "b"]]):
     run: Callable[[Wrap], None] = make_runner("a", output, lambda item: output.append(item))
+```
+
+## Related type parameters in higher-order functions
+
+The output keeps its integer bound when the input tuple is empty.
+
+```py
+from typing import Callable, TypeVar
+
+A = TypeVar("A")
+B = TypeVar("B")
+IntT = TypeVar("IntT", bound=int)
+Transform = Callable[[tuple[A, ...]], tuple[B, ...]]
+
+def decorate(f: Transform[A, IntT]) -> Transform[A, IntT]:
+    return f
+
+def identity(items: tuple[A, ...]) -> tuple[A, ...]:
+    return items
+
+integers: tuple[int, ...] = decorate(identity)(())
+```
+
+The identity function uses the same element type for its input and output. When both type parameters
+are constrained, the only choice they share is `int`.
+
+```py
+from typing_extensions import assert_type
+
+IntOrStr = TypeVar("IntOrStr", int, str)
+IntOrBytes = TypeVar("IntOrBytes", int, bytes)
+
+def common(f: Transform[IntOrBytes, IntOrStr]) -> Transform[IntOrBytes, IntOrStr]:
+    return f
+
+out = common(identity)(())
+assert_type(out, tuple[int, ...])
+```
+
+A decorator accepts a callback with an integer input and a result constrained to `int` or `str`.
+
+```py
+def decorate_value(f: Callable[[IntT], IntOrStr]) -> Callable[[IntT], IntOrStr]:
+    return f
+
+def identity_value(value: A) -> A:
+    return value
+
+# TODO: Since identity_value returns its argument, the decorated call should infer int.
+reveal_type(decorate_value(identity_value)(1))  # revealed: int | str
+```
+
+Composing two identity functions relates three type parameters without fixing a concrete element
+type.
+
+```py
+C = TypeVar("C")
+
+def compose(f: Transform[A, B], g: Transform[B, C]) -> Transform[A, C]:
+    return lambda items: g(f(items))
+
+# TODO: The shared element type should be bound by the returned callable.
+# revealed: (tuple[B@compose, ...], /) -> tuple[B@compose, ...]
+reveal_type(compose(identity, identity))
 ```
 
 ## Dictionary value context containing a bounded type variable
