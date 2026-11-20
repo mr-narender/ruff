@@ -273,9 +273,9 @@ impl Rule {
             }
             Rule::BlanketNOQA
             | Rule::NoqaComments
-            | Rule::RedirectedNOQA
+            | Rule::RenamedRuleInSuppressionComment
             | Rule::RuleCodesInSuppressionComments
-            | Rule::UnusedNOQA => LintSource::Noqa,
+            | Rule::UnusedSuppressionComment => LintSource::Noqa,
             Rule::BidirectionalUnicode
             | Rule::BlankLineWithWhitespace
             | Rule::DocLineTooLong
@@ -288,18 +288,18 @@ impl Rule {
             Rule::AmbiguousUnicodeCharacterComment
             | Rule::BlanketTypeIgnore
             | Rule::BlankLineAfterDecorator
-            | Rule::BlankLineBetweenMethods
-            | Rule::BlankLinesAfterFunctionOrClass
-            | Rule::BlankLinesBeforeNestedDefinition
-            | Rule::BlankLinesTopLevel
+            | Rule::MissingBlankLineBeforeMethod
+            | Rule::MissingBlankLinesAfterTopLevelDefinition
+            | Rule::MissingBlankLineBeforeNestedDefinition
+            | Rule::MissingBlankLinesBeforeTopLevelDefinition
             | Rule::CommentedOutCode
             | Rule::EmptyComment
             | Rule::ExtraneousParentheses
-            | Rule::InvalidCharacterBackspace
-            | Rule::InvalidCharacterEsc
-            | Rule::InvalidCharacterNul
-            | Rule::InvalidCharacterSub
-            | Rule::InvalidCharacterZeroWidthSpace
+            | Rule::UnescapedBackspaceCharacter
+            | Rule::UnescapedEscapeCharacter
+            | Rule::UnescapedNullCharacter
+            | Rule::UnescapedSubstituteCharacter
+            | Rule::UnescapedZeroWidthSpaceCharacter
             | Rule::InvalidTodoCapitalization
             | Rule::InvalidTodoTag
             | Rule::LineContainsFixme
@@ -315,11 +315,11 @@ impl Rule {
             | Rule::MultiLineImplicitStringConcatenation
             | Rule::MultipleStatementsOnOneLineColon
             | Rule::MultipleStatementsOnOneLineSemicolon
-            | Rule::ProhibitedTrailingComma
+            | Rule::UnnecessaryTrailingComma
             | Rule::ShebangLeadingWhitespace
-            | Rule::ShebangMissingExecutableFile
+            | Rule::ExecutableFileWithoutShebang
             | Rule::ShebangMissingPython
-            | Rule::ShebangNotExecutable
+            | Rule::NonExecutableFileWithShebang
             | Rule::ShebangNotFirstLine
             | Rule::SingleLineImplicitStringConcatenation
             | Rule::TabIndentation
@@ -417,16 +417,18 @@ impl Rule {
 /// Pairs of checks that shouldn't be enabled together.
 pub const INCOMPATIBLE_CODES: &[(Rule, Rule, &str); 2] = &[
     (
-        Rule::BlankLineBeforeClass,
-        Rule::IncorrectBlankLineBeforeClass,
-        "`incorrect-blank-line-before-class` (D203) and `blank-line-before-class` (D211) are \
-         incompatible. Ignoring `incorrect-blank-line-before-class`.",
+        Rule::BlankLineBeforeClassDocstring,
+        Rule::IncorrectBlankLineBeforeClassDocstring,
+        "`incorrect-blank-line-before-class-docstring` (D203) and \
+         `blank-line-before-class-docstring` (D211) are incompatible. \
+         Ignoring `incorrect-blank-line-before-class-docstring`.",
     ),
     (
-        Rule::MultiLineSummaryFirstLine,
-        Rule::MultiLineSummarySecondLine,
-        "`multi-line-summary-first-line` (D212) and `multi-line-summary-second-line` (D213) are \
-         incompatible. Ignoring `multi-line-summary-second-line`.",
+        Rule::MultilineDocstringSummaryOnSeparateLine,
+        Rule::MultilineDocstringSummaryOnFirstLine,
+        "`multiline-docstring-summary-on-separate-line` (D212) and \
+         `multiline-docstring-summary-on-first-line` (D213) are incompatible. \
+         Ignoring `multiline-docstring-summary-on-first-line`.",
     ),
 ];
 

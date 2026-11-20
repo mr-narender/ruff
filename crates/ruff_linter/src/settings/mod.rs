@@ -371,8 +371,8 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::StripWithMultiCharacters), // B005
     RuleSelector::rule(Rule::MutableArgumentDefault), // B006
     RuleSelector::rule(Rule::FunctionCallInDefaultArgument), // B008
-    RuleSelector::rule(Rule::GetAttrWithConstant), // B009
-    RuleSelector::rule(Rule::SetAttrWithConstant), // B010
+    RuleSelector::rule(Rule::GetattrWithConstant), // B009
+    RuleSelector::rule(Rule::SetattrWithConstant), // B010
     RuleSelector::rule(Rule::JumpStatementInFinally), // B012
     RuleSelector::rule(Rule::RedundantTupleInExceptionHandler), // B013
     RuleSelector::rule(Rule::DuplicateHandlerException), // B014
@@ -418,14 +418,14 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::CallDatetimeUtcfromtimestamp), // DTZ004
     RuleSelector::rule(Rule::BareExcept), // E722
     RuleSelector::rule(Rule::IOError), // E902
-    RuleSelector::rule(Rule::ShebangNotExecutable), // EXE001
-    RuleSelector::rule(Rule::ShebangMissingExecutableFile), // EXE002
+    RuleSelector::rule(Rule::NonExecutableFileWithShebang), // EXE001
+    RuleSelector::rule(Rule::ExecutableFileWithoutShebang), // EXE002
     RuleSelector::rule(Rule::ShebangLeadingWhitespace), // EXE004
     RuleSelector::rule(Rule::ShebangNotFirstLine), // EXE005
     RuleSelector::rule(Rule::UnusedImport), // F401
     RuleSelector::rule(Rule::ImportShadowedByLoopVar), // F402
     RuleSelector::rule(Rule::LateFutureImport), // F404
-    RuleSelector::rule(Rule::UndefinedLocalWithNestedImportStarUsage), // F406
+    RuleSelector::rule(Rule::NonModuleLevelStarImport), // F406
     RuleSelector::rule(Rule::FutureFeatureNotDefined), // F407
     RuleSelector::rule(Rule::PercentFormatInvalidFormat), // F501
     RuleSelector::rule(Rule::PercentFormatExpectedMapping), // F502
@@ -484,17 +484,17 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::SortedMinMax), // FURB192
     RuleSelector::rule(Rule::LoggingWarn), // G010
     RuleSelector::rule(Rule::LoggingExtraAttrClash), // G101
-    RuleSelector::rule(Rule::LoggingExcInfo), // G201
+    RuleSelector::rule(Rule::LoggingErrorWithExcInfo), // G201
     RuleSelector::rule(Rule::LoggingRedundantExcInfo), // G202
     RuleSelector::rule(Rule::UnsortedImports), // I001
-    RuleSelector::rule(Rule::FStringInGetTextFuncCall), // INT001
-    RuleSelector::rule(Rule::FormatInGetTextFuncCall), // INT002
-    RuleSelector::rule(Rule::PrintfInGetTextFuncCall), // INT003
+    RuleSelector::rule(Rule::FStringInGettextCall), // INT001
+    RuleSelector::rule(Rule::FormatInGettextCall), // INT002
+    RuleSelector::rule(Rule::PrintfInGettextCall), // INT003
     RuleSelector::rule(Rule::ImplicitStringConcatenationInCollectionLiteral), // ISC004
     RuleSelector::rule(Rule::DirectLoggerInstantiation), // LOG001
-    RuleSelector::rule(Rule::InvalidGetLoggerArgument), // LOG002
-    RuleSelector::rule(Rule::UndocumentedWarn), // LOG009
-    RuleSelector::rule(Rule::ExcInfoOutsideExceptHandler), // LOG014
+    RuleSelector::rule(Rule::FilePathAsLoggerName), // LOG002
+    RuleSelector::rule(Rule::LoggingWarnConstant), // LOG009
+    RuleSelector::rule(Rule::LoggingExcInfoOutsideExceptHandler), // LOG014
     RuleSelector::rule(Rule::RootLoggerCall), // LOG015
     RuleSelector::rule(Rule::InvalidModuleName), // N999
     RuleSelector::rule(Rule::UnnecessaryListCast), // PERF101
@@ -545,11 +545,11 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::SingledispatchmethodFunction), // PLE1520
     RuleSelector::rule(Rule::YieldFromInAsyncFunction), // PLE1700
     RuleSelector::rule(Rule::BidirectionalUnicode), // PLE2502
-    RuleSelector::rule(Rule::InvalidCharacterBackspace), // PLE2510
-    RuleSelector::rule(Rule::InvalidCharacterSub), // PLE2512
-    RuleSelector::rule(Rule::InvalidCharacterEsc), // PLE2513
-    RuleSelector::rule(Rule::InvalidCharacterNul), // PLE2514
-    RuleSelector::rule(Rule::InvalidCharacterZeroWidthSpace), // PLE2515
+    RuleSelector::rule(Rule::UnescapedBackspaceCharacter), // PLE2510
+    RuleSelector::rule(Rule::UnescapedSubstituteCharacter), // PLE2512
+    RuleSelector::rule(Rule::UnescapedEscapeCharacter), // PLE2513
+    RuleSelector::rule(Rule::UnescapedNullCharacter), // PLE2514
+    RuleSelector::rule(Rule::UnescapedZeroWidthSpaceCharacter), // PLE2515
     RuleSelector::rule(Rule::ComparisonWithItself), // PLR0124
     RuleSelector::rule(Rule::ComparisonOfConstant), // PLR0133
     RuleSelector::rule(Rule::PropertyWithParameters), // PLR0206
@@ -610,7 +610,7 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::CustomTypeVarForSelf), // PYI019
     RuleSelector::rule(Rule::QuotedAnnotationInStub), // PYI020
     RuleSelector::rule(Rule::UnaliasedCollectionsAbcSetImport), // PYI025
-    RuleSelector::rule(Rule::TypeAliasWithoutAnnotation), // PYI026
+    RuleSelector::rule(Rule::UnannotatedTypeAliasInStub), // PYI026
     RuleSelector::rule(Rule::StrOrReprDefinedInStub), // PYI029
     RuleSelector::rule(Rule::UnnecessaryLiteralUnion), // PYI030
     RuleSelector::rule(Rule::AnyEqNeAnnotation), // PYI032
@@ -627,11 +627,11 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::UnusedPrivateTypeAlias), // PYI047
     RuleSelector::rule(Rule::StubBodyMultipleStatements), // PYI048
     RuleSelector::rule(Rule::UnusedPrivateTypedDict), // PYI049
-    RuleSelector::rule(Rule::NoReturnArgumentAnnotationInStub), // PYI050
+    RuleSelector::rule(Rule::ParameterAnnotatedWithNoReturn), // PYI050
     RuleSelector::rule(Rule::UnannotatedAssignmentInStub), // PYI052
     RuleSelector::rule(Rule::UnnecessaryTypeUnion), // PYI055
-    RuleSelector::rule(Rule::ByteStringUsage), // PYI057
-    RuleSelector::rule(Rule::GeneratorReturnFromIterMethod), // PYI058
+    RuleSelector::rule(Rule::DeprecatedByteStringType), // PYI057
+    RuleSelector::rule(Rule::IterMethodWithGeneratorReturnAnnotation), // PYI058
     RuleSelector::rule(Rule::GenericNotLastBaseClass), // PYI059
     RuleSelector::rule(Rule::RedundantNoneLiteral), // PYI061
     RuleSelector::rule(Rule::DuplicateLiteralMember), // PYI062
@@ -672,10 +672,10 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::UnusedUnpackedVariable), // RUF059
     RuleSelector::rule(Rule::AccessAnnotationsFromClassDict), // RUF063
     RuleSelector::rule(Rule::DuplicateEntryInDunderAll), // RUF068
-    RuleSelector::rule(Rule::UnusedNOQA), // RUF100
-    RuleSelector::rule(Rule::RedirectedNOQA), // RUF101
+    RuleSelector::rule(Rule::UnusedSuppressionComment), // RUF100
+    RuleSelector::rule(Rule::RenamedRuleInSuppressionComment), // RUF101
     RuleSelector::rule(Rule::InvalidPyprojectToml), // RUF200
-    RuleSelector::rule(Rule::ExecBuiltin), // S102
+    RuleSelector::rule(Rule::Exec), // S102
     RuleSelector::rule(Rule::TryExceptPass), // S110
     RuleSelector::rule(Rule::TryExceptContinue), // S112
     RuleSelector::rule(Rule::DuplicateIsinstanceCall), // SIM101
@@ -704,11 +704,11 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::EmptyTypeCheckingBlock), // TC005
     RuleSelector::rule(Rule::UnquotedTypeAlias), // TC007
     RuleSelector::rule(Rule::RuntimeStringUnion), // TC010
-    RuleSelector::rule(Rule::RaiseVanillaClass), // TRY002
+    RuleSelector::rule(Rule::RaiseExceptionOrBaseException), // TRY002
     RuleSelector::rule(Rule::TypeCheckWithoutTypeError), // TRY004
     RuleSelector::rule(Rule::VerboseRaise), // TRY201
     RuleSelector::rule(Rule::UselessTryExcept), // TRY203
-    RuleSelector::rule(Rule::VerboseLogMessage), // TRY401
+    RuleSelector::rule(Rule::RedundantExceptionInLoggingMessage), // TRY401
     RuleSelector::rule(Rule::UselessMetaclassType), // UP001
     RuleSelector::rule(Rule::TypeOfPrimitive), // UP003
     RuleSelector::rule(Rule::UselessObjectInheritance), // UP004
@@ -720,7 +720,7 @@ pub const DEFAULT_SELECTORS: &[RuleSelector] = &[
     RuleSelector::rule(Rule::UnnecessaryFutureImport), // UP010
     RuleSelector::rule(Rule::LRUCacheWithoutParameters), // UP011
     RuleSelector::rule(Rule::UnnecessaryEncodeUTF8), // UP012
-    RuleSelector::rule(Rule::ConvertNamedTupleFunctionalToClass), // UP014
+    RuleSelector::rule(Rule::FunctionalNamedTuple), // UP014
     RuleSelector::rule(Rule::DatetimeTimezoneUTC), // UP017
     RuleSelector::rule(Rule::NativeLiterals), // UP018
     RuleSelector::rule(Rule::TypingTextStrAlias), // UP019
@@ -984,7 +984,7 @@ mod tests {
         	blocking-input-in-async-function (ASYNC250),
         	abstract-base-class-without-abstract-method (B024),
         	empty-method-without-abstract-decorator (B027),
-        	del-attr-with-constant (B043),
+        	delattr-with-constant (B043),
         	return-in-generator (B901),
         	loop-iterator-mutation (B909),
         	trailing-comma-on-bare-tuple (COM818),
@@ -1013,12 +1013,12 @@ mod tests {
         	duplicate-bases (PLE0241),
         	dict-iter-missing-items (PLE1141),
         	modified-iterating-set (PLE4703),
-        	no-classmethod-decorator (PLR0202),
-        	no-staticmethod-decorator (PLR0203),
+        	non-decorator-classmethod (PLR0202),
+        	non-decorator-staticmethod (PLR0203),
         	swap-with-temporary-variable (PLR1712),
         	unnecessary-lambda (PLW0108),
         	redefined-slots-in-subclass (PLW0244),
-        	replace-str-enum (UP042),
+        	manual-str-enum (UP042),
         	while-one (UP048),
         	deprecated-abc-decorator (UP051),
         	context-manager-iterator (UP052),
@@ -1067,7 +1067,7 @@ mod tests {
 
         Removed in preview:
         [
-        	exec-builtin (S102),
+        	exec (S102),
         ]
         ");
     }

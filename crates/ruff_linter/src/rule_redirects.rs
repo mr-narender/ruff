@@ -14,10 +14,229 @@ pub(crate) fn get_redirect(selector: &str) -> Option<(&'static str, &'static str
 }
 
 /// Former rule names and their current rules.
-pub const RULE_NAME_REDIRECTS: &[(&str, Rule)] = &[(
-    "missing-return-type-undocumented-public-function",
-    Rule::MissingReturnTypePublicFunction,
-)];
+pub const RULE_NAME_REDIRECTS: &[(&str, Rule)] = &[
+    (
+        "missing-return-type-undocumented-public-function",
+        Rule::MissingReturnTypePublicFunction,
+    ),
+    (
+        "blank-line-before-function",
+        Rule::BlankLineBeforeFunctionDocstring,
+    ),
+    (
+        "blank-line-after-function",
+        Rule::BlankLineAfterFunctionDocstring,
+    ),
+    (
+        "incorrect-blank-line-before-class",
+        Rule::IncorrectBlankLineBeforeClassDocstring,
+    ),
+    (
+        "incorrect-blank-line-after-class",
+        Rule::IncorrectBlankLineAfterClassDocstring,
+    ),
+    (
+        "missing-blank-line-after-summary",
+        Rule::IncorrectBlankLineAfterDocstringSummary,
+    ),
+    ("under-indentation", Rule::UnderIndentedDocstringLine),
+    ("over-indentation", Rule::OverIndentedDocstringLine),
+    (
+        "new-line-after-last-paragraph",
+        Rule::MissingNewLineAfterLastDocstringParagraph,
+    ),
+    (
+        "surrounding-whitespace",
+        Rule::WhitespaceAroundDocstringText,
+    ),
+    (
+        "blank-line-before-class",
+        Rule::BlankLineBeforeClassDocstring,
+    ),
+    (
+        "multi-line-summary-first-line",
+        Rule::MultilineDocstringSummaryOnSeparateLine,
+    ),
+    (
+        "multi-line-summary-second-line",
+        Rule::MultilineDocstringSummaryOnFirstLine,
+    ),
+    ("overindented-section", Rule::OverIndentedDocstringSection),
+    (
+        "overindented-section-underline",
+        Rule::OverIndentedDocstringSectionUnderline,
+    ),
+    ("triple-single-quotes", Rule::UnconventionalDocstringQuotes),
+    (
+        "missing-section-underline-after-name",
+        Rule::BlankLineBeforeDocstringSectionUnderline,
+    ),
+    (
+        "no-blank-line-after-section",
+        Rule::MissingBlankLineAfterDocstringSection,
+    ),
+    (
+        "no-blank-line-before-section",
+        Rule::MissingBlankLineBeforeDocstringSection,
+    ),
+    (
+        "missing-blank-line-after-last-section",
+        Rule::MissingBlankLineAfterLastDocstringSection,
+    ),
+    ("undocumented-param", Rule::UndocumentedParameter),
+    ("get-attr-with-constant", Rule::GetattrWithConstant),
+    ("set-attr-with-constant", Rule::SetattrWithConstant),
+    ("del-attr-with-constant", Rule::DelattrWithConstant),
+    ("f-string-in-get-text-func-call", Rule::FStringInGettextCall),
+    ("format-in-get-text-func-call", Rule::FormatInGettextCall),
+    ("printf-in-get-text-func-call", Rule::PrintfInGettextCall),
+    ("exec-builtin", Rule::Exec),
+    ("suspicious-eval-usage", Rule::Eval),
+    ("suspicious-telnet-usage", Rule::SuspiciousTelnetlibUsage),
+    ("suspicious-ftp-lib-usage", Rule::SuspiciousFtplibUsage),
+    ("p-print", Rule::Pprint),
+    ("raw-string-in-exception", Rule::StringLiteralInException),
+    ("dot-format-in-exception", Rule::StrFormatInException),
+    ("logging-exc-info", Rule::LoggingErrorWithExcInfo),
+    ("invalid-get-logger-argument", Rule::FilePathAsLoggerName),
+    (
+        "log-exception-outside-except-handler",
+        Rule::LoggingExceptionOutsideExceptHandler,
+    ),
+    (
+        "exception-without-exc-info",
+        Rule::LoggingExceptionWithFalsyExcInfo,
+    ),
+    (
+        "exc-info-outside-except-handler",
+        Rule::LoggingExcInfoOutsideExceptHandler,
+    ),
+    ("undocumented-warn", Rule::LoggingWarnConstant),
+    ("raise-vanilla-class", Rule::RaiseExceptionOrBaseException),
+    ("raise-vanilla-args", Rule::RaiseExceptionWithMessage),
+    (
+        "error-instead-of-exception",
+        Rule::LoggingErrorInsteadOfException,
+    ),
+    (
+        "verbose-log-message",
+        Rule::RedundantExceptionInLoggingMessage,
+    ),
+    (
+        "boolean-type-hint-positional-argument",
+        Rule::BooleanAnnotatedPositionalParameter,
+    ),
+    (
+        "boolean-default-value-positional-argument",
+        Rule::BooleanDefaultValuePositionalParameter,
+    ),
+    ("invalid-class-name", Rule::NonCamelCaseClassName),
+    ("invalid-function-name", Rule::NonLowercaseFunctionName),
+    ("invalid-argument-name", Rule::NonLowercaseParameterName),
+    (
+        "invalid-first-argument-name-for-class-method",
+        Rule::ClassMethodReceiverNotNamedCls,
+    ),
+    (
+        "invalid-first-argument-name-for-method",
+        Rule::InstanceMethodReceiverNotNamedSelf,
+    ),
+    (
+        "camelcase-imported-as-lowercase",
+        Rule::CamelCaseImportedAsLowercase,
+    ),
+    (
+        "camelcase-imported-as-constant",
+        Rule::CamelCaseImportedAsConstant,
+    ),
+    (
+        "camelcase-imported-as-acronym",
+        Rule::CamelCaseImportedAsAcronym,
+    ),
+    (
+        "error-suffix-on-exception-name",
+        Rule::ExceptionClassWithoutErrorSuffix,
+    ),
+    ("no-classmethod-decorator", Rule::NonDecoratorClassmethod),
+    ("no-staticmethod-decorator", Rule::NonDecoratorStaticmethod),
+    ("no-self-use", Rule::UnusedSelf),
+    (
+        "typed-argument-default-in-stub",
+        Rule::ComplexDefaultForAnnotatedParameterInStub,
+    ),
+    (
+        "argument-default-in-stub",
+        Rule::ComplexDefaultForUnannotatedParameterInStub,
+    ),
+    (
+        "type-alias-without-annotation",
+        Rule::UnannotatedTypeAliasInStub,
+    ),
+    (
+        "no-return-argument-annotation-in-stub",
+        Rule::ParameterAnnotatedWithNoReturn,
+    ),
+    ("redundant-literal-union", Rule::LiteralUnionWithSupertype),
+    ("byte-string-usage", Rule::DeprecatedByteStringType),
+    (
+        "generator-return-from-iter-method",
+        Rule::IterMethodWithGeneratorReturnAnnotation,
+    ),
+    ("runtime-cast-value", Rule::CastWithUnquotedType),
+    (
+        "convert-typed-dict-functional-to-class",
+        Rule::FunctionalTypedDict,
+    ),
+    (
+        "convert-named-tuple-functional-to-class",
+        Rule::FunctionalNamedTuple,
+    ),
+    ("replace-str-enum", Rule::ManualStrEnum),
+    ("prohibited-trailing-comma", Rule::UnnecessaryTrailingComma),
+    (
+        "blank-line-between-methods",
+        Rule::MissingBlankLineBeforeMethod,
+    ),
+    (
+        "blank-lines-top-level",
+        Rule::MissingBlankLinesBeforeTopLevelDefinition,
+    ),
+    (
+        "blank-lines-after-function-or-class",
+        Rule::MissingBlankLinesAfterTopLevelDefinition,
+    ),
+    (
+        "blank-lines-before-nested-definition",
+        Rule::MissingBlankLineBeforeNestedDefinition,
+    ),
+    ("shebang-not-executable", Rule::NonExecutableFileWithShebang),
+    (
+        "shebang-missing-executable-file",
+        Rule::ExecutableFileWithoutShebang,
+    ),
+    ("undefined-local-with-import-star", Rule::StarImport),
+    (
+        "undefined-local-with-import-star-usage",
+        Rule::PossiblyUndefinedNameWithStarImport,
+    ),
+    (
+        "undefined-local-with-nested-import-star-usage",
+        Rule::NonModuleLevelStarImport,
+    ),
+    (
+        "invalid-character-backspace",
+        Rule::UnescapedBackspaceCharacter,
+    ),
+    ("invalid-character-sub", Rule::UnescapedSubstituteCharacter),
+    ("invalid-character-esc", Rule::UnescapedEscapeCharacter),
+    ("invalid-character-nul", Rule::UnescapedNullCharacter),
+    (
+        "invalid-character-zero-width-space",
+        Rule::UnescapedZeroWidthSpaceCharacter,
+    ),
+    ("unused-noqa", Rule::UnusedSuppressionComment),
+    ("redirected-noqa", Rule::RenamedRuleInSuppressionComment),
+];
 
 static REDIRECTS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut redirects = HashMap::from([

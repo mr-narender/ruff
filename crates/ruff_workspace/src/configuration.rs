@@ -319,6 +319,7 @@ impl Configuration {
         let future_annotations = lint.future_annotations.unwrap_or_default();
 
         Ok(Settings {
+            preview: global_preview,
             cache_dir: self
                 .cache_dir
                 .clone()
@@ -663,27 +664,22 @@ impl Configuration {
     #[must_use]
     pub(crate) fn apply_fallbacks(
         mut self,
-        origin: ConfigurationOrigin,
+        origin: ConfigurationOrigin<'_>,
         initial_config_path: &Path,
     ) -> Self {
-        if matches!(origin, ConfigurationOrigin::Ancestor) {
-            self.target_version = self.target_version.or_else(|| {
-                let dir = initial_config_path.parent()?;
-                let fallback = pyproject::find_fallback_target_version(dir)?;
-                debug!("Derived `target-version` from `requires-python`: {fallback:?}");
-                Some(fallback.into())
-            });
+        let directory = match origin {
+            ConfigurationOrigin::Ancestor if self.target_version.is_none() => {
+                initial_config_path.parent()
+            }
+            // The `requires-python` constraint from the `pyproject.toml` takes precedence
+            // over the `target-version` from the user configuration.
+            ConfigurationOrigin::UserSettings { fallback_directory } => Some(fallback_directory),
+            _ => None,
+        };
+        if let Some(version) = directory.and_then(pyproject::find_fallback_target_version) {
+            debug!("Derived `target-version` from `requires-python`: {version:?}");
+            self.target_version = Some(version.into());
         }
-        // If the origin is UserSettings, we need more information
-        // to determine where to search for a fallback target version.
-        // - If Ruff is being invoked via the CLI, then we search in
-        // the cwd.
-        // - If Ruff is being invoked via the server, then we search
-        // in the editor's workspace root.
-        //
-        // This logic is implemented manually, at the time of this
-        // writing 2026-01-30, in `ruff::resolve::resolve` and
-        // `ruff_server::session::index::ruff_settings::RuffSettings::fallback`, respectively.
         self
     }
 }
@@ -1774,7 +1770,9 @@ mod tests {
     use ruff_linter::rule_selector::PreviewOptions;
     use ruff_linter::settings::types::PreviewMode;
 
-    use crate::configuration::{LintConfiguration, RuleSelection};
+    use crate::configuration::{
+        Configuration, FormatConfiguration, LintConfiguration, RuleSelection,
+    };
     use crate::options::PydocstyleOptions;
 
     const PREVIEW_RULES: &[Rule] = &[
@@ -1785,12 +1783,12 @@ mod tests {
         Rule::UnnecessaryEnumerate,
         Rule::MathConstant,
         Rule::PreviewTestRule,
-        Rule::BlankLineBetweenMethods,
-        Rule::BlankLinesTopLevel,
+        Rule::MissingBlankLineBeforeMethod,
+        Rule::MissingBlankLinesBeforeTopLevelDefinition,
         Rule::TooManyBlankLines,
         Rule::BlankLineAfterDecorator,
-        Rule::BlankLinesAfterFunctionOrClass,
-        Rule::BlankLinesBeforeNestedDefinition,
+        Rule::MissingBlankLinesAfterTopLevelDefinition,
+        Rule::MissingBlankLineBeforeNestedDefinition,
     ];
 
     fn resolve_rules(
@@ -2039,6 +2037,28 @@ mod tests {
             Rule::TabIndentation,
         ]);
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn global_preview_is_independent_of_component_preview() -> Result<()> {
+        let settings = Configuration {
+            preview: Some(PreviewMode::Enabled),
+            lint: LintConfiguration {
+                preview: Some(PreviewMode::Disabled),
+                ..LintConfiguration::default()
+            },
+            format: FormatConfiguration {
+                preview: Some(PreviewMode::Disabled),
+                ..FormatConfiguration::default()
+            },
+            ..Configuration::default()
+        }
+        .into_settings(&std::env::temp_dir())?;
+
+        assert!(settings.preview.is_enabled());
+        assert!(!settings.linter.preview.is_enabled());
+        assert!(!settings.formatter.preview.is_enabled());
         Ok(())
     }
 
