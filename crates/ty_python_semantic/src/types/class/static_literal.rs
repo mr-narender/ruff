@@ -9,7 +9,7 @@ use ruff_db::{
 use ruff_python_ast as ast;
 use ruff_python_ast::{PythonVersion, name::Name};
 use ruff_text_size::{Ranged, TextRange};
-use std::cell::RefCell;
+use std::cell::{LazyCell, RefCell};
 
 use super::implicit_attributes::implicit_attribute_names;
 use crate::{
@@ -1938,24 +1938,37 @@ impl<'db> StaticClassLiteral<'db> {
         }
 
         let field_policy = code_generator()?;
-        let pydantic_constructor_fields_are_keyword_only =
-            field_policy.is_pydantic() && pydantic::constructor_fields_are_keyword_only(db, self);
-        let pydantic_constructor_fields_are_optional = name == "__init__"
-            && field_policy.is_pydantic()
-            && pydantic::constructor_fields_are_optional(db, self);
-
-        let instance_ty = Type::instance(
-            db,
-            env,
-            self.apply_optional_specialization(db, specialization),
-        );
+        let instance_ty = LazyCell::new(|| {
+            Type::instance(
+                db,
+                env,
+                self.apply_optional_specialization(db, specialization),
+            )
+        });
 
         let signature_from_fields = |mut parameters: Vec<_>, return_ty: Type<'db>| {
+            let pydantic_constructor_fields_are_keyword_only = field_policy.is_pydantic()
+                && pydantic::constructor_fields_are_keyword_only(db, self);
+            let pydantic_constructor_fields_are_optional = name == "__init__"
+                && field_policy.is_pydantic()
+                && pydantic::constructor_fields_are_optional(db, self);
+
             if name == "__init__" && field_policy.is_pydantic() {
                 pydantic::extend_settings_constructor_parameters(db, self, &mut parameters);
             }
 
-            for (field_name, field) in self.fields(db, specialization, field_policy) {
+            let fields = self.fields(db, specialization, field_policy);
+            let validated_fields = LazyCell::new(|| {
+                let names = fields
+                    .iter()
+                    .filter(|(_, field)| {
+                        matches!(field.kind, FieldKind::Pydantic { init: true, .. })
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                pydantic::fields_with_raw_input_validators(db, self, names)
+            });
+            for (field_name, field) in fields {
                 let (init, mut default_ty, kw_only, alias, converter, strict) = match &field.kind {
                     FieldKind::NamedTuple { default_ty } => (
                         true,
@@ -2067,7 +2080,12 @@ impl<'db> StaticClassLiteral<'db> {
                 {
                     let strict = metadata.field_is_strict(db, strict);
                     field_ty = pydantic::constructor_parameter_type(
-                        db, self, field_name, field_ty, strict,
+                        db,
+                        self,
+                        &validated_fields,
+                        field_name,
+                        field_ty,
+                        strict,
                     );
                 }
 
@@ -2179,7 +2197,7 @@ impl<'db> StaticClassLiteral<'db> {
 
                 let self_parameter = Parameter::positional_or_keyword(Name::new_static("self"))
                     // TODO: could be `Self`.
-                    .with_annotated_type(instance_ty);
+                    .with_annotated_type(*instance_ty);
                 signature_from_fields(vec![self_parameter], Type::none(db, env))
             }
             (
@@ -2200,7 +2218,7 @@ impl<'db> StaticClassLiteral<'db> {
                             env,
                             &TypeMapping::ReplaceSelf {
                                 new_origin: SelfTypeVarOrigin::Class(self.into()),
-                                new_upper_bound: instance_ty,
+                                new_upper_bound: *instance_ty,
                             },
                             TypeContext::default(),
                         )
@@ -2244,10 +2262,10 @@ impl<'db> StaticClassLiteral<'db> {
                     Parameters::standard([
                         Parameter::positional_or_keyword(Name::new_static("self"))
                             // TODO: could be `Self`.
-                            .with_annotated_type(instance_ty),
+                            .with_annotated_type(*instance_ty),
                         Parameter::positional_or_keyword(Name::new_static("other"))
                             // TODO: could be `Self`.
-                            .with_annotated_type(instance_ty),
+                            .with_annotated_type(*instance_ty),
                     ]),
                     KnownClass::Bool.to_instance(db, env),
                 );
@@ -2268,7 +2286,7 @@ impl<'db> StaticClassLiteral<'db> {
                         Parameters::standard([Parameter::positional_or_keyword(Name::new_static(
                             "self",
                         ))
-                        .with_annotated_type(instance_ty)]),
+                        .with_annotated_type(*instance_ty)]),
                         KnownClass::Int.to_instance(db, env),
                     );
 
@@ -2335,16 +2353,16 @@ impl<'db> StaticClassLiteral<'db> {
                 "__replace__",
             ) if env.python_version(db) >= PythonVersion::PY313 => {
                 let self_parameter = Parameter::positional_or_keyword(Name::new_static("self"))
-                    .with_annotated_type(instance_ty);
+                    .with_annotated_type(*instance_ty);
 
-                signature_from_fields(vec![self_parameter], instance_ty)
+                signature_from_fields(vec![self_parameter], *instance_ty)
             }
             (CodeGeneratorKind::DataclassLike(_), "__setattr__") => {
                 if self.is_frozen_dataclass(db) == Some(true) {
                     let signature = Signature::new(
                         Parameters::standard([
                             Parameter::positional_or_keyword(Name::new_static("self"))
-                                .with_annotated_type(instance_ty),
+                                .with_annotated_type(*instance_ty),
                             Parameter::positional_or_keyword(Name::new_static("name")),
                             Parameter::positional_or_keyword(Name::new_static("value")),
                         ]),
@@ -2361,7 +2379,7 @@ impl<'db> StaticClassLiteral<'db> {
                 let signature = Signature::new(
                     Parameters::standard([
                         Parameter::positional_or_keyword(Name::new_static("self"))
-                            .with_annotated_type(instance_ty),
+                            .with_annotated_type(*instance_ty),
                         Parameter::positional_or_keyword(Name::new_static("name")),
                     ]),
                     Type::Never,

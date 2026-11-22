@@ -894,16 +894,25 @@ impl<'db> UnionBuilder<'db> {
                                 UnionElement::Type(existing)
                                     if can_compare_with_literals(*existing) =>
                                 {
+                                    // Neither a string literal nor its complement is a subtype of
+                                    // `type[C]`. The reverse check still matters when the callable
+                                    // used as C's metaclass returns `Never`.
+                                    let is_subclass_of = existing.is_subclass_of();
+
                                     // e.g. `existing` could be `Literal[""] & Any`,
                                     // and `ty` could be `Literal[""]`
-                                    if ty.is_redundant_with(db, &self.env, *existing) {
+                                    if !is_subclass_of
+                                        && ty.is_redundant_with(db, &self.env, *existing)
+                                    {
                                         return;
                                     }
                                     if existing.is_redundant_with(db, &self.env, ty) {
                                         to_remove = Some(index);
                                         continue;
                                     }
-                                    if ty_negated().is_subtype_of(db, &self.env, *existing) {
+                                    if !is_subclass_of
+                                        && ty_negated().is_subtype_of(db, &self.env, *existing)
+                                    {
                                         // The type that includes both this new element, and its negation
                                         // (or a supertype of its negation), must be simply `object`.
                                         self.collapse_to_object();
@@ -1154,8 +1163,11 @@ impl<'db> UnionBuilder<'db> {
     /// A `false` result leaves the decision to the general relation checks.
     ///
     /// Distinct class and module literals identify different objects. Applying the same truthiness
-    /// guard to two class literals preserves that distinction. Methods bound to distinct
-    /// singleton literals also remain distinct because `__self__` exposes their captured receiver:
+    /// guard to two class literals preserves that distinction.
+    ///
+    /// Bound methods expose the underlying function as `__func__`, so distinct function
+    /// literals keep their methods distinct even when the signatures are identical. Similarly,
+    /// `__self__` distinguishes methods bound to different singleton literals:
     ///
     /// ```python
     /// from typing import Literal, LiteralString, reveal_type
@@ -1193,6 +1205,11 @@ impl<'db> UnionBuilder<'db> {
             (Type::Dynamic(_), Type::NominalInstance(instance))
             | (Type::NominalInstance(instance), Type::Dynamic(_))
                 if !instance.is_object() =>
+            {
+                true
+            }
+            (Type::BoundMethod(left), Type::BoundMethod(right))
+                if left.has_distinct_function(db, right) =>
             {
                 true
             }

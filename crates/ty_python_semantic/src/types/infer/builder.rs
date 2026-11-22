@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{LazyCell, OnceCell, RefCell};
 use std::collections::{HashSet, hash_map};
 use std::convert::Infallible;
 use std::rc::Rc;
@@ -1271,7 +1271,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             definition,
                             &function.node(self.module()).decorator_list,
                         );
-                        post_inference::function::check_function_definition(
+                        let checked_function = post_inference::function::check_function_definition(
                             &self.context,
                             definition,
                             &|expr| self.file_expression_type(expr),
@@ -1288,6 +1288,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         post_inference::typeguard::check_type_guard_definition(
                             &self.context,
                             ty,
+                            checked_function,
                             function.node(self.module()),
                         );
                     }
@@ -2358,14 +2359,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             );
         }
 
-        let rhs_scope = self
-            .index
-            .node_scope(NodeWithScopeRef::TypeAlias(type_alias))
-            .to_scope_id(self.db(), self.program_file());
-
         let type_alias_ty =
             Type::KnownInstance(KnownInstanceType::TypeAliasType(TypeAliasType::PEP695(
-                PEP695TypeAliasType::new(self.db(), alias_name, rhs_scope, None, None),
+                PEP695TypeAliasType::new(self.db(), alias_name, definition, None, None),
             )));
 
         self.store_expression_type(&type_alias.name, type_alias_ty);
@@ -5261,7 +5257,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 // Perform loud inference without type context, as there may be multiple
                 // equally applicable type contexts for each union member.
-                infer_value_ty.infer_loud(self, TypeContext::default());
+                let value_ty = infer_value_ty.infer_loud(self, TypeContext::default());
 
                 let mut operation_failed = false;
                 let Ok(result_ty) = state.try_map_union(db, env, union, |elem_type, state| {
@@ -5269,7 +5265,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         assignment,
                         elem_type,
                         value_expr,
-                        &mut |builder, tcx| infer_value_ty.infer_silent(builder, tcx),
+                        &mut |builder, tcx| {
+                            if tcx == TypeContext::default() {
+                                value_ty
+                            } else {
+                                infer_value_ty.infer_silent(builder, tcx)
+                            }
+                        },
                         state,
                     ) {
                         Ok(ty) => ty,
@@ -6968,6 +6970,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         expression: &ast::Expr,
         tcx: TypeContext<'db>,
     ) -> Type<'db> {
+        // A nominal target other than `tuple` supplies no element types to a tuple
+        // literal. Drop it before the cache lookup so overloads expecting, for
+        // example, `list[str]` and `list[bytes]` can share the same inference.
+        let tcx = if expression.is_tuple_expr()
+            && let Some(Type::NominalInstance(expected)) = tcx.expected_type()
+            && !expected.is_exact_tuple()
+        {
+            tcx.with_expected_type(None)
+        } else {
+            tcx
+        };
+
         let Some(expression_cache) = &self.expression_cache else {
             return self.infer_expression_uncached(expression, tcx);
         };
@@ -7470,8 +7484,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_bytes_literal_expression(&mut self, literal: &ast::ExprBytesLiteral) -> Type<'db> {
-        // TODO: ignoring r/R prefixes for now, should normalize bytes values
-        let bytes: Vec<u8> = literal.value.bytes().collect();
+        let bytes: Cow<'_, [u8]> = (&literal.value).into();
         Type::bytes_literal(self.db(), &bytes)
     }
 
@@ -8133,25 +8146,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let db = self.db();
         let env = self.program_environment();
 
-        // Extract the type variable `T` from `list[T]` in typeshed.
-        let elt_tys = |collection_class: KnownClass| {
-            let collection_alias = collection_class
-                .try_to_class_literal(db, env)?
-                .identity_specialization(db)
-                .into_generic_alias()?;
-
-            let generic_context = collection_alias
-                .specialization(self.db())
-                .generic_context(self.db());
-
-            Some((
-                collection_alias,
-                generic_context,
-                generic_context.variables(self.db()),
-            ))
-        };
-
-        let Some((collection_alias, generic_context, elt_tys)) = elt_tys(collection_class) else {
+        let Some((class, generic_context)) = collection_class
+            .try_to_class_literal(db, env)
+            .and_then(|class| Some((class, class.generic_context(db)?)))
+        else {
             // Infer the element types without type context, and fallback to `Unknown` for
             // custom typesheds.
             for elts in elts {
@@ -8164,9 +8162,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         };
 
+        let elt_tys = generic_context.variables(db);
         let constraints = ConstraintSetBuilder::new();
         let inferable = generic_context.inferable_typevars(db);
-        let identity_instance = Type::instance(db, env, ClassType::Generic(collection_alias));
+        let identity_instance =
+            LazyCell::new(|| Type::instance(db, env, class.identity_specialization(db)));
         let mut builder = SpecializationBuilder::new(db, env, &constraints, generic_context);
 
         // Remove any union elements of that are unrelated to the collection type.
@@ -8363,13 +8363,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
 
             if compatible {
-                let class_type = collection_alias.origin(self.db()).apply_specialization(
-                    db,
-                    |generic_context| {
-                        generic_context
-                            .specialize_recursive(db, specialization.into_iter().map(Some))
-                    },
-                );
+                let class_type = class.apply_specialization(db, |generic_context| {
+                    generic_context.specialize_recursive(db, specialization.into_iter().map(Some))
+                });
                 return Type::from(class_type).to_instance_approximation(db, env);
             }
 
@@ -8437,16 +8433,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     .as_divergent()
                 {
                     // Infer `collection[Divergent]` for the initial cycle result.
-                    let divergent_instance = collection_alias
-                        .origin(self.db())
-                        .apply_specialization(db, |generic_context| {
-                            generic_context
-                                .repeat_specialization(self.db(), Type::Divergent(divergent))
-                        });
+                    let divergent_instance = class.apply_specialization(db, |generic_context| {
+                        generic_context.repeat_specialization(self.db(), Type::Divergent(divergent))
+                    });
 
                     builder
                         .infer(
-                            identity_instance,
+                            *identity_instance,
                             Type::instance(db, env, divergent_instance),
                         )
                         .ok()?;
@@ -8458,7 +8451,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             continue;
                         }
 
-                        builder.infer(identity_instance, *constraint).ok()?;
+                        builder.infer(*identity_instance, *constraint).ok()?;
                     }
                 }
             }
@@ -8594,22 +8587,20 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
-        let class_type = collection_alias
-            .origin(self.db())
-            .apply_specialization(db, |_| {
-                builder.build_merged_with(|current_typevar, bounds| {
-                    let lower = bounds?.inference_lower()?;
+        let class_type = class.apply_specialization(db, |_| {
+            builder.build_merged_with(|current_typevar, bounds| {
+                let lower = bounds?.inference_lower()?;
 
-                    let lower = lower.promote_collection_element_type(
-                        db,
-                        env,
-                        tuple_size_promotion_constraints.allow(current_typevar.identity(self.db())),
-                        tcx.expected_type().is_none(),
-                    );
+                let lower = lower.promote_collection_element_type(
+                    db,
+                    env,
+                    tuple_size_promotion_constraints.allow(current_typevar.identity(self.db())),
+                    tcx.expected_type().is_none(),
+                );
 
-                    Some(lower)
-                })
-            });
+                Some(lower)
+            })
+        });
 
         Type::from(class_type).to_instance_approximation(db, env)
     }
