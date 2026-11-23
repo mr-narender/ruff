@@ -1,5 +1,6 @@
 use crate::ProgramEnvironment;
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -17,6 +18,7 @@ use crate::types::relation_error::ErrorRelation;
 use crate::types::set_theoretic::RecursivelyDefined;
 use crate::types::signatures::{ParametersKind, SignatureRelationVisitor};
 use crate::types::tuple::TupleType;
+use crate::types::typed_dict::TypedDictType;
 use crate::types::typevar::TypeVarDomain;
 use crate::types::visitor::any_over_type_expanding_aliases;
 use crate::types::{
@@ -583,7 +585,7 @@ impl<'db> Type<'db> {
     ) -> bool {
         let constraints = ConstraintSetBuilder::new();
         self.when_constraint_set_assignable_to(db, env, target, &constraints)
-            .is_always_satisfied(db, env, TypeVarSet::None)
+            .is_always_satisfied_in_isolation(db, env)
     }
 
     /// Return true if this type is a subtype of `target` for every specialization of the type
@@ -594,7 +596,7 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         target: Type<'db>,
     ) -> bool {
-        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _| false, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _| false, heap_size=ruff_memory_usage::heap_size)]
         fn is_constraint_set_subtype_of_impl<'db>(db: &'db dyn Db, types: TypePair<'db>) -> bool {
             let env = ProgramEnvironment::from_program(types.program(db));
             let constraints = ConstraintSetBuilder::new();
@@ -610,7 +612,7 @@ impl<'db> Type<'db> {
                     TypeVarEvaluation::Lazy,
                     ConstraintProvenance::INFERRED,
                 )
-                .is_always_satisfied(db, &env, TypeVarSet::None)
+                .is_always_satisfied_in_isolation(db, &env)
         }
 
         is_constraint_set_subtype_of_impl(db, TypePair::new(db, env.program(db), self, target))
@@ -660,7 +662,7 @@ impl<'db> Type<'db> {
 
         #[salsa::tracked(
             returns(ref),
-            cycle_initial=|_, _, _| OwnedConstraintSet::always(),
+            cycle_initial=|_, _, _, _| OwnedConstraintSet::always(),
             heap_size=ruff_memory_usage::heap_size,
         )]
         fn when_assignable_to_owned_impl<'db>(
@@ -672,7 +674,7 @@ impl<'db> Type<'db> {
 
         #[salsa::tracked(
             returns(ref),
-            cycle_initial=|_, _, _, _| OwnedConstraintSet::always(),
+            cycle_initial=|_, _, _, _, _| OwnedConstraintSet::always(),
             heap_size=ruff_memory_usage::heap_size,
         )]
         fn when_assignable_to_owned_with_inferable_impl<'db>(
@@ -706,7 +708,7 @@ impl<'db> Type<'db> {
 
     /// Returns `true` if assignability is known to be unconditionally satisfied before
     /// constructing the relation checker.
-    fn is_trivially_assignable_to(self, db: &'db dyn Db, target: Type<'db>) -> bool {
+    pub(super) fn is_trivially_assignable_to(self, db: &'db dyn Db, target: Type<'db>) -> bool {
         if self.materialized_divergent_fallback().is_none() && self == target {
             return true;
         }
@@ -781,7 +783,7 @@ impl<'db> Type<'db> {
 
         #[salsa::tracked(
             returns(ref),
-            cycle_initial=|_, _, _| OwnedConstraintSet::always(),
+            cycle_initial=|_, _, _, _| OwnedConstraintSet::always(),
             heap_size=ruff_memory_usage::heap_size,
         )]
         fn when_constraint_set_assignable_to_owned_impl<'db>(
@@ -799,7 +801,7 @@ impl<'db> Type<'db> {
 
         #[salsa::tracked(
             returns(ref),
-            cycle_initial=|_, _, _, _| OwnedConstraintSet::always(),
+            cycle_initial=|_, _, _, _, _| OwnedConstraintSet::always(),
             heap_size=ruff_memory_usage::heap_size,
         )]
         fn when_constraint_set_assignable_to_owned_with_provenance_impl<'db>(
@@ -870,7 +872,7 @@ impl<'db> Type<'db> {
         // comparison alternate between true and false. Keeping an extra alternative is safe.
         #[salsa::tracked(
             returns(copy),
-            cycle_initial=|_, _, _| true,
+            cycle_initial=|_, _, _, _| true,
             cycle_fn=|_, _, previous: &bool, current: bool, _| *previous && current,
             heap_size=ruff_memory_usage::heap_size,
         )]
@@ -1080,7 +1082,7 @@ impl<'db> Type<'db> {
     ) -> Cow<'db, OwnedConstraintSet<'db>> {
         #[salsa::tracked(
             returns(ref),
-            cycle_initial=|_, _, _| OwnedConstraintSet::always(),
+            cycle_initial=|_, _, _, _| OwnedConstraintSet::always(),
             heap_size=ruff_memory_usage::heap_size,
         )]
         fn when_constraint_set_equivalent_to_impl<'db>(
@@ -1124,7 +1126,7 @@ impl<'db> Type<'db> {
         }
 
         self.when_constraint_set_equivalent_to_owned(db, env, other)
-            .query(|_constraints, when| when.is_always_satisfied(db, env, TypeVarSet::None))
+            .query(|_constraints, when| when.is_always_satisfied_in_isolation(db, env))
     }
 
     fn when_equivalent_to_with_materialization_visitor<'c>(
@@ -1261,14 +1263,26 @@ impl<'db> Type<'db> {
     }
 }
 
-/// A [`CycleDetector`] that is used in `has_relation_to` methods.
-pub(crate) type HasRelationToVisitor<'db, 'c> = CycleDetector<
+type TypePairVisitor<'db, 'c> = CycleDetector<
     'db,
     TypeRelation,
     (Type<'db>, Type<'db>, TypeRelation, TypeVarEvaluation),
     ConstraintSet<'db, 'c>,
     1,
 >;
+
+type TypedDictUnionCache<'db, 'c> = FxHashMap<
+    (TypedDictType<'db>, TypeRelation, TypeVarEvaluation),
+    (UnionType<'db>, ConstraintSet<'db, 'c>),
+>;
+
+/// Results shared within a relation check.
+pub(crate) struct HasRelationToVisitor<'db, 'c> {
+    pairs: TypePairVisitor<'db, 'c>,
+    /// Recursive schemas often compare a source against the same union many times.
+    /// Keep the last reusable union per source and mode to bound memory when targets vary.
+    typed_dict_unions: RefCell<TypedDictUnionCache<'db, 'c>>,
+}
 
 impl<'db> HasIdentity<'db> for (Type<'db>, Type<'db>, TypeRelation, TypeVarEvaluation) {
     type Id = (
@@ -1297,7 +1311,10 @@ impl<'db> HasIdentity<'db> for (Type<'db>, Type<'db>, TypeRelation, TypeVarEvalu
 
 impl<'db, 'c> HasRelationToVisitor<'db, 'c> {
     pub(crate) fn default(constraints: &'c ConstraintSetBuilder<'db>) -> Self {
-        HasRelationToVisitor::new(ConstraintSet::from_bool(constraints, true))
+        Self {
+            pairs: TypePairVisitor::new(ConstraintSet::from_bool(constraints, true)),
+            typed_dict_unions: RefCell::default(),
+        }
     }
 }
 
@@ -1672,12 +1689,36 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             }
         };
 
-        let mut elements_context = vec![];
-        let context_tree = self.context_tree.as_ref().filter(|tree| tree.is_enabled());
+        // Reuse the union result only if every arm we visit already has a completed
+        // TypedDict comparison. Repeating the traversal would then combine the same
+        // constraints in the same order. On the first miss, fall back to ordinary
+        // checking for the rest of the union, since a recursive arm can be provisional.
+        let context_tree = self.report_context();
+        let mut cache_source = source.as_typed_dict().filter(|_| context_tree.is_none());
 
+        let mut elements_context = vec![];
         let result = elements
             .iter()
             .when_any(db, self.constraints, |&element| {
+                // Union membership already handled reflexivity. With context collection
+                // disabled, the pair guard accepts every completed TypedDict result.
+                if cache_source.is_some()
+                    && element.is_typed_dict()
+                    && let Some(result) = self.relation_visitor.pairs.completed(&(
+                        source,
+                        element,
+                        self.relation,
+                        self.typevar_evaluation,
+                    ))
+                {
+                    // Save the slot for a union that needs more than one pair lookup.
+                    if result.is_trivially_always_satisfied() && element == elements[0] {
+                        cache_source = None;
+                    }
+                    return result;
+                }
+                cache_source = None;
+
                 let result = self.check_type_pair(db, source, element);
                 if let Some(context_tree) = context_tree {
                     let context = context_tree.take();
@@ -1724,6 +1765,13 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 }
                 self.without_context_collection(|| self.check_type_pair(db, source, materialized))
             });
+
+        if let Some(source) = cache_source {
+            self.relation_visitor.typed_dict_unions.borrow_mut().insert(
+                (source, self.relation, self.typevar_evaluation),
+                (union, result),
+            );
+        }
 
         if context_tree.is_some()
             && !elements_context.is_empty()
@@ -1994,6 +2042,7 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
     ) -> ConstraintSet<'db, 'c> {
         let collect_context = self.is_context_collection_enabled();
         self.relation_visitor
+            .pairs
             .try_visit(
                 db,
                 (source, target, self.relation, self.typevar_evaluation),
@@ -2284,6 +2333,19 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                     self.check_type_pair(db, source, intersection.expand_aliases(db, env))
                 }),
 
+            // A cached union already passed the alias check below, which scans every arm.
+            (Type::TypedDict(source), Type::Union(union))
+                if !self.is_context_collection_enabled()
+                    && let Some(&(previous, result)) = self
+                        .relation_visitor
+                        .typed_dict_unions
+                        .borrow()
+                        .get(&(source, self.relation, self.typevar_evaluation))
+                    && previous == union =>
+            {
+                result
+            }
+
             // Annotation unions retain type aliases so recursive aliases can be represented.
             // Normalize direct alias elements together before checking the union so reductions
             // that depend on multiple elements, such as all members of an enum, are visible.
@@ -2293,6 +2355,36 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
                 })
             }
 
+            _ => self.check_normalized_type_pair(db, source, target),
+        }
+    }
+
+    // Keep the large dispatch below off the stack while unfolding recursive aliases.
+    fn check_normalized_type_pair(
+        &self,
+        db: &'db dyn Db,
+        source: Type<'db>,
+        target: Type<'db>,
+    ) -> ConstraintSet<'db, 'c> {
+        let env = self.env;
+        match (source, target) {
+            (
+                Type::Never
+                | Type::RecursiveVar(_)
+                | Type::Divergent(_)
+                | Type::Recursive(_)
+                | Type::TypeAlias(_),
+                _,
+            )
+            | (
+                _,
+                Type::RecursiveVar(_)
+                | Type::Divergent(_)
+                | Type::Recursive(_)
+                | Type::TypeAlias(_),
+            ) => {
+                unreachable!("handled before checking normalized types")
+            }
             (Type::TypeForm(source_typeform), Type::TypeForm(target_typeform)) => self
                 .with_recursion_guard(db, source, target, || {
                     self.check_type_pair(

@@ -654,6 +654,30 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
             .is_always_satisfied(db, env, &mut storage, inferable, self.source_order)
     }
 
+    /// Checks a relation in a builder that will be discarded after the check.
+    ///
+    /// On an all-negative path, the only rule that can cause a conflict is a tautology.
+    /// Every other sequent needs a positive premise, and only positive bounds contribute
+    /// to candidate solutions. In a shared builder, discovering those sequents can still
+    /// intern constraints whose order matters to later bounded searches.
+    pub(super) fn is_always_satisfied_in_isolation(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
+        let mut storage = self.builder.storage.borrow_mut();
+        if !self.node.is_terminal()
+            && let Some(atoms) = self.node.all_negative_path_to_false(&storage)
+            && atoms
+                .iter()
+                .all(|&atom| !storage.atomic_constraint_data(atom).is_tautology(db))
+        {
+            return false;
+        }
+        self.node
+            .is_always_satisfied(db, env, &mut storage, TypeVarSet::None, self.source_order)
+    }
+
     /// Like [`Self::is_always_satisfied`], but returns `None` if the default solution budget is
     /// exhausted before the result is known.
     pub(super) fn is_always_satisfied_bounded(
@@ -3746,7 +3770,7 @@ impl<'db> Type<'db> {
 
 #[salsa::tracked(
     returns(ref),
-    cycle_initial=|_, _, _, _, _, _, _| CandidateSolutions::Unsatisfiable,
+    cycle_initial=|_, _, _, _, _, _, _, _| CandidateSolutions::Unsatisfiable,
     heap_size=ruff_memory_usage::heap_size,
 )]
 fn assignable_solutions_impl<'db>(
@@ -3775,7 +3799,7 @@ fn assignable_solutions_impl<'db>(
 
 #[salsa::tracked(
     returns(copy),
-    cycle_initial = |_, _, _| true,
+    cycle_initial = |_, _, _, _| true,
     heap_size = get_size2::GetSize::get_heap_size
 )]
 fn is_possibly_constraint_set_assignable<'db>(db: &'db dyn Db, types: TypePair<'db>) -> bool {
@@ -3976,12 +4000,13 @@ impl<'db> CandidateSolutions<'db> {
         unspecialized_type_var_policy: UnspecializedTypeVarPolicy,
         search: CandidateSearch,
     ) -> ControlFlow<L::Break, Self> {
-        let source_orders = storage.calculate_source_orders(source_order);
+        let mut source_orders = None;
         if let Some(path_bounds) = Self::compute_simple_bound_conjunction(
             db,
             env,
             storage,
-            &source_orders,
+            source_order,
+            &mut source_orders,
             node,
             inferable,
             &mut limits,
@@ -3994,6 +4019,8 @@ impl<'db> CandidateSolutions<'db> {
             return ControlFlow::Continue(path_bounds);
         }
 
+        let source_orders =
+            source_orders.unwrap_or_else(|| storage.calculate_source_orders(source_order));
         let mut walker = SolutionWalker::new(db, storage, source_orders, inferable, limits, node)
             .with_unspecialized_type_var_policy(unspecialized_type_var_policy)
             .with_search(search);
@@ -4028,7 +4055,8 @@ impl<'db> CandidateSolutions<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
-        source_orders: &FxIndexSet<AtomicConstraintId>,
+        source_order: Option<SourceOrderId>,
+        source_orders: &mut Option<FxIndexSet<AtomicConstraintId>>,
         node: NodeId,
         inferable: TypeVarSet<'db>,
         limits: &mut L,
@@ -4042,7 +4070,7 @@ impl<'db> CandidateSolutions<'db> {
                 && !mentions_typevar(bound)
         };
 
-        let mut constraints = Vec::default();
+        let mut constraints = SmallVec::<[_; 1]>::new();
         let mut current = node;
         loop {
             limits.visit_node()?;
@@ -4079,13 +4107,16 @@ impl<'db> CandidateSolutions<'db> {
                         return ControlFlow::Continue(None);
                     }
 
-                    constraints.push((
-                        constraint,
+                    // No other bound can precede or follow a lone constraint.
+                    let order = if constraints.is_empty() && interior.if_true == ALWAYS_TRUE {
+                        0
+                    } else {
                         source_orders
+                            .get_or_insert_with(|| storage.calculate_source_orders(source_order))
                             .get_index_of(&constraint_id)
-                            .expect("every TDD constraint should have a source order"),
-                    ));
-
+                            .expect("every TDD constraint should have a source order")
+                    };
+                    constraints.push((typevar, constraint, order));
                     current = interior.if_true;
                 }
             }
@@ -4093,26 +4124,12 @@ impl<'db> CandidateSolutions<'db> {
 
         let mut mappings: FxIndexMap<BoundTypeVarInstance<'db>, CandidateTypeVarSolver<'db>> =
             FxIndexMap::default();
-        constraints.sort_by_key(|(_, source_order)| *source_order);
-        for (constraint, _) in constraints {
-            match constraint {
-                AtomicConstraint::ConcreteLower(lower) => {
-                    let bounds = mappings.entry(lower.typevar).or_default();
-                    bounds.add_lower(lower.provenance, lower.bound);
-                }
-                AtomicConstraint::ConcreteUpper(upper) => {
-                    let bounds = mappings.entry(upper.typevar).or_default();
-                    bounds.add_upper(upper.provenance, upper.bound);
-                }
-                AtomicConstraint::ConcreteEquivalence(equivalence) => {
-                    let bounds = mappings.entry(equivalence.typevar).or_default();
-                    bounds.add_lower(equivalence.provenance, equivalence.bound);
-                    bounds.add_upper(equivalence.provenance, equivalence.bound);
-                }
-                AtomicConstraint::TypeVarRange(_) | AtomicConstraint::TypeVarEquivalence(_) => {
-                    panic!("typevar constraint should have been filtered out");
-                }
-            }
+        constraints.sort_by_key(|(_, _, order)| *order);
+        for (typevar, constraint, _) in constraints {
+            mappings
+                .entry(typevar)
+                .or_default()
+                .add_constraint(db, typevar, constraint);
         }
 
         // Add the declared upper bounds of each typevar in this fast-path solution. This fast path
@@ -6332,6 +6349,27 @@ class E: ...
 
         assert!(tautology.is_always_satisfied(db, &env, TypeVarSet::None));
         assert!(!tautology.is_trivially_always_satisfied());
+    }
+
+    #[test]
+    fn a_tautology_rules_out_an_all_negative_counterexample() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let [t, u, v] = ["T", "U", "V"].map(|name| create_typevar(db, name));
+
+        // T ≤ U or T ≤ V can be false, but T ≤ U or T ≤ T always holds.
+        for (right, always) in [(v, false), (t, true)] {
+            let builder = ConstraintSetBuilder::new();
+            let bound = |other| {
+                let range = TypeVarRangeBound::new(db, ConstraintProvenance::INFERRED, t, other);
+                let (node, order) = Constraint::Atomic(AtomicConstraint::TypeVarRange(range))
+                    .new_node(db, &env, &mut builder.storage.borrow_mut());
+                ConstraintSet::from_node(&builder, node, order)
+            };
+            let set = bound(u).or(db, &builder, || bound(right));
+            assert_eq!(set.is_always_satisfied_in_isolation(db, &env), always);
+        }
     }
 
     #[test]

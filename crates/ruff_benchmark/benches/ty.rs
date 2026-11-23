@@ -1653,6 +1653,96 @@ fn benchmark_typed_dict_get_large_literal_union(criterion: &mut Criterion) {
     );
 }
 
+fn benchmark_typed_dict_union_assignability(criterion: &mut Criterion) {
+    let variants = |name: &str, count| {
+        (0..count)
+            .map(|i| format!("{name}[Literal[{i}]]"))
+            .join(", ")
+    };
+
+    // Each source only matches Default. Checking child before tag compares Leaf to Nodes
+    // for every source and target pair. The trailing None prevents caching the whole union
+    // result, so each comparison walks all the arms even when the Node results are cached.
+    let [nodes, sources, targets] = ["Node", "Source", "Target"].map(|name| variants(name, 160));
+    let nullable = format!(
+        "
+        from typing import Literal, TypedDict, Union
+
+        class Leaf(TypedDict):
+            extra: int
+
+        class Node[T](TypedDict):
+            value: T
+
+        Nodes = Union[{nodes}, None]
+
+        class Source[T](TypedDict):
+            child: Leaf
+            tag: T
+
+        class Target[T](TypedDict):
+            child: Nodes
+            tag: T
+
+        class Default(TypedDict):
+            child: Leaf
+
+        Sources = Union[{sources}]
+        Targets = Union[{targets}, Default]
+
+        def assign(source: Sources) -> Targets:
+            return source
+        "
+    );
+    benchmark_micro_case(
+        criterion,
+        "ty_micro[nullable_typed_dict_union_assignability]",
+        &nullable,
+    );
+
+    // The envelopes compare the same two recursive schemas before checking their tags.
+    // Once the individual comparisons complete, each source node can reuse its result
+    // against the entire target schema.
+    let [sources, targets, source_envelopes, target_envelopes] =
+        ["Source", "Target", "SourceEnvelope", "TargetEnvelope"].map(|name| variants(name, 59));
+    let recursive = format!(
+        "
+        from typing import Literal, NotRequired, TypedDict, Union
+        from typing_extensions import ReadOnly
+
+        class Source[T](TypedDict):
+            tag: T
+            child: ReadOnly[NotRequired['Sources']]
+
+        class Target[T](TypedDict):
+            tag: T
+            child: ReadOnly[NotRequired['Targets']]
+
+        Sources = Union[{sources}]
+        Targets = Union[{targets}]
+
+        class SourceEnvelope[T](TypedDict):
+            child: ReadOnly[Sources]
+            tag: T
+
+        class TargetEnvelope[T](TypedDict):
+            child: ReadOnly[Targets]
+            tag: T
+
+        SourceEnvelopes = Union[{source_envelopes}]
+        TargetEnvelopes = Union[{target_envelopes}]
+
+        def assign(source: SourceEnvelopes) -> TargetEnvelopes:
+            return source
+        "
+    );
+    benchmark_micro_case(
+        criterion,
+        "ty_micro[recursive_typed_dict_union_assignability]",
+        &recursive,
+    );
+}
+
 fn benchmark_union_construction(criterion: &mut Criterion) {
     const NUM_CLASSES: usize = 256;
 
@@ -2114,6 +2204,17 @@ fn benchmark_literal_match_fallthrough(criterion: &mut Criterion) {
         "ty_micro[literal_match_fallthrough]",
         &literal_match_fallthrough_code(false),
     );
+}
+
+/// Each failed case adds another literal exclusion to the type of `opcode`.
+fn benchmark_int_match_fallthrough(criterion: &mut Criterion) {
+    let mut code = String::from("def decode(opcode: int) -> int:\n    match opcode:\n");
+    for opcode in 0..128 {
+        writeln!(code, "        case {opcode}: return {opcode}").unwrap();
+    }
+    code.push_str("    return opcode\n");
+
+    benchmark_micro_case(criterion, "ty_micro[int_match_fallthrough]", &code);
 }
 
 /// Benchmarks guarded `match` fallthrough over a gradual literal subject.
@@ -2721,6 +2822,25 @@ fn benchmark_repeated_statement_calls(criterion: &mut Criterion) {
     }
 }
 
+/// Each call adds a reachability constraint for the next statement. Passing an extra argument
+/// forces a diagnostic at every call, so scanning all ranges for each diagnostic is quadratic.
+fn benchmark_diagnostic_range_reachability(criterion: &mut Criterion) {
+    const CALLS: usize = 4_000;
+    let code = format!(
+        "def f(value: str) -> None:\n{}",
+        "    value.upper(0)\n".repeat(CALLS)
+    );
+
+    setup_rayon();
+    criterion.bench_function("ty_micro[diagnostic_range_reachability]", |b| {
+        b.iter_batched_ref(
+            || setup_micro_case(&code),
+            |case| assert_eq!(case.db.check().len(), CALLS),
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 /// Exercises repeated control-flow gates with and without interleaved statement-call predicates.
 ///
 /// Each suppressing context manager merges the old binding with a reassigned binding. Repeating
@@ -3014,6 +3134,7 @@ criterion_group!(
     benchmark_paramspec_bounded_overloads,
     benchmark_vararg_parameter_type_accumulation,
     benchmark_typed_dict_get_large_literal_union,
+    benchmark_typed_dict_union_assignability,
     benchmark_very_large_tuple,
     benchmark_nested_tuple_comparison,
     benchmark_union_construction,
@@ -3022,6 +3143,7 @@ criterion_group!(
     benchmark_class_or_pattern_captures,
     benchmark_large_isinstance_narrowing,
     benchmark_literal_match_fallthrough,
+    benchmark_int_match_fallthrough,
     benchmark_literal_match_fallthrough_guarded_any,
     benchmark_literal_equality_fallthrough_guarded_any,
     benchmark_enum_union_equality,
@@ -3037,6 +3159,7 @@ criterion_group!(
     benchmark_nested_mapping_pattern_exhaustiveness,
     benchmark_typeis_narrowing,
     benchmark_repeated_statement_calls,
+    benchmark_diagnostic_range_reachability,
     benchmark_repeated_suppressing_context_managers,
     benchmark_repeated_narrowed_assignments,
 );

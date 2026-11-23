@@ -430,7 +430,7 @@ fn factory_name_argument(arguments: &ast::Arguments) -> Option<&ast::Expr> {
 /// Inferring the argument can re-enter the object's `__name__` lookup. Start cycle recovery
 /// with no literal so the lookup can use `str`.
 #[salsa::tracked(
-    cycle_initial=|_, _, _| None,
+    cycle_initial=|_, _, _, _| None,
     heap_size=ruff_memory_usage::heap_size,
 )]
 fn factory_name_literal<'db>(
@@ -3009,7 +3009,7 @@ impl<'db> Type<'db> {
 
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|_, id, _, _, materialization_kind| {
+        cycle_initial=|_, id, _, _, _, materialization_kind| {
             Type::Divergent(DivergentType::new(id).materialized(materialization_kind))
         },
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, program, _| {
@@ -3116,7 +3116,17 @@ impl<'db> Type<'db> {
     }
 
     /// Resolve aliases and recursive binders at the outermost level.
+    #[inline]
     fn resolve_type_alias(self, db: &'db dyn Db) -> Type<'db> {
+        match self {
+            Type::TypeAlias(_) | Type::Recursive(_) | Type::RecursiveVar(_) => {
+                self.resolve_type_alias_chain(db)
+            }
+            _ => self,
+        }
+    }
+
+    fn resolve_type_alias_chain(self, db: &'db dyn Db) -> Type<'db> {
         let mut ty = self;
         let mut seen = SmallVec::<[Type<'db>; 4]>::new();
         loop {
@@ -4483,7 +4493,7 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         policy: MemberLookupPolicy,
     ) -> Option<PlaceAndQualifiers<'db>> {
-        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
         fn lookup_dunder_new_inner<'db>(
             db: &'db dyn Db,
             program: Program<'db>,
@@ -4530,7 +4540,7 @@ impl<'db> Type<'db> {
 
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|_, id, _| Place::bound(Type::divergent(id)).into(),
+        cycle_initial=|_, id, _, _| Place::bound(Type::divergent(id)).into(),
         cycle_fn=|db, cycle, previous: &PlaceAndQualifiers<'db>, member: PlaceAndQualifiers<'db>, key: MemberLookupKey<'db>| {
             member.cycle_normalized(db, &ProgramEnvironment::from_program(key.program(db)), *previous, cycle)
         },
@@ -5234,7 +5244,7 @@ impl<'db> Type<'db> {
         instance: Option<Type<'db>>,
         owner: Type<'db>,
     ) -> Result<Option<DescriptorGetResult<'db>>, DescriptorGetError<'db>> {
-        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _, _, _| Ok(None), heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _, _, _, _| Ok(None), heap_size=ruff_memory_usage::heap_size)]
         fn try_call_dunder_get_inner<'db>(
             db: &'db dyn Db,
             program: Program<'db>,
@@ -5649,7 +5659,7 @@ impl<'db> Type<'db> {
     // Recursive aliases use `true`, the identity for the all-of classifications above.
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|_, _, _, _| true,
+        cycle_initial=|_, _, _, _, _| true,
         heap_size=ruff_memory_usage::heap_size
     )]
     fn is_definitely_non_data_descriptor_impl(
@@ -5685,7 +5695,7 @@ impl<'db> Type<'db> {
     // Seed recursive aliases with the corresponding identity value.
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|_, _, _, _, any_of_union: bool| !any_of_union,
+        cycle_initial=|_, _, _, _, _, any_of_union: bool| !any_of_union,
         heap_size=ruff_memory_usage::heap_size
     )]
     fn is_data_descriptor_impl(
@@ -6088,7 +6098,7 @@ impl<'db> Type<'db> {
     ) -> MemberLookupResult<'db> {
         #[salsa::tracked(
             returns(copy),
-            cycle_initial=|_, id, _| Place::bound(Type::divergent(id)).into(),
+            cycle_initial=|_, id, _, _| Place::bound(Type::divergent(id)).into(),
             cycle_fn=|db, cycle, previous: &MemberLookupResult<'db>, member: MemberLookupResult<'db>, key: MemberLookupKey<'db>| {
                 cycle_normalized_member_lookup(db, &ProgramEnvironment::from_program(key.program(db)), member, *previous, cycle)
             },
@@ -6103,7 +6113,7 @@ impl<'db> Type<'db> {
 
         #[salsa::tracked(
             returns(copy),
-            cycle_initial=|_, id, _, _| Place::bound(Type::divergent(id)).into(),
+            cycle_initial=|_, id, _, _, _| Place::bound(Type::divergent(id)).into(),
             cycle_fn=|db, cycle, previous: &MemberLookupResult<'db>, member: MemberLookupResult<'db>, key: MemberLookupKey<'db>, _| {
                 cycle_normalized_member_lookup(db, &ProgramEnvironment::from_program(key.program(db)), member, *previous, cycle)
             },
@@ -6176,14 +6186,9 @@ impl<'db> Type<'db> {
                         .nominal_class(db, env)
                         .map(|class| class.class_literal(db))
                         .and_then(|class| class.into_enum_class(db)),
-                } && let Some(resolved_name) = enum_class.resolve_member(db, name)
+                } && let Some(member) = enum_class.member_type(db, env, name)
                 {
-                    return Place::bound(Type::enum_literal(EnumLiteralType::new(
-                        db,
-                        enum_class,
-                        resolved_name,
-                    )))
-                    .into();
+                    return Place::bound(member).into();
                 }
 
                 let fallback = this.instance_member(db, env, name_str);
@@ -6720,7 +6725,7 @@ impl<'db> Type<'db> {
                 Type::LiteralValue(literal)
                     if matches!(name_str, "name" | "_name_" | "value" | "_value_")
                         && let Some(enum_literal) = literal.as_enum()
-                        && !enums::class_defines_property(
+                        && !enums::class_overrides_enum_attribute(
                             db,
                             env,
                             enum_literal.enum_class(db),
@@ -6760,7 +6765,12 @@ impl<'db> Type<'db> {
                     if matches!(name_str, "name" | "_name_" | "value" | "_value_")
                         && let class_literal = instance.class_literal(db, env)
                         && let Some(metadata) = enum_metadata(db, class_literal)
-                        && !enums::class_defines_property(db, env, class_literal, name_str) =>
+                        && !enums::class_overrides_enum_attribute(
+                            db,
+                            env,
+                            class_literal,
+                            name_str,
+                        ) =>
                 {
                     let is_enum_subclass = Type::ClassLiteral(class_literal).is_subtype_of(
                         db,
@@ -6864,14 +6874,9 @@ impl<'db> Type<'db> {
                         _ => None,
                     };
                     if let Some(enum_class) = enum_class
-                        && let Some(resolved_name) = enum_class.resolve_member(db, name)
+                        && let Some(member) = enum_class.member_type(db, env, name)
                     {
-                        return Place::bound(Type::enum_literal(EnumLiteralType::new(
-                            db,
-                            enum_class,
-                            resolved_name,
-                        )))
-                        .into();
+                        return Place::bound(member).into();
                     }
 
                     let class_attr_plain = this.class_object_member(db, env, name_str, policy);
@@ -7284,9 +7289,19 @@ impl<'db> Type<'db> {
                         .overloads
                         .iter()
                         .all(Signature::has_implicit_positional_receiver_annotation);
-                // Synthesized signatures can contain `Self` without a function's generic
-                // context, so substitute it when capturing the receiver.
-                if bound_method.function(db).is_none()
+                // TODO: Remove this fallback once generic decorators preserve method type
+                // variables: https://github.com/astral-sh/ty/issues/3186. A decorator can leave a
+                // type variable in the receiver without a generic context that can infer it.
+                // Declared aliases retain their definition, and generated `Self` methods have a
+                // generic context, so their receivers still participate in argument checking.
+                let receiver_needs_eager_binding = signature.overloads.iter().all(|overload| {
+                    overload.definition.is_none()
+                        && overload.generic_context.is_none()
+                        && overload.parameters().get(0).is_some_and(|parameter| {
+                            parameter.annotated_type().has_typevar(db, env)
+                        })
+                });
+                if receiver_needs_eager_binding
                     || protocol_receiver_is_specialized
                     || signature_receiver != self_instance
                 {
@@ -9936,7 +9951,7 @@ impl<'db> Type<'db> {
 
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|_, id, _, _, _| Type::divergent(id),
+        cycle_initial=|_, id, _, _, _, _| Type::divergent(id),
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, specialization: Specialization<'db>, _| {
             let env = ProgramEnvironment::from_program(
                 specialization.generic_context(db).program(db),
@@ -10872,7 +10887,7 @@ impl<'db> Type<'db> {
 
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|_, id, _, _| Type::divergent(id),
+        cycle_initial=|_, id, _, _, _| Type::divergent(id),
         cycle_fn=|db, cycle, previous: &Type<'db>, value: Type<'db>, _, program| {
             value.cycle_normalized_impl(db, &ProgramEnvironment::from_program(program), *previous, cycle)
         },
@@ -12757,9 +12772,14 @@ impl<'db> ModuleLiteralType<'db> {
 
     fn resolve_submodule(self, db: &'db dyn Db, name: &str) -> Option<Type<'db>> {
         let importing_file = self.importing_file(db)?;
-        let relative_submodule_name = ModuleName::new(name)?;
-        let mut absolute_submodule_name = self.module(db).name(db).clone();
-        absolute_submodule_name.extend(&relative_submodule_name);
+        let relative_submodule_name = ModuleName::from_components([name])?;
+        let absolute_submodule_name = self.module(db).name(db).join(&relative_submodule_name);
+        if !semantic_index(db, importing_file)
+            .imported_modules()
+            .contains(&absolute_submodule_name)
+        {
+            return None;
+        }
         let submodule = resolve_module(
             db,
             ImportingFile::File(
@@ -12861,9 +12881,7 @@ impl<'db> ModuleLiteralType<'db> {
         // the parent module's `__init__.py` file being evaluated. That said, we have
         // chosen to always have the submodule take priority. (This matches pyright's
         // current behavior, but is the opposite of mypy's current behavior.)
-        if self.available_submodule_attributes(db).contains(name)
-            && let Some(submodule) = self.resolve_submodule(db, name)
-        {
+        if let Some(submodule) = self.resolve_submodule(db, name) {
             return Place::bound(submodule).into();
         }
 

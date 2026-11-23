@@ -85,7 +85,7 @@ use crate::types::{
     DATACLASS_FLAGS, DataclassFlags, DataclassParams, DynamicType, GenericAlias,
     InternedConstraintSet, IntersectionType, KnownBoundMethodType, KnownClass, KnownInstanceType,
     LiteralValueTypeKind, NominalInstanceType, ParamSpecValue, PropertyInstanceType, RecursiveType,
-    StringLiteralType, TypeAliasType, TypeContext, TypeIdentity, TypeMapping,
+    StringLiteralType, TypeAliasType, TypeContext, TypeIdentity, TypeMapping, TypePair,
     TypeVarBoundOrConstraints, TypeVarVariance, UnionAccumulator, UnionBuilder, UnionType,
     WrapperDescriptorKind, enums, factory_name_literal, is_property_method, list_members,
 };
@@ -2867,23 +2867,10 @@ impl<'db> Bindings<'db> {
                         }
 
                         _ => {
-                            // Ideally, either the implementation, or exactly one of the overloads
-                            // of the function can have the dataclass_transform decorator applied.
-                            // However, we do not yet enforce this, and in the case of multiple
-                            // applications of the decorator, we will only consider the last one.
-                            let transformer_params = function_type
-                                .iter_overloads_and_implementation(db)
-                                .rev()
-                                .find_map(|function_overload| {
-                                    function_overload.dataclass_transformer_params(db)
-                                });
-
-                            if let Some(params) = transformer_params {
+                            if let Some(dataclass_params) = function_type.dataclass_params(db) {
                                 // If this function was called with a keyword argument like
                                 // `order=False`, we extract the argument type and overwrite
                                 // the corresponding flag in `dataclass_params`.
-                                let dataclass_params =
-                                    DataclassParams::from_transformer_params(db, params);
                                 let mut flags = dataclass_params.flags(db);
 
                                 for (param, flag) in DATACLASS_FLAGS {
@@ -4509,6 +4496,10 @@ impl<'db> CallableBinding<'db> {
     /// [`Unknown`]: crate::types::DynamicType::Unknown
     /// [`mark_as_unmatched_overload`]: Binding::mark_as_unmatched_overload
     /// [1]: https://typing.python.org/en/latest/spec/overload.html#overload-call-evaluation
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "Salsa supplies None when an overload comparison participates in a cycle"
+    )]
     fn filter_overloads_using_any_or_unknown(
         &mut self,
         db: &'db dyn Db,
@@ -4517,6 +4508,28 @@ impl<'db> CallableBinding<'db> {
         arguments: &CallArguments<'_, 'db>,
         matching_overload_indexes: &[usize],
     ) {
+        /// Step 5 compares specialized types without inferring any type variables. Calls
+        /// with different arguments can still compare the same parameters or return types.
+        #[salsa::tracked(returns(copy), cycle_result=|_, _, _| None, heap_size=ruff_memory_usage::heap_size)]
+        fn equivalent_overload_types<'db>(db: &'db dyn Db, pair: TypePair<'db>) -> Option<bool> {
+            let env = &ProgramEnvironment::from_program(pair.program(db));
+            Some(
+                pair.first(db)
+                    .when_equivalent_to(db, env, pair.second(db), &ConstraintSetBuilder::new())
+                    .is_always_satisfied(db, env, TypeVarSet::None),
+            )
+        }
+
+        let equivalent = |first: Type<'db>, second: Type<'db>| {
+            first == second
+                || equivalent_overload_types(db, TypePair::new(db, env.program(db), first, second))
+                    .unwrap_or_else(|| {
+                        first
+                            .when_equivalent_to(db, env, second, constraints)
+                            .is_always_satisfied(db, env, TypeVarSet::None)
+                    })
+        };
+
         let matching_overload_slots = matching_overload_indexes
             .iter()
             .map(|&index| {
@@ -4564,10 +4577,7 @@ impl<'db> CallableBinding<'db> {
                     overload_slots.get(slot_index).map(|slot| slot.parameter);
                 match (first_parameter_type, current_parameter_type) {
                     (Some(first_parameter_type), Some(current_parameter_type)) => {
-                        if !first_parameter_type
-                            .when_equivalent_to(db, env, current_parameter_type, constraints)
-                            .is_always_satisfied(db, env, TypeVarSet::None)
-                        {
+                        if !equivalent(first_parameter_type, current_parameter_type) {
                             participating_slot_indices.push(slot_index);
                             break;
                         }
@@ -4612,10 +4622,7 @@ impl<'db> CallableBinding<'db> {
                 .map(|(_, overload)| overload.return_type())
             {
                 matching_overloads.all(|(_, overload)| {
-                    overload
-                        .return_type()
-                        .when_equivalent_to(db, env, first_overload_return_type, constraints)
-                        .is_always_satisfied(db, env, TypeVarSet::None)
+                    equivalent(overload.return_type(), first_overload_return_type)
                 })
             } else {
                 // No matching overload
@@ -7934,11 +7941,25 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         // We still update the actual type of the parameter in this binding to match the argument,
         // even if the argument type is not assignable to the expected parameter type.
         //
-        // For a broad variadic sink such as `*args: object` or `**kwargs: object`, preserving a
-        // union of every individual argument type does not improve call checking or special-case
-        // return inference. Keep the already-declared top type instead of repeatedly growing a
-        // large union.
-        if (parameter.is_variadic() || parameter.is_keyword_variadic()) && expected_ty.is_object() {
+        // Generic inference and argument checking use the individual arguments. For an
+        // ordinary function the combined variadic type doesn't affect the return type,
+        // so keep the expected type as we do for variadics accepting `object`.
+        // A dataclass transform can use it to recognize a class passed through `*args`.
+        // Leave overloads alone because any of them could carry the transform.
+        if (parameter.is_variadic() || parameter.is_keyword_variadic())
+            && (expected_ty.is_object()
+                || self
+                    .signature_type
+                    .as_function_literal()
+                    .is_some_and(|function| {
+                        let ([], Some(definition)) = function.overloads_and_implementation(db)
+                        else {
+                            return false;
+                        };
+                        definition.known(db).is_none()
+                            && definition.dataclass_transformer_params(db).is_none()
+                    }))
+        {
             self.parameter_tys[parameter_index].get_or_insert(expected_ty);
             return;
         }
@@ -9316,7 +9337,7 @@ impl<'db> Binding<'db> {
         /// with the same generic context and inferred arguments has the same parameter context.
         #[salsa::tracked(
             returns(as_ref),
-            cycle_initial = |_, _, _| None,
+            cycle_initial = |_, _, _, _| None,
             heap_size = ruff_memory_usage::heap_size,
         )]
         fn inferred_parameter_context<'db>(
