@@ -68,6 +68,7 @@ use crate::types::constraints::ConstraintSet;
 use crate::types::context::InferContext;
 use crate::types::cyclic::ActiveRecursionDetector;
 
+use crate::types::dedicated::attrs;
 use crate::types::generics::{
     GenericContext, Specialization, typing_self, walk_specialization_types,
 };
@@ -79,13 +80,12 @@ use crate::types::known_instance::DeprecatedInstance;
 use crate::types::narrow::ClassInfoConstraintFunction;
 use crate::types::relation::TypeRelationChecker;
 use crate::types::signatures::{CallableSignature, ReturnCallableTypeVarScope, Signature};
-use crate::types::typevar::TypeVarNonce;
 use crate::types::variance::{VarianceInferable, VarianceOrigin, VarianceTerm};
 use crate::types::{
     ApplyTypeMappingVisitor, BoundMethodType, BoundTypeVarIdentity, BoundTypeVarInstance,
-    CallableType, ClassType, DataclassParams, FindLegacyTypeVarsVisitor, KnownClass,
-    MemberLookupPolicy, SubclassOfInner, SubclassOfType, Type, TypeContext, TypeMapping, UnionType,
-    binding_type, definition_expression_type,
+    CallableType, ClassType, DataclassFlags, DataclassParams, FindLegacyTypeVarsVisitor,
+    KnownClass, MemberLookupPolicy, SubclassOfInner, SubclassOfType, Type, TypeContext,
+    TypeMapping, UnionType, binding_type, definition_expression_type,
 };
 use crate::{Db, FxOrderSet, ProgramEnvironment};
 use ty_python_core::ast_ids::HasScopedUseId;
@@ -1527,7 +1527,9 @@ impl<'db> FunctionType<'db> {
             .iter_overloads_and_implementation(db)
             .rev()
             .find_map(|overload| overload.dataclass_transformer_params(db))?;
-        Some(DataclassParams::from_transformer_params(db, params))
+        let mut flags = DataclassFlags::from(params.flags(db));
+        flags.set(DataclassFlags::ATTRS, attrs::is_known_decorator(db, self));
+        Some(DataclassParams::new(db, flags, params.field_specifiers(db)))
     }
 
     pub(crate) fn with_dataclass_transformer_params(
@@ -1837,8 +1839,7 @@ impl<'db> FunctionType<'db> {
         let method_renaming = overload.generic_context.and_then(|context| {
             let definition = self.definition(db);
             let fresh = context.variables(db).filter(|var| {
-                var.freshness(db) != TypeVarNonce::NONE
-                    && var.binding_context(db).definition() == Some(definition)
+                var.is_fresh(db) && var.binding_context(db).definition() == Some(definition)
             });
             let env = ProgramEnvironment::from_definition(definition);
             let declared = GenericContext::try_from_typevar_instances(
@@ -2373,6 +2374,21 @@ pub enum KnownFunction {
     /// `dataclasses.field`
     Field,
 
+    /// `attr.attrs`, also exported as `attr.s`, `attr.attributes`, and `attr.dataclass`.
+    #[strum(serialize = "attrs")]
+    AttrAttrs,
+    /// `attr.attrib`, also exported as `attr.ib` and `attr.attr`.
+    #[strum(serialize = "attrib")]
+    AttrAttrib,
+    /// `attrs.field`
+    AttrsField,
+    /// `attrs.define`, also exported as `attrs.mutable`.
+    #[strum(serialize = "define")]
+    AttrsDefine,
+    /// `attrs.frozen`
+    #[strum(serialize = "frozen")]
+    AttrsFrozen,
+
     /// `pydantic.fields.Field`
     #[strum(serialize = "Field")]
     PydanticField,
@@ -2455,12 +2471,18 @@ impl KnownFunction {
             return Some(Self::DataclassTransform);
         }
 
-        let candidate = Self::from_str(name).ok()?;
-        candidate
-            .check_module(
-                file_to_module(db, definition.program_file(db).resolver_file(db))?.known(db)?,
-            )
-            .then_some(candidate)
+        let candidates: &[Self] = match name {
+            "field" => &[Self::Field, Self::AttrsField],
+            _ => &[Self::from_str(name).ok()?],
+        };
+
+        let file = definition.program_file(db).resolver_file(db);
+        let module = file_to_module(db, file)?.known(db)?;
+
+        candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.check_module(module))
     }
 
     /// Return `true` if `self` is defined in `module`
@@ -2492,6 +2514,11 @@ impl KnownFunction {
             }
             Self::Dataclass | Self::Field => {
                 matches!(module, KnownModule::Dataclasses)
+            }
+            Self::AttrAttrs | Self::AttrAttrib => matches!(module, KnownModule::Attr),
+            // Older attrs stubs define the modern API in `attr`.
+            Self::AttrsDefine | Self::AttrsFrozen | Self::AttrsField => {
+                matches!(module, KnownModule::Attr | KnownModule::Attrs)
             }
             Self::PydanticField => matches!(module, KnownModule::PydanticFields),
             Self::PydanticFieldValidator => {
@@ -2533,7 +2560,10 @@ impl KnownFunction {
     }
 
     pub(crate) fn name(self) -> &'static str {
-        self.into()
+        match self {
+            Self::Field | Self::AttrsField => "field",
+            _ => self.into(),
+        }
     }
 }
 
@@ -2583,6 +2613,10 @@ pub(crate) mod tests {
 
                 KnownFunction::Dataclass | KnownFunction::Field => KnownModule::Dataclasses,
 
+                KnownFunction::AttrAttrs | KnownFunction::AttrAttrib => KnownModule::Attr,
+                KnownFunction::AttrsDefine
+                | KnownFunction::AttrsFrozen
+                | KnownFunction::AttrsField => KnownModule::Attrs,
                 KnownFunction::PydanticField => KnownModule::PydanticFields,
                 KnownFunction::PydanticFieldValidator => KnownModule::PydanticFunctionalValidators,
                 KnownFunction::PytestFixture | KnownFunction::PytestYieldFixture => {

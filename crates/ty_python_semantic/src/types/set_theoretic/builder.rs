@@ -1199,6 +1199,11 @@ impl<'db> UnionBuilder<'db> {
     /// other type.
     fn is_incomparable_for_union(db: &'db dyn Db, left: Type<'db>, right: Type<'db>) -> bool {
         match (left, right) {
+            // Unmaterialized markers survive redundancy checks and are their own
+            // negations. Materialized markers can act like `object` or `Never`.
+            (Type::Divergent(left), Type::Divergent(right)) => {
+                left.materialization_kind().is_none() && right.materialization_kind().is_none()
+            }
             (Type::ClassLiteral(_), Type::ClassLiteral(_))
             | (Type::ModuleLiteral(_), Type::ModuleLiteral(_)) => true,
             // Distributing `Any & Literal["a", "b"]` produces one intersection per
@@ -1374,6 +1379,19 @@ impl<'db> UnionBuilder<'db> {
                 if let (Type::NominalInstance(left), Type::NominalInstance(right)) =
                     (ty, element_type)
                     && left.has_unrelated_class(db, right)
+                {
+                    continue;
+                }
+
+                // Disjoint leading literals distinguish tagged tuples. Only inspect
+                // the tags when we would otherwise check both directions for redundancy.
+                if let Some(left) = ty.exact_tuple_instance_spec(db)
+                    && let Some(left) = left.as_fixed_length()
+                    && let Some(Type::LiteralValue(tag)) = left.elements_slice().first()
+                    && let Some(right) = element_type.exact_tuple_instance_spec(db)
+                    && let Some(right) = right.as_fixed_length()
+                    && let Some(Type::LiteralValue(other)) = right.elements_slice().first()
+                    && tag.is_disjoint_from(db, *other)
                 {
                     continue;
                 }

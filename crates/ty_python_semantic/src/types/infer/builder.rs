@@ -510,6 +510,66 @@ fn transparent_callable_decorator_result<'db>(
         return None;
     };
 
+    // Matching `Callable[[A, B], R]` against `[M: Matrix](M, M) -> M` can
+    // equate `A`, `B` and `R` without solving for `R`. The resulting `(R, R) -> R`
+    // refers to a variable that went out of scope when the decorator returned.
+    // TODO: Carry the callback's bound through call inference so we can solve
+    // for the decorator's variables before specializing the returned signature.
+    if let Type::Callable(result) = overload.return_ty
+        && let [inferred] = result.signatures(db).overloads.as_slice()
+        && inferred.generic_context.is_none()
+        && let Type::TypeVar(free) = inferred.return_ty
+        && let Some(context) = decorator_signature.generic_context
+        && context.contains(db, free.identity(db))
+        && let Type::Callable(formal) = parameter.annotated_type().resolve_type_alias(db)
+        && Type::Callable(formal) == decorator_signature.return_ty.resolve_type_alias(db)
+        // A bound on the decorator could restrict inputs more than the callback does.
+        && context
+            .variables(db)
+            .all(|var| var.typevar(db).is_simple(db))
+    {
+        let callback = decorated_ty
+            .try_upcast_to_callable(db, env)?
+            .exactly_one()?;
+        let [original] = callback.signatures(db).overloads.as_slice() else {
+            return None;
+        };
+        let var = original.return_ty.as_typevar()?;
+        if !original.generic_context?.contains(db, var.identity(db))
+            || original.parameters().len() != inferred.parameters().len()
+        {
+            return None;
+        }
+        let TypeVarBoundOrConstraints::UpperBound(bound) =
+            var.require_bound_or_constraints(db, env)
+        else {
+            return None;
+        };
+
+        let mut parameters = Vec::with_capacity(inferred.parameters().len());
+        for (param, arg) in std::iter::zip(inferred.parameters(), original.parameters()) {
+            if !param.is_positional_only() || !arg.is_positional() {
+                return None;
+            }
+            if param.annotated_type() == Type::TypeVar(free)
+                && arg.annotated_type() == Type::TypeVar(var)
+            {
+                parameters.push(param.clone().with_annotated_type(bound));
+            } else if param.annotated_type() == arg.annotated_type() {
+                parameters.push(param.clone());
+            } else {
+                return None;
+            }
+        }
+
+        // The callback accepts its upper bound. The wrapper might reuse a
+        // previous result, so we can't assume it stays generic across calls.
+        let signature = Signature::new(Parameters::standard(parameters), Type::unknown());
+        return Some(Type::Callable(
+            callback.with_signatures(db, CallableSignature::single(signature)),
+        ));
+    }
+
     let (parameter_callable_paramspec, parameter_callable_return) =
         callable_paramspec_and_return(db, env, parameter.annotated_type())?;
     let (return_callable_paramspec, return_callable_return) =
@@ -8622,6 +8682,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     inferred_elt_ty
                 };
 
+                // Only exact tuples depend on the expression for tuple-size promotion.
+                // For example, a variable can block promotion even immediately after a
+                // tuple literal with the same promoted type.
+                let repeated = previous_evidence[i] == Some(inferred_type_for_typevar);
+                if repeated
+                    && !matches!(inferred_type_for_typevar, Type::NominalInstance(ty) if ty.is_exact_tuple())
+                {
+                    continue;
+                }
+
                 tuple_size_promotion_constraints.record_inferred_expression_type(
                     db,
                     env,
@@ -8630,7 +8700,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     inferred_type_for_typevar,
                 );
 
-                if previous_evidence[i] != Some(inferred_type_for_typevar) {
+                if !repeated {
                     builder
                         .infer(Type::TypeVar(elt_ty), inferred_type_for_typevar)
                         .ok()?;
@@ -10769,7 +10839,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ApplicableConstraints::ConstrainedBindings(bindings) => {
                     let reachability_constraints = bindings.reachability_constraints();
                     let predicates = bindings.predicates();
-                    let mut union = UnionBuilder::new(db, env);
+                    let mut types = SmallVec::<[Type<'db>; 1]>::new();
                     let mut loop_header_fallbacks = FxHashMap::default();
                     for binding in bindings {
                         let static_reachability = evaluate_reachability_with_cache(
@@ -10782,7 +10852,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         if static_reachability.is_always_false() {
                             continue;
                         }
-                        match binding.binding {
+                        let binding_ty = match binding.binding {
                             DefinitionState::Defined(definition)
                                 if !is_discarded_dict_key_assignment(db, definition) =>
                             {
@@ -10799,26 +10869,23 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                         [binding_ty, fallback_ty],
                                     );
                                 }
-                                union.add_in_place(
-                                    binding
-                                        .narrowing_constraint
-                                        .narrow(db, env, binding_ty, place),
-                                );
+                                binding_ty
                             }
                             DefinitionState::Defined(_)
                             | DefinitionState::Undefined
-                            | DefinitionState::Deleted => {
-                                union.add_in_place(
-                                    binding.narrowing_constraint.narrow(db, env, ty, place),
-                                );
-                            }
-                        }
+                            | DefinitionState::Deleted => ty,
+                        };
+                        types.push(
+                            binding
+                                .narrowing_constraint
+                                .narrow(db, env, binding_ty, place),
+                        );
                     }
                     // If there are no visible bindings, the union becomes `Never`.
                     // Since an unbound binding is recorded even for an undefined place,
                     // this can only happen if the code is unreachable
                     // and therefore it is correct to set the result to `Never`.
-                    ty = union.build();
+                    ty = UnionType::normalize_place_types(db, env, &types);
                 }
             }
         }
@@ -12498,6 +12565,43 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             matches!(signature.return_ty, Type::NominalInstance(_))
         }
 
+        // With a single decorator of type `(F) -> F`, the argument is the undecorated
+        // method. Keep the full check if specialization could pick a different function
+        // from a TypeVar constraint, bound, or default.
+        fn is_identity_decorator<'db>(
+            db: &'db dyn Db,
+            env: &ProgramEnvironment<'db>,
+            decorator: Type<'db>,
+        ) -> bool {
+            let Type::FunctionLiteral(function) = decorator else {
+                return false;
+            };
+            if function.known(db).is_some() {
+                return false;
+            }
+            let [signature] = function.signature(db).overloads.as_slice() else {
+                return false;
+            };
+            let Type::TypeVar(variable) = signature.return_ty else {
+                return false;
+            };
+            let [parameter] = signature.parameters().as_slice() else {
+                return false;
+            };
+            parameter.is_positional()
+                && parameter.annotated_type() == signature.return_ty
+                && signature
+                    .generic_context
+                    .is_some_and(|context| context.variables(db).eq([variable]))
+                && !variable.is_paramspec(db)
+                && !variable.is_typevartuple(db)
+                && matches!(
+                    variable.typevar(db).bound_or_constraints(db, env),
+                    None | Some(TypeVarBoundOrConstraints::UpperBound(Type::Callable(_)))
+                )
+                && variable.typevar(db).default_type(db, env).is_none()
+        }
+
         self.infer_region();
 
         let mut known_decorators = FunctionDecorators::empty();
@@ -12511,13 +12615,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let ty = self.expression_type(&decorator.expression);
                 let flags = FunctionDecorators::from_decorator_type(self.db(), ty);
                 known_decorators |= flags;
-                if flags.is_empty()
-                    && !matches!(ty, Type::ClassLiteral(class)
+                if !flags.is_empty()
+                    || matches!(ty, Type::ClassLiteral(class)
                         if class.known(self.db()) == Some(KnownClass::Property))
-                    && !(decorators.len() == 1 && returns_nominal_instance(self.db(), ty))
                 {
-                    may_produce_abstract_method = true;
+                    continue;
                 }
+                if decorators.len() == 1 {
+                    if returns_nominal_instance(self.db(), ty) {
+                        continue;
+                    }
+                    // A class-body TypeGuard can narrow the method to an abstract function
+                    // even if the decorator preserves the type of the original definition.
+                    let bindings = self.index.use_def_map(definition.file_scope(self.db()));
+                    if !bindings.may_narrow(definition.place(self.db()))
+                        && is_identity_decorator(self.db(), self.program_environment(), ty)
+                    {
+                        continue;
+                    }
+                }
+                may_produce_abstract_method = true;
             }
             may_produce_abstract_method |=
                 known_decorators.contains(FunctionDecorators::ABSTRACT_METHOD);

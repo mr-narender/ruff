@@ -47,6 +47,7 @@ use crate::types::constraints::{
 };
 use crate::types::context::LintDiagnosticGuardBuilder;
 use crate::types::cyclic::PairVisitor;
+use crate::types::dedicated::attrs;
 use crate::types::dedicated::pydantic::{self, ConfigBoolean};
 use crate::types::diagnostic::{
     CALL_TO_FUNCTION_WITH_UNKNOWN_SIGNATURE, INVALID_ARGUMENT_TYPE, INVALID_DATACLASS,
@@ -67,6 +68,7 @@ use crate::types::infer::{TypeContextKind, original_class_type};
 use crate::types::known_instance::{
     FieldInstance, InternedConstraintSetSolution, MethodWrapper, MethodWrapperKind,
 };
+use crate::types::relation::TypeVarEvaluation;
 use crate::types::signatures::{
     CallableSignature, Parameter, ParameterDisplayName, ParameterKind, Parameters, ParametersKind,
     PartialApplication,
@@ -74,7 +76,9 @@ use crate::types::signatures::{
 use crate::types::tuple::{TupleLength, TupleSpec, TupleSpecBuilder, TupleType, VariableSegment};
 use crate::types::type_alias::walk_type_alias_arguments;
 use crate::types::typed_dict::TypedDictOpenness;
-use crate::types::typevar::{BoundTypeVarIdentity, TypeVarKind, TypeVarNonceGenerator, TypeVarSet};
+use crate::types::typevar::{
+    BoundTypeVarIdentity, TypeVarFreshening, TypeVarKind, TypeVarNonceGenerator, TypeVarSet,
+};
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeKind, TypeVisitor, any_over_type, any_over_type_expanding_aliases,
@@ -228,7 +232,7 @@ fn freshen_generic_contexts_in_type<'db>(
                 env,
                 &TypeMapping::FreshenBoundTypeVars {
                     generic_context,
-                    delta: nonce_generator.next().value(),
+                    freshening: TypeVarFreshening::Offset(nonce_generator.next().value()),
                 },
                 TypeContext::default(),
             )
@@ -607,6 +611,45 @@ impl<'db> BindingsElement<'db> {
             .map(|item| item.error_priority(db))
             .max()
             .unwrap_or(CallErrorPriority::NotCallable)
+    }
+
+    /// Report a single callable's errors or the highest-priority errors of a failing intersection.
+    fn report_diagnostics(
+        &self,
+        context: &CallDiagnosticContext<'_, '_, 'db, '_>,
+        node: ast::AnyNodeRef,
+        union: Option<&UnionDiagnosticContext<'db>>,
+    ) {
+        if let [item] = self.items.as_slice() {
+            if item.has_own_diagnostics() {
+                let variant = union.map(|union| CompoundDiagnostic::UnionVariant {
+                    variant: self.callable_type,
+                    union,
+                });
+                item.callable()
+                    .report_diagnostics(context, node, variant.as_ref());
+            }
+            return;
+        }
+
+        let db = context.db();
+        if self.as_result(db).is_ok() {
+            return;
+        }
+
+        let max_priority = self.error_priority(db);
+        for item in &self.items {
+            if item.error_priority(db) != max_priority || !item.has_own_diagnostics() {
+                continue;
+            }
+            let binding = item.callable();
+            let diagnostic = CompoundDiagnostic::IntersectionElement {
+                element: binding.callable_type,
+                intersection: self.callable_type,
+                union,
+            };
+            binding.report_diagnostics(context, node, Some(&diagnostic));
+        }
     }
 
     /// Returns true if any binding in this element is callable.
@@ -1611,16 +1654,10 @@ impl<'db> Bindings<'db> {
             return;
         }
 
-        if let Some(item) = self.single_item() {
-            if item.has_own_diagnostics() {
-                item.callable().report_diagnostics(context, node, None);
-            }
-        } else {
-            // Report diagnostics for each element (union variant).
-            // Each element may be a single binding or an intersection of bindings.
-            for element in &self.elements {
-                self.report_element_diagnostics(context, node, element);
-            }
+        let union =
+            (self.elements.len() > 1).then(|| UnionDiagnosticContext::new(self.callable_type()));
+        for element in &self.elements {
+            element.report_diagnostics(context, node, union.as_ref());
         }
 
         // Report deferred constructor diagnostics when the matched overload is instance-returning.
@@ -1641,70 +1678,6 @@ impl<'db> Bindings<'db> {
                 continue;
             }
             downstream_bindings.report_diagnostics_impl(context, node);
-        }
-    }
-
-    /// Report diagnostics for a single union element.
-    /// If the element is an intersection where all bindings failed, use priority hierarchy.
-    fn report_element_diagnostics(
-        &self,
-        context: &CallDiagnosticContext<'_, '_, 'db, '_>,
-        node: ast::AnyNodeRef,
-        element: &BindingsElement<'db>,
-    ) {
-        // If this element succeeded, no diagnostics to report
-        if element.as_result(context.db()).is_ok() {
-            return;
-        }
-
-        let is_union = self.elements.len() > 1;
-
-        // For intersection elements, use priority hierarchy
-        if element.is_intersection() {
-            // Find the highest priority error among bindings in this element
-            let max_priority = element.error_priority(context.db());
-
-            // Only report errors from bindings with the highest priority
-            for item in &element.items {
-                let binding = item.callable();
-                if item.error_priority(context.db()) == max_priority {
-                    if !item.has_own_diagnostics() {
-                        continue;
-                    }
-                    if is_union {
-                        // Use layered diagnostic for intersection inside a union
-                        let layered_diag = LayeredDiagnostic {
-                            union_callable_type: self.callable_type(),
-                            intersection_callable_type: element.callable_type,
-                            binding,
-                        };
-                        binding.report_diagnostics(context, node, Some(&layered_diag));
-                    } else {
-                        // Just intersection, no union context needed
-                        let intersection_diag = IntersectionDiagnostic {
-                            callable_type: element.callable_type,
-                            binding,
-                        };
-                        binding.report_diagnostics(context, node, Some(&intersection_diag));
-                    }
-                }
-            }
-        } else {
-            // Single binding in this element - report as a union variant
-            if let Some(item) = element.items.first() {
-                if !item.has_own_diagnostics() {
-                    return;
-                }
-                let binding = item.callable();
-                if element.as_result(context.db()).is_ok() {
-                    return;
-                }
-                let union_diag = UnionDiagnostic {
-                    callable_type: self.callable_type(),
-                    variant_type: element.callable_type,
-                };
-                binding.report_diagnostics(context, node, Some(&union_diag));
-            }
         }
     }
 
@@ -2256,6 +2229,8 @@ impl<'db> Bindings<'db> {
                             found_any.then(|| (input_types.build(), output_types.build()))
                         });
 
+                        let field_instance_kind = attrs::field_instance_kind(db, function_type);
+
                         // `typeshed` pretends that `dataclasses.field()` returns the type of the
                         // default value directly. At runtime, however, this function returns an
                         // instance of `dataclasses.Field`. We also model it this way and return
@@ -2265,7 +2240,15 @@ impl<'db> Bindings<'db> {
                         // to `T`. Otherwise, we would error on `name: str = field(default="")`.
                         overload.set_return_type(Type::KnownInstance(KnownInstanceType::Field(
                             FieldInstance::new(
-                                db, default_ty, init, kw_only, alias, converter, strict, frozen,
+                                db,
+                                field_instance_kind,
+                                default_ty,
+                                init,
+                                kw_only,
+                                alias,
+                                converter,
+                                strict,
+                                frozen,
                             ),
                         )));
                     }
@@ -2301,6 +2284,7 @@ impl<'db> Bindings<'db> {
                                             env,
                                             ty_b,
                                             constraints,
+                                            TypeVarSet::All,
                                         )
                                     } else {
                                         ty_a.when_subtype_of(
@@ -2351,6 +2335,7 @@ impl<'db> Bindings<'db> {
                                         env,
                                         ty_b,
                                         constraints,
+                                        TypeVarSet::All,
                                     )
                                 });
                                 let tracked = InternedConstraintSet::new(db, result);
@@ -2986,6 +2971,7 @@ impl<'db> Bindings<'db> {
                                 env,
                                 constraints,
                                 ConstraintProvenance::INFERRED,
+                                TypeVarSet::All,
                                 typevar,
                                 lower,
                             )
@@ -3015,6 +3001,7 @@ impl<'db> Bindings<'db> {
                                 env,
                                 constraints,
                                 ConstraintProvenance::INFERRED,
+                                TypeVarSet::All,
                                 typevar,
                                 upper,
                             )
@@ -3044,6 +3031,7 @@ impl<'db> Bindings<'db> {
                                 env,
                                 constraints,
                                 ConstraintProvenance::INFERRED,
+                                TypeVarSet::All,
                                 typevar,
                                 value,
                             )
@@ -3076,6 +3064,7 @@ impl<'db> Bindings<'db> {
                                 env,
                                 constraints,
                                 ConstraintProvenance::INFERRED,
+                                TypeVarSet::All,
                                 typevar,
                                 lower,
                                 upper,
@@ -3193,9 +3182,15 @@ impl<'db> Bindings<'db> {
                         let result = constraints.into_owned(|constraints| {
                             let set = constraints.load(db, env, tracked.constraints(db));
                             if matches!(method, KnownBoundMethodType::ConstraintSetExists(_)) {
-                                set.reduce_inferable(db, env, constraints, typevars)
+                                set.reduce_inferable(
+                                    db,
+                                    env,
+                                    constraints,
+                                    typevars,
+                                    TypeVarSet::All,
+                                )
                             } else {
-                                set.for_all(db, env, constraints, typevars)
+                                set.for_all(db, env, constraints, typevars, TypeVarSet::All)
                             }
                         });
                         let tracked = InternedConstraintSet::new(db, result);
@@ -3213,11 +3208,8 @@ impl<'db> Bindings<'db> {
                         let Type::TypeVar(typevar) = typevar.project_type_form(db, env) else {
                             continue;
                         };
-                        let Type::NominalInstance(inferable) = inferable.project_type_form(db, env)
-                        else {
-                            continue;
-                        };
-                        let Some(inferable) = inferable_typevars_from_tuple(db, env, &inferable)
+                        let Some(inferable) =
+                            overload.constraint_solver_scope(db, env, tracked, *inferable)
                         else {
                             continue;
                         };
@@ -3253,11 +3245,8 @@ impl<'db> Bindings<'db> {
                         let [Some(inferable)] = overload.parameter_types() else {
                             continue;
                         };
-                        let Type::NominalInstance(inferable) = inferable.project_type_form(db, env)
-                        else {
-                            continue;
-                        };
-                        let Some(inferable) = inferable_typevars_from_tuple(db, env, &inferable)
+                        let Some(inferable) =
+                            overload.constraint_solver_scope(db, env, tracked, *inferable)
                         else {
                             continue;
                         };
@@ -3305,11 +3294,8 @@ impl<'db> Bindings<'db> {
                         let [Some(inferable)] = overload.parameter_types() else {
                             continue;
                         };
-                        let Type::NominalInstance(inferable) = inferable.project_type_form(db, env)
-                        else {
-                            continue;
-                        };
-                        let Some(inferable) = inferable_typevars_from_tuple(db, env, &inferable)
+                        let Some(inferable) =
+                            overload.constraint_solver_scope(db, env, tracked, *inferable)
                         else {
                             continue;
                         };
@@ -3640,7 +3626,16 @@ impl<'db> OverloadFilter<'db> {
             .take(max_slot_count)
             .collect::<Vec<_>>();
 
-        for (index, current) in candidates.iter().enumerate().take(candidates.len() - 1) {
+        // Variadic contributions come from the entire candidate set. Only the ordinary
+        // argument types can change between prefixes, through contextual inference.
+        let mut prefix_len = 0;
+        for group in candidates[..candidates.len() - 1].chunk_by(|left, right| {
+            left.slots
+                .iter()
+                .map(|slot| slot.argument)
+                .eq(right.slots.iter().map(|slot| slot.argument))
+        }) {
+            let arguments = &group[0].slots;
             let mut union_argument_type_builders =
                 std::iter::repeat_with(|| UnionBuilder::new(db, env))
                     .take(max_slot_count)
@@ -3649,8 +3644,7 @@ impl<'db> OverloadFilter<'db> {
             for candidate in candidates {
                 for (slot_index, slot) in candidate.slots.iter().enumerate() {
                     let argument_type = slot.variadic_argument.unwrap_or_else(|| {
-                        current
-                            .slots
+                        arguments
                             .get(slot_index)
                             .map_or(Type::unknown(), |slot| slot.argument)
                     });
@@ -3673,26 +3667,29 @@ impl<'db> OverloadFilter<'db> {
                     }),
             );
 
-            for (builder, slot) in union_parameter_types.iter_mut().zip(&current.slots) {
-                builder.add_in_place(slot.parameter);
-            }
+            for current in group {
+                prefix_len += 1;
+                for (builder, slot) in union_parameter_types.iter_mut().zip(&current.slots) {
+                    builder.add_in_place(slot.parameter);
+                }
 
-            let parameter_types = Type::heterogeneous_tuple(
-                db,
-                env,
-                union_parameter_types
-                    .iter()
-                    .filter(|builder| !builder.is_empty())
-                    .cloned()
-                    .map(UnionBuilder::build),
-            );
+                let parameter_types = Type::heterogeneous_tuple(
+                    db,
+                    env,
+                    union_parameter_types
+                        .iter()
+                        .filter(|builder| !builder.is_empty())
+                        .cloned()
+                        .map(UnionBuilder::build),
+                );
 
-            let inferable = current.inferable;
-            if top_materialized_argument_type
-                .when_assignable_to_owned(db, env, parameter_types, inferable)
-                .query(|_, when| when.is_always_satisfied(db, env, inferable))
-            {
-                return index + 1;
+                let inferable = current.inferable;
+                if top_materialized_argument_type
+                    .when_assignable_to_owned(db, env, parameter_types, inferable)
+                    .query(|_, when| when.is_always_satisfied(db, env, inferable))
+                {
+                    return prefix_len;
+                }
             }
         }
 
@@ -3819,9 +3816,9 @@ impl<'db> CallableBinding<'db> {
         // generic function recursively within its body: the recursive reference should bind new
         // copies of the typevars.
         //
-        // We can use a single new nonce here for all of the generic overloads, since overloads are
-        // not able to share generic contexts. That means we cannot freshen two overloads in a way
-        // that causes their typevars to collide.
+        // Synthesized overloads can share a context. The first occurrence keeps its
+        // type variables unless it refers to an enclosing definition. Later occurrences
+        // use the same fresh nonce for this callable.
         let nonce = nonce_generator.next();
         for overload in &mut self.overloads {
             let Some(generic_context) = overload.signature.generic_context else {
@@ -4869,7 +4866,7 @@ impl<'db> CallableBinding<'db> {
         &self,
         context: &CallDiagnosticContext<'_, '_, 'db, '_>,
         node: ast::AnyNodeRef,
-        compound_diag: Option<&dyn CompoundDiagnostic>,
+        compound_diag: Option<&CompoundDiagnostic<'_, 'db>>,
     ) {
         let db = context.db();
         let env = context.program_environment();
@@ -6080,7 +6077,31 @@ fn enumerate_argument_types<'a, 'db>(
     })
 }
 
-/// The inputs to parameter specialization when the expected return type supplies no bindings.
+/// The return annotation and expected type that constrain argument inference.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
+struct ReturnTypeContext<'db> {
+    return_ty: Type<'db>,
+    expected: Type<'db>,
+    kind: TypeContextKind,
+}
+
+impl<'db> ReturnTypeContext<'db> {
+    fn bounds(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        generic_context: GenericContext<'db>,
+    ) -> &'db CandidateSolutions<'db> {
+        self.return_ty.assignable_solutions_for_argument_context(
+            db,
+            env,
+            self.expected,
+            generic_context.inferable_typevars(db),
+        )
+    }
+}
+
+/// The inputs to parameter specialization for one pass of argument inference.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, salsa::Supertype)]
 enum ParameterContextKey<'db> {
     Uninferred(GenericContext<'db>),
@@ -6095,7 +6116,9 @@ struct ExplicitParameterContext<'db> {
     #[returns(copy)]
     program: Program<'db>,
     #[returns(copy)]
-    inference: TypeVarInference<'db>,
+    inference: Option<TypeVarInference<'db>>,
+    #[returns(copy)]
+    return_context: Option<ReturnTypeContext<'db>>,
 }
 
 impl<'db> ParameterContextKey<'db> {
@@ -6104,23 +6127,26 @@ impl<'db> ParameterContextKey<'db> {
         env: &ProgramEnvironment<'db>,
         generic_context: GenericContext<'db>,
         inference: Option<TypeVarInference<'db>>,
+        return_context: Option<ReturnTypeContext<'db>>,
     ) -> Self {
-        let Some(inference) = inference else {
-            return Self::Uninferred(generic_context);
-        };
         let program = env.program(db);
-        if inference.generic_context(db) == generic_context
-            && generic_context.program(db) == program
-        {
-            Self::Inferred(inference)
-        } else {
-            Self::Explicit(ExplicitParameterContext::new(
-                db,
-                generic_context,
-                program,
-                inference,
-            ))
+        if return_context.is_none() {
+            let Some(inference) = inference else {
+                return Self::Uninferred(generic_context);
+            };
+            if inference.generic_context(db) == generic_context
+                && generic_context.program(db) == program
+            {
+                return Self::Inferred(inference);
+            }
         }
+        Self::Explicit(ExplicitParameterContext::new(
+            db,
+            generic_context,
+            program,
+            inference,
+            return_context,
+        ))
     }
 }
 
@@ -6214,17 +6240,37 @@ fn parameter_context_specialization<'db>(
     env: &ProgramEnvironment<'db>,
     generic_context: GenericContext<'db>,
     inference: Option<TypeVarInference<'db>>,
-    return_type_solutions: &FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>>,
-    return_context_kind: TypeContextKind,
-    return_bounds: Option<&CandidateSolutions<'db>>,
+    constraints: &ConstraintSetBuilder<'db>,
+    return_context: Option<ReturnTypeContext<'db>>,
 ) -> ArgumentContextSpecialization<'db> {
+    let mut return_type_solutions: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
+        FxHashMap::default();
+    let return_bounds = return_context.map(|context| context.bounds(db, env, generic_context));
+    if let Some(bounds) = return_bounds
+        && let Solutions::Constrained(solutions) =
+            bounds.solve_for_argument_context(db, env, constraints)
+    {
+        for solution in solutions.into_vec() {
+            for binding in solution.solved_typevars {
+                let identity = binding.bound_typevar.identity(db);
+                return_type_solutions
+                    .entry(identity)
+                    .and_modify(|existing| {
+                        *existing =
+                            UnionType::from_two_elements(db, env, *existing, binding.solution);
+                    })
+                    .or_insert(binding.solution);
+            }
+        }
+    }
+
     let specialization = if let Some(inference) = inference {
         inferred_parameter_specialization(
             db,
             env,
             generic_context,
             inference,
-            return_type_solutions,
+            &return_type_solutions,
             return_bounds,
         )
     } else {
@@ -6249,7 +6295,7 @@ fn parameter_context_specialization<'db>(
         .map(|typevar| {
             let identity = typevar.identity(db);
             if return_type_solutions.contains_key(&identity) {
-                Some(return_context_kind)
+                return_context.map(|context| context.kind)
             } else {
                 inference
                     .is_some_and(|inference| inference.has_inferred_type(db, identity))
@@ -6262,6 +6308,45 @@ fn parameter_context_specialization<'db>(
         specialization,
         kinds,
     }
+}
+
+/// Inputs to generic inference when a call has no expected return type. Only
+/// the ordered formal and actual types affect a successful solution.
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+struct GenericArguments<'db> {
+    #[returns(copy)]
+    context: GenericContext<'db>,
+    #[returns(copy)]
+    return_ty: Type<'db>,
+    #[returns(deref)]
+    relations: Box<[(Type<'db>, Type<'db>)]>,
+}
+
+#[salsa::tracked(
+    returns(copy),
+    cycle_result=|_, _, _| None,
+    heap_size=ruff_memory_usage::heap_size
+)]
+fn infer_generic_arguments<'db>(
+    db: &'db dyn Db,
+    arguments: GenericArguments<'db>,
+) -> Option<TypeVarInference<'db>> {
+    let context = arguments.context(db);
+    let env = &ProgramEnvironment::from_program(context.program(db));
+    let constraints = &ConstraintSetBuilder::new();
+    let mut builder = SpecializationBuilder::new(db, env, constraints, context);
+    for &(formal, actual) in arguments.relations(db) {
+        builder.infer(formal, actual).ok()?;
+    }
+    let return_ty = arguments.return_ty(db);
+    let prefer = TypeContext::default().should_prefer_expected_type();
+    builder
+        .build_inference_with(ReportDiagnostics::Yes, |_, bounds| {
+            bounds.map(|bounds| {
+                CallInference::solve_typevar(db, env, return_ty, constraints, bounds, prefer)
+            })
+        })
+        .ok()
 }
 
 /// Completed inference and its diagnostics, passed together to argument validation.
@@ -6963,6 +7048,43 @@ impl<'db> CallInference<'_, 'db> {
             return self.infer_legacy(constraints, generic_context, constraint_set_errors);
         }
 
+        // Expected return types and unpacked variadic packs can add constraints
+        // beyond the argument relations. Keep those calls and any failed solutions
+        // on the path that has the full argument list and diagnostic locations.
+        if self.call_expression_tcx == TypeContext::default()
+            && generic_context.program(db) == self.env.program(db)
+            // With a declared bound or constraints, rejecting one overload can be
+            // expensive. Solve those calls once with the full diagnostic context.
+            && generic_context.variables(db).all(|var| {
+                let var = var.typevar(db);
+                var.is_simple(db) || var.is_self(db)
+            })
+            && self
+                .signature
+                .parameters()
+                .variadic()
+                .is_none_or(|(_, parameter)| !parameter.has_starred_annotation())
+        {
+            let relations: SmallVec<[_; 4]> = self
+                .argument_relations()
+                .filter(|r| r.declared_type != r.argument_type)
+                .map(|r| (r.declared_type, r.argument_type))
+                .collect();
+            let arguments =
+                GenericArguments::new(db, generic_context, self.return_ty, relations.as_slice());
+            if let Some(inference) = infer_generic_arguments(db, arguments) {
+                let (return_ty, arguments_validated) = self.select_return_type(inference);
+                return InferredCall {
+                    inferable_typevars: self.inferable_typevars,
+                    inference: Some(inference),
+                    return_ty,
+                    arguments_validated,
+                    errors: Vec::new(),
+                    constraint_set_errors,
+                };
+            }
+        }
+
         let mut specialization_errors = Vec::new();
         let mut builder = SpecializationBuilder::new(db, self.env, constraints, generic_context);
 
@@ -6988,8 +7110,13 @@ impl<'db> CallInference<'_, 'db> {
                 ConstraintProvenance::DECLARED
             };
             let return_constraints = return_ty
-                .when_constraint_set_assignable_to_owned_with_provenance(
-                    db, self.env, tcx, provenance,
+                .when_constraint_set_assignable_to_owned_with_evaluation(
+                    db,
+                    self.env,
+                    tcx,
+                    self.inferable_typevars,
+                    TypeVarEvaluation::Lazy,
+                    provenance,
                 );
             builder.record_constraint_set(constraints.load(db, self.env, &return_constraints));
             (return_ty, tcx)
@@ -7025,7 +7152,10 @@ impl<'db> CallInference<'_, 'db> {
                 &mut specialization_errors,
                 |_, bounds| {
                     bounds.map(|bounds| {
-                        self.solve_typevar(
+                        Self::solve_typevar(
+                            self.db,
+                            self.env,
+                            self.return_ty,
                             constraints,
                             bounds,
                             self.call_expression_tcx.should_prefer_expected_type(),
@@ -7277,7 +7407,10 @@ impl<'db> CallInference<'_, 'db> {
 
         let inference = builder.build_inference_with(report_diagnostics, |_, bounds| {
             bounds.map(|bounds| {
-                self.solve_typevar(
+                Self::solve_typevar(
+                    self.db,
+                    self.env,
+                    self.return_ty,
                     constraints,
                     bounds,
                     self.call_expression_tcx.should_prefer_expected_type(),
@@ -7303,39 +7436,33 @@ impl<'db> CallInference<'_, 'db> {
     }
 
     fn solve_typevar(
-        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        return_ty: Type<'db>,
         constraints: &ConstraintSetBuilder<'db>,
         bounds: &CandidateTypeVarSolution<'db>,
         prefer_declared: bool,
     ) -> PathBoundSolution<'db> {
-        let db = self.db;
         let typevar = bounds.bound_typevar;
 
-        CandidateSolutions::solve_with_preference(
-            db,
-            self.env,
-            constraints,
-            bounds,
-            prefer_declared,
-        )
-        .map(|solution| {
-            let bound_or_constraints = typevar.typevar(db).bound_or_constraints(db, self.env);
+        CandidateSolutions::solve_with_preference(db, env, constraints, bounds, prefer_declared)
+            .map(|solution| {
+                let bound_or_constraints = typevar.typevar(db).bound_or_constraints(db, env);
 
-            // For constrained TypeVars, the inferred type is already one of the
-            // constraints. Promoting literals would produce a type that doesn't
-            // match any constraint.
-            if matches!(
-                bound_or_constraints,
-                Some(TypeVarBoundOrConstraints::Constraints(_))
-            ) {
-                return solution;
-            }
+                // For constrained TypeVars, the inferred type is already one of the
+                // constraints. Promoting literals would produce a type that doesn't
+                // match any constraint.
+                if matches!(
+                    bound_or_constraints,
+                    Some(TypeVarBoundOrConstraints::Constraints(_))
+                ) {
+                    return solution;
+                }
 
-            let mut variance_in_return = TypeVarVariance::Bivariant;
+                let mut variance_in_return = TypeVarVariance::Bivariant;
 
-            // Find all occurrences of the type variable in the return type.
-            self.return_ty
-                .visit_specialization(db, self.env, |ty, variance| {
+                // Find all occurrences of the type variable in the return type.
+                return_ty.visit_specialization(db, env, |ty, variance| {
                     if ty != Type::TypeVar(typevar) {
                         return;
                     }
@@ -7343,35 +7470,34 @@ impl<'db> CallInference<'_, 'db> {
                     variance_in_return = variance_in_return.join(variance);
                 });
 
-            // Promotion is only useful if the type variable is in non-covariant position
-            // in the return type.
-            if variance_in_return.is_covariant() {
-                return solution;
-            }
+                // Promotion is only useful if the type variable is in non-covariant position
+                // in the return type.
+                if variance_in_return.is_covariant() {
+                    return solution;
+                }
 
-            let promoted = solution.promote(db, self.env);
+                let promoted = solution.promote(db, env);
 
-            // If the TypeVar has an upper bound, only use the promoted type if it
-            // still satisfies the bound.
-            if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) = bound_or_constraints
-                && !promoted.is_assignable_to(db, self.env, bound)
-            {
-                return solution;
-            }
+                // If the TypeVar has an upper bound, only use the promoted type if it
+                // still satisfies the bound.
+                if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) = bound_or_constraints
+                    && !promoted.is_assignable_to(db, env, bound)
+                {
+                    return solution;
+                }
 
-            // The promoted type must still be compatible with the constraints on this type variable.
-            //
-            // Note that legacy mappings are stored as equivalence mappings and so generally cannot
-            // be promoted, as we do not have access to the original constraints to validate the
-            // promotion.
-            if promoted != solution
-                && !bounds.accepts_candidate(db, self.env, constraints, promoted)
-            {
-                solution
-            } else {
-                promoted
-            }
-        })
+                // The promoted type must still be compatible with the constraints on this type variable.
+                //
+                // Note that legacy mappings are stored as equivalence mappings and so generally cannot
+                // be promoted, as we do not have access to the original constraints to validate the
+                // promotion.
+                if promoted != solution && !bounds.accepts_candidate(db, env, constraints, promoted)
+                {
+                    solution
+                } else {
+                    promoted
+                }
+            })
     }
 
     /// Solve the collected constraints, consuming the builder before argument validation.
@@ -7422,7 +7548,14 @@ impl<'db> CallInference<'_, 'db> {
                         .apply_optional_specialization(db, preferred_specialization)
                         .is_assignable_to(db, self.env, ty)
                 }) {
-                    return Some(self.solve_typevar(constraints, bounds, true));
+                    return Some(Self::solve_typevar(
+                        self.db,
+                        self.env,
+                        self.return_ty,
+                        constraints,
+                        bounds,
+                        true,
+                    ));
                 }
             }
 
@@ -8151,8 +8284,40 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let (sub_arguments, sources) =
             select_paramspec_arguments(db, self.env, self.arguments, self.argument_matches, prefix);
 
-        let bindings = match callable
-            .bindings(db, self.env)
+        let mut bindings = callable.bindings(db, self.env);
+        // TODO: Remove this fallback once https://github.com/astral-sh/ruff/pull/30566
+        // lands. The outer call will then solve for its result using the forwarded arguments.
+        //
+        // The outer result can still refer to the callback's type variables. Give that
+        // result to the existing argument check so it can apply its usual return context
+        // and literal promotion rules. Overloads may have different return types.
+        let mut free_in_result = None;
+        if let Ok(callable) = bindings.iter_flat_mut().exactly_one()
+            && let [binding] = callable.overloads.as_mut_slice()
+            && let Some(context) = binding.signature.generic_context
+        {
+            let free = self.return_ty.free_typevars(db, self.env).0;
+            if context.variables(db).any(|var| var.is_inferable(db, free))
+                // An indeterminate unpack may change which argument binds to a parameter.
+                && sub_arguments.iter().all(|arg| match arg {
+                    CallArgument::Variadic(arg) => arg
+                        .sequence(db, self.env)
+                        .is_some_and(|seq| seq.as_fixed_length().is_some()),
+                    CallArgument::Keywords(arg) => arg.is_complete(),
+                    _ => true,
+                })
+                // Substitution would also specialize the callback if the wrapper returns P.
+                // Enforcing the wrapper's own bounds requires solving both calls together.
+                && !self.signature.return_ty.free_typevars(db, self.env).0.iter(db).any(|var| {
+                    var.is_same_typevar_as(db, paramspec)
+                        || var.typevar(db).bound_or_constraints(db, self.env).is_some()
+                })
+            {
+                binding.set_return_type(self.return_ty);
+                free_in_result = Some(free);
+            }
+        }
+        let bindings = match bindings
             .match_parameters(db, self.env, &sub_arguments)
             .check_types(
                 db,
@@ -8162,7 +8327,23 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 self.call_expression_tcx,
                 &[],
             ) {
-            Ok(bindings) => bindings,
+            Ok(bindings) => {
+                // An unsolved variable with no default would become Unknown and could
+                // hide an incompatible assignment.
+                if let Some(free) = free_in_result
+                    && let Some(callable) = bindings.single_element()
+                    && let [binding] = callable.overloads()
+                    && let Some(inference) = binding.inference
+                    && inference.generic_context(db).variables(db).all(|var| {
+                        !var.is_inferable(db, free)
+                            || inference.has_inferred_type(db, var.identity(db))
+                            || var.default_type(db).is_some()
+                    })
+                {
+                    self.return_ty = binding.return_type();
+                }
+                bindings
+            }
             Err(CallError(_, bindings)) => *bindings,
         };
 
@@ -8687,12 +8868,11 @@ pub(crate) fn inferable_typevar_occurrences<'db>(
 
         fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
             if let Type::TypeVar(typevar) = ty {
-                let identity = if typevar.is_paramspec(db) {
-                    typevar.without_paramspec_attr(db).identity(db)
-                } else {
-                    typevar.identity(db)
-                };
-                if identity.is_inferable(db, self.inferable) {
+                if typevar
+                    .identity(db)
+                    .binder()
+                    .is_inferable(db, self.inferable)
+                {
                     self.count.set(self.count.get() + 1);
                 }
                 return;
@@ -8779,6 +8959,32 @@ pub(crate) struct Binding<'db> {
 }
 
 impl<'db> Binding<'db> {
+    // TODO: Move the `inferable` parameter from `ConstraintSet.solutions` to each of the
+    // various constructors.
+    fn constraint_solver_scope(
+        &mut self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        tracked: InternedConstraintSet<'db>,
+        inferable: Type<'db>,
+    ) -> Option<TypeVarSet<'db>> {
+        let Type::NominalInstance(instance) = inferable.project_type_form(db, env) else {
+            return None;
+        };
+        let inferable = inferable_typevars_from_tuple(db, env, &instance)?;
+        if !tracked
+            .constraints(db)
+            .query(|_, set| set.has_inferable_subjects(db, inferable))
+        {
+            self.errors.push(BindingError::InternalCallError(
+                "`inferable` must include every type variable constrained by this set",
+            ));
+            self.set_return_type(Type::unknown());
+            return None;
+        }
+        Some(inferable)
+    }
+
     /// Checks the getter invoked by `property.__get__`, retaining its error and recovery type.
     fn check_property_getter(
         &mut self,
@@ -9333,8 +9539,6 @@ impl<'db> Binding<'db> {
         constraints: &ConstraintSetBuilder<'db>,
         call_expression_tcx: TypeContext<'db>,
     ) -> Cow<'db, ArgumentContextSpecialization<'db>> {
-        /// With no evidence from the expected return type, every call in this program
-        /// with the same generic context and inferred arguments has the same parameter context.
         #[salsa::tracked(
             returns(as_ref),
             cycle_initial = |_, _, _, _| None,
@@ -9344,7 +9548,7 @@ impl<'db> Binding<'db> {
             db: &'db dyn Db,
             key: ParameterContextKey<'db>,
         ) -> Option<ArgumentContextSpecialization<'db>> {
-            let (generic_context, program, inference) = match key {
+            let (generic_context, program, inference, return_context) = match key {
                 ParameterContextKey::Uninferred(context) => {
                     return Some(ArgumentContextSpecialization {
                         specialization: context.repeat_specialization(
@@ -9356,62 +9560,44 @@ impl<'db> Binding<'db> {
                 }
                 ParameterContextKey::Inferred(inference) => {
                     let context = inference.generic_context(db);
-                    (context, context.program(db), inference)
+                    (context, context.program(db), Some(inference), None)
                 }
-                ParameterContextKey::Explicit(key) => {
-                    (key.generic_context(db), key.program(db), key.inference(db))
-                }
+                ParameterContextKey::Explicit(key) => (
+                    key.generic_context(db),
+                    key.program(db),
+                    key.inference(db),
+                    key.return_context(db),
+                ),
             };
             Some(parameter_context_specialization(
                 db,
                 &ProgramEnvironment::from_program(program),
                 generic_context,
-                Some(inference),
-                &FxHashMap::default(),
-                TypeContextKind::preference(),
-                None,
+                inference,
+                &ConstraintSetBuilder::new(),
+                return_context,
             ))
         }
 
-        let mut return_type_solutions: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
-            FxHashMap::default();
-        let return_bounds = call_expression_tcx.expected_type().map(|expected| {
-            self.unspecialized_return_type(db)
-                .assignable_solutions_for_argument_context(
-                    db,
-                    env,
-                    expected,
-                    generic_context.inferable_typevars(db),
+        // Calls whose expected type contributes no bounds can share a cache entry
+        // with calls that have no expected type.
+        let return_context = call_expression_tcx
+            .expected_type()
+            .map(|expected| ReturnTypeContext {
+                return_ty: self.unspecialized_return_type(db),
+                expected,
+                kind: call_expression_tcx.kind(),
+            })
+            .filter(|context| {
+                matches!(
+                    context.bounds(db, env, generic_context),
+                    CandidateSolutions::Constrained(_)
                 )
-        });
-        if let Some(path_bounds) = return_bounds {
-            let solutions = path_bounds.solve_for_argument_context(db, env, constraints);
-            if let Solutions::Constrained(solutions) = solutions {
-                for solution in solutions.into_vec() {
-                    for binding in solution.solved_typevars {
-                        let identity = binding.bound_typevar.identity(db);
-                        return_type_solutions
-                            .entry(identity)
-                            .and_modify(|existing| {
-                                *existing = UnionType::from_two_elements(
-                                    db,
-                                    env,
-                                    *existing,
-                                    binding.solution,
-                                );
-                            })
-                            .or_insert(binding.solution);
-                    }
-                }
-            }
-        }
-
-        if return_type_solutions.is_empty()
-            && let Some(specialization) = inferred_parameter_context(
-                db,
-                ParameterContextKey::new(db, env, generic_context, inference),
-            )
-        {
+            });
+        if let Some(specialization) = inferred_parameter_context(
+            db,
+            ParameterContextKey::new(db, env, generic_context, inference, return_context),
+        ) {
             return Cow::Borrowed(specialization);
         }
         Cow::Owned(parameter_context_specialization(
@@ -9419,9 +9605,8 @@ impl<'db> Binding<'db> {
             env,
             generic_context,
             inference,
-            &return_type_solutions,
-            call_expression_tcx.kind(),
-            return_bounds,
+            constraints,
+            return_context,
         ))
     }
 
@@ -9442,6 +9627,7 @@ impl<'db> Binding<'db> {
         }
     }
 
+    #[expect(clippy::unnecessary_wraps, reason = "Salsa returns None during cycles")]
     fn freshen_bound_typevars(
         &mut self,
         db: &'db dyn Db,
@@ -9455,7 +9641,38 @@ impl<'db> Binding<'db> {
         if self.signature.generic_context.is_none() {
             return;
         }
-        self.signature = self.signature.freshen_bound_typevars(db, env, delta);
+        // Synthesized overloads, such as those for TypedDict.get, often need the
+        // same renaming at many call sites. Keep nonce selection local to the call.
+        #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+        struct Freshening<'db> {
+            #[returns(copy)]
+            program: crate::Program<'db>,
+            #[returns(ref)]
+            signature: Signature<'db>,
+            #[returns(copy)]
+            delta: u32,
+        }
+
+        #[salsa::tracked(
+            returns(as_ref),
+            cycle_result=|_, _, _| None,
+            heap_size=ruff_memory_usage::heap_size
+        )]
+        fn freshened_signature<'db>(
+            db: &'db dyn Db,
+            key: Freshening<'db>,
+        ) -> Option<Signature<'db>> {
+            let env = &ProgramEnvironment::from_program(key.program(db));
+            Some(
+                key.signature(db)
+                    .freshen_bound_typevars(db, env, key.delta(db)),
+            )
+        }
+
+        let key = Freshening::new(db, env.program(db), &self.signature, delta);
+        self.signature = freshened_signature(db, key)
+            .cloned()
+            .unwrap_or_else(|| self.signature.freshen_bound_typevars(db, env, delta));
         self.return_ty = self.initial_return_type(db);
     }
 
@@ -9866,7 +10083,7 @@ impl<'db> Binding<'db> {
         context: &CallDiagnosticContext<'_, '_, 'db, '_>,
         node: ast::AnyNodeRef,
         callable_ty: Type<'db>,
-        compound_diag: Option<&dyn CompoundDiagnostic>,
+        compound_diag: Option<&CompoundDiagnostic<'_, 'db>>,
         matching_overload: Option<&MatchingOverloadLiteral<'db>>,
     ) {
         let mut reported_argument_errors: FxHashMap<_, SmallVec<[_; 1]>> = FxHashMap::default();
@@ -10716,7 +10933,7 @@ impl<'db> BindingError<'db> {
         context: &CallDiagnosticContext<'_, '_, 'db, '_>,
         node: ast::AnyNodeRef,
         callable_ty: Type<'db>,
-        compound_diag: Option<&dyn CompoundDiagnostic>,
+        compound_diag: Option<&CompoundDiagnostic<'_, 'db>>,
         matching_overload: Option<&MatchingOverloadLiteral<'_>>,
         source_parameter_index_offset: usize,
     ) {
@@ -11423,123 +11640,73 @@ impl<'db> BindingError<'db> {
     }
 }
 
-/// Trait for adding context about compound types (unions/intersections) to diagnostics.
-trait CompoundDiagnostic {
-    /// Adds context about any relevant compound type function types to the given diagnostic.
-    fn add_context(&self, db: &dyn Db, env: &ProgramEnvironment<'_>, diag: &mut Diagnostic);
+/// All failing variants of a call share this note. Format the union only if we emit a diagnostic.
+struct UnionDiagnosticContext<'db> {
+    ty: Type<'db>,
+    message: OnceCell<String>,
 }
 
-/// Contains additional context for union specific diagnostics.
-///
-/// This is used when a function call is inconsistent with one or more variants
-/// of a union. This can be used to attach sub-diagnostics that clarify that
-/// the error is part of a union.
-struct UnionDiagnostic<'db> {
-    /// The type of the union.
-    callable_type: Type<'db>,
-    /// The type associated with the specific union variant that failed.
-    variant_type: Type<'db>,
-}
+impl<'db> UnionDiagnosticContext<'db> {
+    fn new(ty: Type<'db>) -> Self {
+        Self {
+            ty,
+            message: OnceCell::new(),
+        }
+    }
 
-impl CompoundDiagnostic for UnionDiagnostic<'_> {
-    fn add_context(&self, db: &dyn Db, env: &ProgramEnvironment<'_>, diag: &mut Diagnostic) {
-        let sub = SubDiagnostic::new(
-            SubDiagnosticSeverity::Info,
-            format_args!(
-                "Union variant `{callable_ty}` is incompatible with this call site",
-                callable_ty = self.variant_type.display(db, env),
-            ),
-        );
-        diag.sub(sub);
-
-        let sub = SubDiagnostic::new(
-            SubDiagnosticSeverity::Info,
-            format_args!(
+    fn message(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> &str {
+        self.message.get_or_init(|| {
+            format!(
                 "Attempted to call union type `{}`",
-                self.callable_type.display(db, env)
-            ),
-        );
-        diag.sub(sub);
+                self.ty.display(db, env)
+            )
+        })
     }
 }
 
-/// Contains additional context for intersection specific diagnostics.
-///
-/// This is used when a function call is inconsistent with all elements
-/// of an intersection. This can be used to attach sub-diagnostics that clarify that
-/// the error is part of an intersection.
-struct IntersectionDiagnostic<'b, 'db> {
-    /// The type of the intersection.
-    callable_type: Type<'db>,
-    /// The specific binding that failed.
-    binding: &'b CallableBinding<'db>,
+/// Identifies the part of a compound callable that failed to bind.
+enum CompoundDiagnostic<'a, 'db> {
+    UnionVariant {
+        variant: Type<'db>,
+        union: &'a UnionDiagnosticContext<'db>,
+    },
+    IntersectionElement {
+        element: Type<'db>,
+        intersection: Type<'db>,
+        union: Option<&'a UnionDiagnosticContext<'db>>,
+    },
 }
 
-impl CompoundDiagnostic for IntersectionDiagnostic<'_, '_> {
-    fn add_context(&self, db: &dyn Db, env: &ProgramEnvironment<'_>, diag: &mut Diagnostic) {
-        let sub = SubDiagnostic::new(
-            SubDiagnosticSeverity::Info,
-            format_args!(
-                "Intersection element `{callable_ty}` is incompatible with this call site",
-                callable_ty = self.binding.callable_type.display(db, env),
-            ),
-        );
-        diag.sub(sub);
-
-        let sub = SubDiagnostic::new(
-            SubDiagnosticSeverity::Info,
-            format_args!(
-                "Attempted to call intersection type `{}`",
-                self.callable_type.display(db, env)
-            ),
-        );
-        diag.sub(sub);
-    }
-}
-
-/// Contains both union and intersection context for layered diagnostics.
-///
-/// Used when an intersection fails inside a union - we want to report both
-/// that this is a union variant AND that this is an intersection element.
-struct LayeredDiagnostic<'b, 'db> {
-    /// The type of the union.
-    union_callable_type: Type<'db>,
-    /// The type of the intersection (for intersection context).
-    intersection_callable_type: Type<'db>,
-    /// The specific binding that failed.
-    binding: &'b CallableBinding<'db>,
-}
-
-impl CompoundDiagnostic for LayeredDiagnostic<'_, '_> {
-    fn add_context(&self, db: &dyn Db, env: &ProgramEnvironment<'_>, diag: &mut Diagnostic) {
-        // Add intersection context first (more specific)
-        let sub = SubDiagnostic::new(
-            SubDiagnosticSeverity::Info,
-            format_args!(
-                "Intersection element `{callable_ty}` is incompatible with this call site",
-                callable_ty = self.binding.callable_type.display(db, env),
-            ),
-        );
-        diag.sub(sub);
-
-        let sub = SubDiagnostic::new(
-            SubDiagnosticSeverity::Info,
-            format_args!(
-                "Attempted to call intersection type `{}`",
-                self.intersection_callable_type.display(db, env)
-            ),
-        );
-        diag.sub(sub);
-
-        // Then add union context (outer layer)
-        let sub = SubDiagnostic::new(
-            SubDiagnosticSeverity::Info,
-            format_args!(
-                "Attempted to call union type `{}`",
-                self.union_callable_type.display(db, env)
-            ),
-        );
-        diag.sub(sub);
+impl<'db> CompoundDiagnostic<'_, 'db> {
+    /// Describe the failing member first, then the enclosing intersection and union, if any.
+    fn add_context(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>, diag: &mut Diagnostic) {
+        let union = match *self {
+            Self::UnionVariant { variant, union } => {
+                diag.info(format_args!(
+                    "Union variant `{}` is incompatible with this call site",
+                    variant.display(db, env)
+                ));
+                Some(union)
+            }
+            Self::IntersectionElement {
+                element,
+                intersection,
+                union,
+            } => {
+                diag.info(format_args!(
+                    "Intersection element `{}` is incompatible with this call site",
+                    element.display(db, env)
+                ));
+                diag.info(format_args!(
+                    "Attempted to call intersection type `{}`",
+                    intersection.display(db, env)
+                ));
+                union
+            }
+        };
+        if let Some(union) = union {
+            diag.info(union.message(db, env));
+        }
     }
 }
 

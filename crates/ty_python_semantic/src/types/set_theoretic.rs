@@ -12,7 +12,7 @@ use crate::types::class::KnownClass;
 use crate::types::enums::EnumComplement;
 use crate::types::{
     ApplyTypeMappingVisitor, InstanceProjection, LiteralValueType, PromotionKind, PromotionMode,
-    Type, TypeContext, TypeMapping, TypePair, TypeQualifiers,
+    RecursiveTypeNormalizer, Type, TypeContext, TypeMapping, TypePair, TypeQualifiers,
 };
 use crate::types::{TypeVarBoundOrConstraints, visitor};
 use crate::{Db, FxOrderSet, Program};
@@ -142,6 +142,18 @@ impl<'db> UnionType<'db> {
         env: &ProgramEnvironment<'db>,
         types: &[Type<'db>],
     ) -> Type<'db> {
+        // Most reads see one binding. The builder still needs to expand aliases,
+        // normalize literals and unions, and turn `Top[Divergent]` into plain `object`.
+        if let [ty] = types
+            && !matches!(
+                ty,
+                Type::Union(_) | Type::TypeAlias(_) | Type::LiteralValue(_) | Type::Divergent(_)
+            )
+        {
+            ty.assert_not_recursive_var();
+            return *ty;
+        }
+
         // Successive reads often merge the same few bindings. Even two inputs can
         // require quadratic work if one is a wide union. Bound the key size so a
         // series of conditional assignments doesn't retain a growing list at each use.
@@ -717,13 +729,14 @@ impl<'db> UnionType<'db> {
         }
     }
 
-    pub(crate) fn recursive_type_normalized_impl(
+    pub(super) fn normalize_recursive(
         self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        div: Type<'db>,
+        normalizer: &mut RecursiveTypeNormalizer<'_, 'db>,
         nested: bool,
     ) -> Option<Type<'db>> {
+        let env = normalizer.env;
+        let div = normalizer.div;
         let mut builder = UnionBuilder::new(db, env)
             .unpack_aliases(false)
             .cycle_recovery(true)
@@ -732,7 +745,7 @@ impl<'db> UnionType<'db> {
         for ty in self.elements(db) {
             if nested {
                 // list[T | Divergent] => list[Divergent]
-                let ty = ty.recursive_type_normalized_impl(db, env, div, nested)?;
+                let ty = ty.normalize_recursive(db, normalizer, nested)?;
                 if ty.same_divergent_marker(div) {
                     return Some(ty);
                 }
@@ -746,7 +759,7 @@ impl<'db> UnionType<'db> {
                     continue;
                 }
                 builder.add_in_place(
-                    ty.recursive_type_normalized_impl(db, env, div, nested)
+                    ty.normalize_recursive(db, normalizer, nested)
                         .unwrap_or(div),
                 );
                 empty = false;
@@ -780,7 +793,7 @@ impl<'db> UnionType<'db> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, get_size2::GetSize, salsa::SalsaValue)]
 pub(crate) enum KnownUnion {
     Float,   // `int | float`
     Complex, // `int | float | complex`
@@ -806,7 +819,27 @@ impl KnownUnion {
         }
     }
 
+    /// Returns the normalized union for this program's numeric classes.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "Salsa supplies None when the union participates in a cycle"
+    )]
     pub(crate) fn to_type<'db>(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
+        // Promotion can request the same union for every element of a collection. As with other
+        // unions, normalize in the caller if a built-in class is still being resolved in a cycle.
+        #[salsa::tracked(returns(copy), cycle_result=|_, _, _, _| None, heap_size=ruff_memory_usage::heap_size)]
+        fn numeric_union<'db>(
+            db: &'db dyn Db,
+            program: Program<'db>,
+            union: KnownUnion,
+        ) -> Option<Type<'db>> {
+            Some(union.build(db, &ProgramEnvironment::from_program(program)))
+        }
+
+        numeric_union(db, env.program(db), self).unwrap_or_else(|| self.build(db, env))
+    }
+
+    fn build<'db>(self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> Type<'db> {
         match self {
             KnownUnion::Float => UnionType::from_two_elements(
                 db,

@@ -410,15 +410,15 @@ impl Project {
         path: &SystemPath,
         workspace: uv::UvWorkspace,
     ) -> Result<ProjectReloadResult, ProjectMetadataError> {
-        let mut metadata = self.metadata(db).rediscover(db.system(), path, workspace)?;
-        if let Err(error) = metadata.apply_configuration_files(db.system()) {
-            let error = anyhow::Error::new(error);
-            tracing::error!(
-                "Failed to apply configuration files, \
-                continuing without applying them: {error:#}"
-            );
-        }
+        let metadata = self.metadata(db).rediscover(db.system(), path, workspace)?;
+        Ok(self.apply_rediscovered_metadata(db, metadata))
+    }
 
+    fn apply_rediscovered_metadata(
+        self,
+        db: &mut dyn Db,
+        metadata: ProjectMetadata,
+    ) -> ProjectReloadResult {
         metadata.try_add_project_root(db);
         let merged_options = metadata.to_merged_options();
 
@@ -457,7 +457,7 @@ impl Project {
         );
 
         tracing::debug!("Reloading project after structural change");
-        Ok(self.reload(db, metadata, settings, settings_diagnostics))
+        self.reload(db, metadata, settings, settings_diagnostics)
     }
 
     /// Reload the project after its metadata or settings have changed.
@@ -1248,6 +1248,24 @@ mod tests {
             vec![] as Vec<String>
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_file_under_an_excluded_directory() -> ruff_db::system::Result<()> {
+        let root = SystemPathBuf::from("/project");
+        let path = root.join("dist/keep.py");
+        let mut db = TestDb::new(ProjectMetadata::new("test", root.clone()));
+        let project = db.project();
+        db.write_file(&path, "")?;
+        let file = system_path_to_file(&db, &path).unwrap();
+
+        project.set_included_paths(&mut db, vec![root, path]);
+        assert!(project.files(&db).contains(file));
+
+        project.set_force_exclude(&mut db, true);
+        project.reload_files(&mut db);
+        assert!(!project.files(&db).contains(file));
         Ok(())
     }
 

@@ -1214,6 +1214,22 @@ fn changing_a_name_use_keeps_an_imported_declaration_cached() -> anyhow::Result<
 }
 
 #[test]
+fn project_builtins_follow_file_creation_and_removal() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let main = "/src/main.py";
+    let builtins = "/src/__builtins__.pyi";
+    db.write_file(main, "value = project_value")?;
+
+    let missing = &["Name `project_value` used when not defined"];
+    assert_file_diagnostics(&db, main, missing);
+    db.write_file(builtins, "project_value: int")?;
+    assert_file_diagnostics(&db, main, &[]);
+    db.remove_file(builtins)?;
+    assert_file_diagnostics(&db, main, missing);
+    Ok(())
+}
+
+#[test]
 fn dependency_public_symbol_type_change() -> anyhow::Result<()> {
     let mut db = setup_db();
 
@@ -1762,6 +1778,28 @@ fn recursive_protocol_materialization_tracks_member_type_changes() -> anyhow::Re
         assert_file_diagnostics(&db, "/src/main.py", diagnostics);
     }
 
+    Ok(())
+}
+
+#[test]
+fn abstract_methods_track_changes_to_identity_decorators() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let module = "/src/main.py";
+    db.write_file(
+        module,
+        "from decorate import decorate\nclass Base:\n    @decorate\n    def method(self) -> int: return 1\nBase()",
+    )?;
+    let decorator = "/src/decorate.py";
+    let identity = "from typing import Callable, TypeVar\nF = TypeVar('F', bound=Callable)\ndef decorate(f: F) -> F: return f";
+
+    db.write_file(decorator, identity)?;
+    assert_file_diagnostics(&db, module, &[]);
+
+    db.write_file(decorator, "from abc import abstractmethod as decorate")?;
+    assert_file_diagnostics(&db, module, &["Cannot instantiate abstract class `Base`"]);
+
+    db.write_file(decorator, identity)?;
+    assert_file_diagnostics(&db, module, &[]);
     Ok(())
 }
 
