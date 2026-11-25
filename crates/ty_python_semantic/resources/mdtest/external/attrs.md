@@ -218,22 +218,20 @@ A default value can be specified using a value on the right-hand side, or using 
 `@<field>.default` decorator.
 
 ```py
+import attr
 from attrs import define, field
 
 @define
 class Person:
     name: str = "Unnamed"
-
-    # TODO: This should not be an error once we recognize that `id` has a default
-    # error: [invalid-dataclass-field-order]
     id: int = field()
 
     @id.default
     def _default_id(self) -> int:
         return 0
 
-# TODO: No error here
-# error: [missing-argument] "No argument provided for required parameter `id`"
+reveal_type(Person.__init__)  # revealed: (self: Person, /, name: str = "Unnamed", id: int = ...) -> None
+
 person = Person()
 ```
 
@@ -250,6 +248,35 @@ The `@<field>.default` decorator also doesn't modify the signature of the method
 reveal_type(person._default_id)  # revealed: bound method Person._default_id() -> int
 ```
 
+Only the field named in the decorator gets a default.
+
+```py
+@attr.s
+class Range:
+    start: int = attr.ib()
+    end: int = attr.ib()
+
+    @end.default
+    def _default_end(self) -> int:
+        return self.start
+
+Range(1)  # ok
+Range()  # error: [missing-argument] "No argument provided for required parameter `start`"
+```
+
+A required positional field cannot follow a field with a default.
+
+```py
+@define
+class Invalid:
+    x: int = field()
+    y: int  # error: [invalid-dataclass-field-order]
+
+    @x.default
+    def default_x(self) -> int:
+        return 0
+```
+
 Similar to above, we could also verify that the return type of the default method matches the type
 of the field it is providing a default for:
 
@@ -262,4 +289,104 @@ class WrongDefault:
     @age.default
     def _default_age(self) -> str:
         return "0"
+```
+
+## Custom initialization
+
+With `init=False`, attrs generates an `__attrs_init__` method that a custom `__init__` can call to
+initialize the fields, even on a frozen class.
+
+```py
+from attrs import frozen
+
+@frozen(init=False)
+class User:
+    name: str
+    role: str = "member"
+
+    def __init__(self, first_name: str, last_name: str) -> None:
+        self.__attrs_init__(name=f"{first_name} {last_name}")
+
+User("John", "Doe")  # ok
+User("John")  # error: [missing-argument]
+
+reveal_type(User.__attrs_init__)  # revealed: (self: User, /, name: str, role: str = "member") -> None
+```
+
+For classes without a custom `__init__`, attrs does not generate `__attrs_init__` when `init` is
+omitted or set to `True`.
+
+```py
+from attrs import define
+
+@define
+class Person:
+    name: str
+
+Person.__attrs_init__  # error: [missing-attribute]
+```
+
+attrs also generates an `__attrs_init__` method when `init` is omitted but the class has a custom
+`__init__`.
+
+```py
+@define
+class Guest:
+    name: str
+
+    def __init__(self) -> None:
+        # TODO: Recognize the generated `__attrs_init__` without an explicit `init=False`.
+        self.__attrs_init__(name="Guest")  # error: [missing-attribute]
+```
+
+## Unannotated fields
+
+attrs supports field definitions without annotations. In this case, the `type` argument can be used
+to declare the field type.
+
+In this example, fields without a `type=` declaration have the type `Unknown`.
+
+```py
+import attr
+
+@attr.s
+class User1:
+    id = attr.ib(type=int)
+    name = attr.ib()
+
+# TODO: Include the unannotated fields in the constructor signature.
+reveal_type(User1.__init__)  # revealed: (self: User1, /) -> None
+
+# TODO: No error here.
+# error: [unknown-argument]
+# error: [unknown-argument]
+user = User1(id=1, name="Alice")
+reveal_type(user.id)  # revealed: int
+reveal_type(user.name)  # revealed: Any
+
+# TODO: Report an invalid argument type for `id`.
+# error: [unknown-argument]
+# error: [unknown-argument]
+User1(id="1", name="Alice")
+```
+
+Unannotated fields also work with modern decorators. A field can declare a union type and a default.
+
+```py
+from attrs import define, field
+
+@define
+class User2:
+    name = field()
+    id = attr.ib(type=int | None, default=None)
+
+# TODO: Include the unannotated fields in the constructor signature.
+reveal_type(User2.__init__)  # revealed: (self: User2, /) -> None
+
+# TODO: No error here.
+# error: [unknown-argument]
+# error: [unknown-argument]
+user = User2(name="Alice", id=12)
+# TODO: This should reveal `int | None`.
+reveal_type(user.id)  # revealed: Any
 ```

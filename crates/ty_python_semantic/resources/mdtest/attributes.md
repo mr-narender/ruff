@@ -935,7 +935,7 @@ reveal_type(c_instance.b2)  # revealed: int
 
 ```py
 class C:
-    # This might trigger a stylistic lint like `invalid-first-argument-name-for-method`, but
+    # This might trigger a stylistic lint like `instance-method-receiver-not-named-self`, but
     # it should be supported in general:
     def __init__(this) -> None:
         this.declared_and_bound: str | None = "a"
@@ -5697,6 +5697,29 @@ class Answer(enum.Enum):
 reveal_type(Answer.NO)  # revealed: Literal[Answer.NO]
 reveal_type(Answer.NO.value)  # revealed: Literal[0]
 reveal_type(Answer.__members__)  # revealed: MappingProxyType[str, Answer]
+```
+
+## An implicit attribute inferred from a generic call
+
+An initializer can determine the type of an attribute and still have errors in its arguments.
+Subsequent writes must respect the inferred type.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def wrap(value: T, count: int) -> list[T]:
+    return [value] * count
+
+class Values:
+    def __init__(self, value: str):
+        self.items = wrap(value, "once")  # error: [invalid-argument-type]
+
+def update(values: Values):
+    reveal_type(values.items)  # revealed: list[str]
+    values.items = ["a"]
+    values.items = [1]  # error: [invalid-assignment]
 ```
 
 ## Divergent inferred implicit instance attribute types

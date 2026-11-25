@@ -31,18 +31,20 @@ use ruff_linter::package::PackageRoot;
 use ruff_linter::registry::Rule;
 use ruff_linter::rules::flake8_quotes::settings::Quote;
 use ruff_linter::source_kind::{SourceError, SourceKind};
-use ruff_linter::warn_user_once;
+use ruff_linter::{warn_user_once, warn_user_once_by_message};
+use ruff_python_ast::script::ScriptTag;
 use ruff_python_ast::{PySourceType, SourceType};
 use ruff_python_formatter::{FormatModuleError, QuoteStyle, format_module_source, format_range};
 use ruff_source_file::{LineIndex, LineRanges, OneIndexed, SourceFile, SourceFileBuilder};
 use ruff_text_size::{TextLen, TextRange, TextSize};
-use ruff_workspace::FormatterSettings;
 use ruff_workspace::resolver::{
-    ResolvedFile, Resolver, RootProject, match_exclusion, project_files_in_path,
+    Project, ResolvedFile, RootProject, match_exclusion, project_files_in_path,
 };
+use ruff_workspace::script::{ScriptSettingsError, script};
+use ruff_workspace::{FormatterSettings, Settings};
 
 use crate::args::{ConfigArguments, FormatArguments, FormatRange};
-use crate::cache::{Cache, FileCacheKey, PackageCacheMap, PackageCaches};
+use crate::cache::{Cache, FileCacheKey, PackageCacheMap, PackageCaches, ScriptCacheMode};
 use crate::{ExitStatus, resolve_default_files};
 
 #[derive(Debug, Copy, Clone, is_macro::Is)]
@@ -91,7 +93,7 @@ pub(crate) fn format(
         ));
     }
 
-    warn_incompatible_formatter_settings(&resolver);
+    warn_incompatible_formatter_settings(resolver.settings());
 
     // Discover the package root for each Python file.
     let package_roots = resolver.package_roots(
@@ -120,7 +122,8 @@ pub(crate) fn format(
             match entry {
                 Ok(resolved_file) => {
                     let path = resolved_file.path();
-                    let settings = resolver.resolve(path);
+                    let project = resolver.resolve_with_path(path);
+                    let settings = &project.settings;
 
                     let source_type = settings.formatter.extension.get_source_type(path);
                     if source_type.is_toml() {
@@ -152,7 +155,8 @@ pub(crate) fn format(
                         match catch_unwind(|| {
                             format_path(
                                 path,
-                                &settings.formatter,
+                                project,
+                                config_arguments,
                                 source_type,
                                 mode,
                                 cli.range,
@@ -251,18 +255,20 @@ pub(crate) fn format(
 #[tracing::instrument(level = "debug", skip_all, fields(path = %path.display()))]
 pub(crate) fn format_path(
     path: &Path,
-    settings: &FormatterSettings,
+    project: &Project,
+    overrides: &ConfigArguments,
     source_type: SourceType,
     mode: FormatMode,
     range: Option<FormatRange>,
     cache: Option<&Cache>,
 ) -> Result<FormatResult, FormatCommandError> {
+    let script_mode = ScriptCacheMode::new(project.settings.preview, source_type, overrides);
     if let Some(cache) = cache {
         let relative_path = cache
             .relative_path(path)
             .expect("wrong package cache for file");
 
-        if let Ok(cache_key) = FileCacheKey::from_path(path) {
+        if let Ok(cache_key) = FileCacheKey::from_path(path, script_mode) {
             if cache.is_formatted(relative_path, &cache_key) {
                 return Ok(FormatResult::Unchanged);
             }
@@ -279,6 +285,23 @@ pub(crate) fn format_path(
         }
     };
 
+    let script = script(
+        project,
+        overrides,
+        overrides.script_configuration(),
+        Some(path),
+        source_type,
+        unformatted.source_code(),
+    )
+    .map_err(|error| FormatCommandError::Configuration(path.to_owned(), error))?;
+    if let Some(script) = &script {
+        warn_incompatible_formatter_settings(std::iter::once(script.settings(&project.settings)));
+    }
+    let settings = match &script {
+        Some(script) => &script.settings(&project.settings).formatter,
+        None => &project.settings.formatter,
+    };
+
     // Don't write back to the cache if formatting a range.
     let cache = cache.filter(|_| range.is_none());
 
@@ -293,8 +316,14 @@ pub(crate) fn format_path(
                     .write(&mut writer)
                     .map_err(|err| FormatCommandError::Write(Some(path.to_path_buf()), err))?;
 
+                // Formatting can change script metadata or turn `#/// script` into a valid
+                // opening marker. The rewritten file may now use different settings.
+                let cache = cache.filter(|_| {
+                    matches!(script_mode, ScriptCacheMode::MetadataDisabled)
+                        || (script.is_none() && ScriptTag::parse(formatted.source_code()).is_none())
+                });
                 if let Some(cache) = cache {
-                    if let Ok(cache_key) = FileCacheKey::from_path(path) {
+                    if let Ok(cache_key) = FileCacheKey::from_path(path, script_mode) {
                         let relative_path = cache
                             .relative_path(path)
                             .expect("wrong package cache for file");
@@ -310,8 +339,9 @@ pub(crate) fn format_path(
             },
         },
         FormattedSource::Unchanged => {
+            let cache = cache.filter(|_| script_mode.allows(script.as_ref()));
             if let Some(cache) = cache {
-                if let Ok(cache_key) = FileCacheKey::from_path(path) {
+                if let Ok(cache_key) = FileCacheKey::from_path(path, script_mode) {
                     let relative_path = cache
                         .relative_path(path)
                         .expect("wrong package cache for file");
@@ -826,6 +856,7 @@ impl<'a> FormatResults<'a> {
 #[derive(Error, Debug)]
 pub(crate) enum FormatCommandError {
     Ignore(#[from] ignore::Error),
+    Configuration(PathBuf, ScriptSettingsError),
     Parse {
         error: DisplayParseError,
         source_file: SourceFile,
@@ -866,6 +897,7 @@ impl FormatCommandError {
                     None
                 }
             }
+            Self::Configuration(path, _) => Some(path),
             Self::Parse { error, .. } => error.path(),
             Self::Panic(path, _)
             | Self::Read(path, _)
@@ -887,6 +919,7 @@ impl From<&FormatCommandError> for Diagnostic {
         });
 
         let mut diagnostic = match error {
+            FormatCommandError::Configuration(_, error) => return error.diagnostic.clone(),
             FormatCommandError::Ignore(error) => {
                 Diagnostic::new(DiagnosticId::Io, Severity::Error, error)
             }
@@ -946,6 +979,24 @@ impl Display for FormatCommandError {
                             .map_or_else(|| err.to_string(), std::string::ToString::to_string)
                     )
                 }
+            }
+            Self::Configuration(path, error) => {
+                write!(
+                    f,
+                    "{}{}",
+                    "Failed to parse script metadata in ".bold(),
+                    fs::relativize_path(path).bold()
+                )?;
+                if let Some(span) = error
+                    .diagnostic
+                    .primary_annotation()
+                    .map(Annotation::get_span)
+                    && let Some(range) = span.range()
+                    && let Some(file) = span.as_ruff_file()
+                {
+                    write!(f, ":{}", file.to_source_code().line_column(range.start()))?;
+                }
+                write!(f, ": {}", error.diagnostic.headline_message())
             }
             Self::Parse { error, .. } => {
                 write!(f, "{error}")
@@ -1081,10 +1132,12 @@ impl ModifiedRange {
     }
 }
 
-pub(super) fn warn_incompatible_formatter_settings(resolver: &Resolver) {
+pub(super) fn warn_incompatible_formatter_settings<'a>(
+    settings: impl Iterator<Item = &'a Settings> + Clone,
+) {
     // First, collect all rules that are incompatible regardless of the linter-specific settings.
     let mut incompatible_rules = FxHashSet::default();
-    for setting in resolver.settings() {
+    for setting in settings.clone() {
         for rule in [
             // Flags missing trailing commas when all arguments are on its own line:
             // ```python
@@ -1110,11 +1163,11 @@ pub(super) fn warn_incompatible_formatter_settings(resolver: &Resolver) {
             .collect();
         rule_names.sort();
         if let [rule] = rule_names.as_slice() {
-            warn_user_once!(
+            warn_user_once_by_message!(
                 "The following rule may cause conflicts when used with the formatter: {rule}. To avoid unexpected behavior, we recommend disabling this rule, either by removing it from the `lint.select` or `lint.extend-select` configuration, or adding it to the `lint.ignore` configuration."
             );
         } else {
-            warn_user_once!(
+            warn_user_once_by_message!(
                 "The following rules may cause conflicts when used with the formatter: {}. To avoid unexpected behavior, we recommend disabling these rules, either by removing them from the `lint.select` or `lint.extend-select` configuration, or adding them to the `lint.ignore` configuration.",
                 rule_names.join(", ")
             );
@@ -1122,7 +1175,7 @@ pub(super) fn warn_incompatible_formatter_settings(resolver: &Resolver) {
     }
 
     // Next, validate settings-specific incompatibilities.
-    for setting in resolver.settings() {
+    for setting in settings {
         // Validate all rules that rely on tab styles.
         if setting.linter.rules.enabled(Rule::TabIndentation)
             && setting.formatter.indent_style.is_tab()

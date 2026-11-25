@@ -1582,6 +1582,29 @@ fn parameter_default_presence_invalidates_caller() -> anyhow::Result<()> {
 }
 
 #[test]
+fn instance_classification_tracks_ancestor_edits() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    let main = "/src/main.py";
+    db.write_file(main, "from other import C\ndef f(value: C): pass\n")?;
+    for base in ["object", "Any", "TypedDict", "object"] {
+        db.write_file(
+            "/src/other.pyi",
+            format!(
+                "from typing import Any, TypedDict\nclass Base({base}): ...\nclass C(Base): ...\n"
+            ),
+        )?;
+        let value = get_symbol(&db, main, &["f"], "value").expect_type();
+        if base == "TypedDict" {
+            assert_matches!(value, Type::TypedDict(_));
+        } else {
+            assert_matches!(value, Type::NominalInstance(instance)
+                if instance.inherits_from_explicit_any() == (base == "Any"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn inherited_writes_follow_changes_to_frozen_bases() -> anyhow::Result<()> {
     let mut db = setup_db();
     let path = "/src/main.py";
@@ -1659,6 +1682,23 @@ reveal_type(type(C))
 
     db.write_file("/src/base.py", base)?;
     assert_revealed_type(&db, "/src/main.py", "<class 'Meta1'>");
+    Ok(())
+}
+
+#[test]
+fn collection_type_follows_edits_to_its_receiver() -> anyhow::Result<()> {
+    let mut db = setup_db();
+    for (statement, expected) in [
+        ("items.append(1)", "list[int]"),
+        ("consume(items)", "list[Unknown]"),
+        ("items.append('x')", "list[str]"),
+    ] {
+        db.write_file(
+            "/src/main.py",
+            format!("from typing_extensions import reveal_type\ndef consume(x: list[int]): ...\nitems = []\n{statement}\nreveal_type(items)"),
+        )?;
+        assert_revealed_type(&db, "/src/main.py", expected);
+    }
     Ok(())
 }
 

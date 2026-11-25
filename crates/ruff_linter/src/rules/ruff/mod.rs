@@ -27,20 +27,20 @@ mod tests {
     #[test_case(Rule::CollectionLiteralConcatenation, Path::new("RUF005_slices.py"))]
     #[test_case(Rule::AsyncioDanglingTask, Path::new("RUF006.py"))]
     #[test_case(Rule::ZipInsteadOfPairwise, Path::new("RUF007.py"))]
-    #[test_case(Rule::MutableDataclassDefault, Path::new("RUF008.py"))]
-    #[test_case(Rule::MutableDataclassDefault, Path::new("RUF008_attrs.py"))]
-    #[test_case(Rule::MutableDataclassDefault, Path::new("RUF008_deferred.py"))]
-    #[test_case(Rule::FunctionCallInDataclassDefaultArgument, Path::new("RUF009.py"))]
+    #[test_case(Rule::MutableDataclassFieldDefault, Path::new("RUF008.py"))]
+    #[test_case(Rule::MutableDataclassFieldDefault, Path::new("RUF008_attrs.py"))]
+    #[test_case(Rule::MutableDataclassFieldDefault, Path::new("RUF008_deferred.py"))]
+    #[test_case(Rule::FunctionCallInDataclassFieldDefault, Path::new("RUF009.py"))]
     #[test_case(
-        Rule::FunctionCallInDataclassDefaultArgument,
+        Rule::FunctionCallInDataclassFieldDefault,
         Path::new("RUF009_attrs.py")
     )]
     #[test_case(
-        Rule::FunctionCallInDataclassDefaultArgument,
+        Rule::FunctionCallInDataclassFieldDefault,
         Path::new("RUF009_attrs_auto_attribs.py")
     )]
     #[test_case(
-        Rule::FunctionCallInDataclassDefaultArgument,
+        Rule::FunctionCallInDataclassFieldDefault,
         Path::new("RUF009_deferred.py")
     )]
     #[test_case(Rule::ExplicitFStringTypeConversion, Path::new("RUF010.py"))]
@@ -81,7 +81,7 @@ mod tests {
     #[test_case(Rule::UnnecessaryEmptyIterableWithinDequeCall, Path::new("RUF037.py"))]
     #[test_case(Rule::RedundantBoolLiteral, Path::new("RUF038.py"))]
     #[test_case(Rule::RedundantBoolLiteral, Path::new("RUF038.pyi"))]
-    #[test_case(Rule::InvalidAssertMessageLiteralArgument, Path::new("RUF040.py"))]
+    #[test_case(Rule::NonStringLiteralAsAssertMessage, Path::new("RUF040.py"))]
     #[test_case(Rule::UnnecessaryNestedLiteral, Path::new("RUF041.py"))]
     #[test_case(Rule::UnnecessaryNestedLiteral, Path::new("RUF041.pyi"))]
     #[test_case(Rule::PytestRaisesAmbiguousPattern, Path::new("RUF043.py"))]
@@ -121,8 +121,8 @@ mod tests {
     #[test_case(Rule::IncorrectDecoratorOrder, Path::new("RUF074.py"))]
     #[test_case(Rule::RenamedRuleInSuppressionComment, Path::new("RUF101_0.py"))]
     #[test_case(Rule::RenamedRuleInSuppressionComment, Path::new("RUF101_1.py"))]
-    #[test_case(Rule::InvalidRuleCode, Path::new("RUF102.py"))]
-    #[test_case(Rule::InvalidRuleCode, Path::new("RUF102_1.py"))]
+    #[test_case(Rule::UnknownRuleInSuppressionComment, Path::new("RUF102.py"))]
+    #[test_case(Rule::UnknownRuleInSuppressionComment, Path::new("RUF102_1.py"))]
     #[test_case(Rule::NonEmptyInitModule, Path::new("RUF067/modules/__init__.py"))]
     #[test_case(Rule::NonEmptyInitModule, Path::new("RUF067/modules/okay.py"))]
     fn rules(rule_code: Rule, path: &Path) -> Result<()> {
@@ -498,11 +498,11 @@ mod tests {
             Path::new("ruff/suppressions.py"),
             &settings::LinterSettings::for_rules(vec![
                 Rule::UnusedVariable,
-                Rule::UnusedFunctionArgument,
-                Rule::UnusedMethodArgument,
+                Rule::UnusedFunctionParameter,
+                Rule::UnusedMethodParameter,
                 Rule::AmbiguousVariableName,
                 Rule::UnusedSuppressionComment,
-                Rule::InvalidRuleCode,
+                Rule::UnknownRuleInSuppressionComment,
                 Rule::InvalidSuppressionComment,
                 Rule::UnmatchedSuppressionComment,
             ])
@@ -660,9 +660,9 @@ mod tests {
 
     #[test_case(Path::new("ruff/RUF102.py"))]
     #[test_case(Path::new("ruff/RUF102_1.py"))]
-    fn invalid_rule_code_external_rules(path: &Path) -> Result<()> {
+    fn unknown_rule_in_suppression_comment_external_rules(path: &Path) -> Result<()> {
         let snapshot = format!(
-            "invalid_rule_code_external_rules_{}",
+            "unknown_rule_in_suppression_comment_external_rules_{}",
             path.to_string_lossy(),
         );
         let diagnostics = test_path(
@@ -670,7 +670,7 @@ mod tests {
             &settings::LinterSettings {
                 external: vec!["V".to_string()],
                 preview: PreviewMode::Enabled,
-                ..settings::LinterSettings::for_rule(Rule::InvalidRuleCode)
+                ..settings::LinterSettings::for_rule(Rule::UnknownRuleInSuppressionComment)
             },
         )?;
         assert_diagnostics!(snapshot, diagnostics);
@@ -793,8 +793,8 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(Rule::MutableDataclassDefault, Path::new("RUF008.py"))]
-    #[test_case(Rule::MutableDataclassDefault, Path::new("RUF008_attrs.py"))]
+    #[test_case(Rule::MutableDataclassFieldDefault, Path::new("RUF008.py"))]
+    #[test_case(Rule::MutableDataclassFieldDefault, Path::new("RUF008_attrs.py"))]
     #[test_case(Rule::UnrawRePattern, Path::new("RUF039.py"))]
     #[test_case(Rule::UnrawRePattern, Path::new("RUF039_concat.py"))]
     #[test_case(Rule::UnnecessaryRegularExpression, Path::new("RUF055_0.py"))]

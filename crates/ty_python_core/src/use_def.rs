@@ -246,8 +246,8 @@
 //! [`SemanticIndexBuilder`](crate::builder::SemanticIndexBuilder), e.g. where it
 //! visits a `StmtIf` node.
 
-use std::collections::hash_map::Entry;
-use std::hash::{Hash as _, Hasher as _};
+use hashbrown::hash_table::Entry;
+use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
 use std::ops::Index;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
@@ -255,7 +255,7 @@ use std::sync::{Arc, LazyLock};
 use ruff_index::{FrozenIndexVec, Idx, IndexVec, newtype_index};
 use ruff_python_ast::NodeIndex;
 use ruff_text_size::TextRange;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
@@ -348,11 +348,13 @@ struct PlaceStateInterner {
     interned_bindings: RetainedBindingsBuilder,
     interned_ids_by_bindings: hashbrown::HashTable<InternedBindingsId>,
     interned_declarations: RetainedDeclarationsBuilder,
-    interned_ids_by_declarations: FxHashMap<Declarations, InternedDeclarationsId>,
+    interned_ids_by_declarations: hashbrown::HashTable<InternedDeclarationsId>,
     // Undeclared states are common and can be interned by their dense constraint IDs.
     undeclared_declarations_by_constraint:
         IndexVec<ScopedReachabilityConstraintId, Option<InternedDeclarationsId>>,
     // These values are extremely common, so avoid repeatedly hashing their small vectors.
+    empty_bindings: Option<InternedBindingsId>,
+    empty_declarations: Option<InternedDeclarationsId>,
     always_unbound_bindings: Option<InternedBindingsId>,
     always_undeclared_declarations: Option<InternedDeclarationsId>,
 }
@@ -363,17 +365,22 @@ impl PlaceStateInterner {
             interned_bindings: RetainedBindingsBuilder::with_capacity(bindings),
             interned_ids_by_bindings: hashbrown::HashTable::with_capacity(bindings),
             interned_declarations: RetainedDeclarationsBuilder::with_capacity(declarations),
-            interned_ids_by_declarations: FxHashMap::with_capacity_and_hasher(
-                declaration_map,
-                FxBuildHasher,
-            ),
+            interned_ids_by_declarations: hashbrown::HashTable::with_capacity(declaration_map),
             undeclared_declarations_by_constraint: IndexVec::new(),
+            empty_bindings: None,
+            empty_declarations: None,
             always_unbound_bindings: None,
             always_undeclared_declarations: None,
         }
     }
 
     fn intern_bindings(&mut self, bindings: &Bindings) -> InternedBindingsId {
+        // Reachable places with no explicit bindings share an empty slice.
+        if bindings.as_slice().is_empty() {
+            return *self
+                .empty_bindings
+                .get_or_insert_with(|| self.interned_bindings.push(bindings));
+        }
         if bindings.is_always_unbound() {
             if let Some(interned_id) = self.always_unbound_bindings {
                 return interned_id;
@@ -386,16 +393,16 @@ impl PlaceStateInterner {
 
         // The retained representation discards the unbound narrowing constraint, so it isn't
         // part of the interned identity.
-        let hash = Self::hash_bindings(bindings.as_slice());
+        let hash = Self::hash(bindings.as_slice());
         let interned_bindings = &mut self.interned_bindings;
         let entry = self.interned_ids_by_bindings.entry(
             hash,
             |id| interned_bindings.get(*id) == bindings.as_slice(),
-            |id| Self::hash_bindings(interned_bindings.get(*id)),
+            |id| Self::hash(interned_bindings.get(*id)),
         );
         match entry {
-            hashbrown::hash_table::Entry::Occupied(entry) => *entry.get(),
-            hashbrown::hash_table::Entry::Vacant(entry) => {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
                 let interned_id = interned_bindings.push(bindings);
                 entry.insert(interned_id);
                 interned_id
@@ -403,19 +410,24 @@ impl PlaceStateInterner {
         }
     }
 
-    fn hash_bindings(live_bindings: &[LiveBinding]) -> u64 {
+    fn hash<T: std::hash::Hash>(values: &[T]) -> u64 {
         let mut hasher = FxHasher::default();
-        live_bindings.hash(&mut hasher);
+        values.hash(&mut hasher);
         hasher.finish()
     }
 
-    fn intern_declarations(&mut self, declarations: Declarations) -> InternedDeclarationsId {
+    fn intern_declarations(&mut self, declarations: &Declarations) -> InternedDeclarationsId {
+        if declarations.as_slice().is_empty() {
+            return *self
+                .empty_declarations
+                .get_or_insert_with(|| self.interned_declarations.push(declarations));
+        }
         if declarations.is_always_undeclared() {
             if let Some(interned_id) = self.always_undeclared_declarations {
                 return interned_id;
             }
 
-            let interned_id = self.interned_declarations.push(&declarations);
+            let interned_id = self.interned_declarations.push(declarations);
             self.always_undeclared_declarations = Some(interned_id);
             return interned_id;
         }
@@ -434,15 +446,21 @@ impl PlaceStateInterner {
                 return interned_id;
             }
 
-            let interned_id = self.interned_declarations.push(&declarations);
+            let interned_id = self.interned_declarations.push(declarations);
             self.undeclared_declarations_by_constraint[reachability_constraint] = Some(interned_id);
             return interned_id;
         }
 
-        match self.interned_ids_by_declarations.entry(declarations) {
+        let interned = &mut self.interned_declarations;
+        let entry = self.interned_ids_by_declarations.entry(
+            Self::hash(declarations.as_slice()),
+            |id| interned.get(*id) == declarations.as_slice(),
+            |id| Self::hash(interned.get(*id)),
+        );
+        match entry {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
-                let interned_id = self.interned_declarations.push(entry.key());
+                let interned_id = interned.push(declarations);
                 entry.insert(interned_id);
                 interned_id
             }
@@ -452,7 +470,7 @@ impl PlaceStateInterner {
     fn intern_place_state(
         &mut self,
         bindings: &Bindings,
-        declarations: Declarations,
+        declarations: &Declarations,
     ) -> InternedPlaceStateId {
         InternedPlaceStateId(
             self.intern_bindings(bindings),
@@ -463,14 +481,14 @@ impl PlaceStateInterner {
     fn retain_place_state(
         &mut self,
         bindings: &Bindings,
-        declarations: Declarations,
+        declarations: &Declarations,
     ) -> InternedPlaceStateId {
         // Other retained declarations rarely repeat. Keep the compact IDs without hashing every
         // declaration vector to find the occasional duplicate.
         let declarations_id = if declarations.undeclared_reachability_constraint().is_some() {
             self.intern_declarations(declarations)
         } else {
-            self.interned_declarations.push(&declarations)
+            self.interned_declarations.push(declarations)
         };
         InternedPlaceStateId(self.intern_bindings(bindings), declarations_id)
     }
@@ -661,17 +679,19 @@ impl PredicateNarrowingTargets {
         Self(entries.into_boxed_slice())
     }
 
-    /// Returns whether `predicate` may narrow `place`.
-    pub fn contains(&self, predicate: ScopedPredicateId, place: ScopedPlaceId) -> bool {
-        self.0
-            .binary_search_by_key(&(place, predicate), |&(predicate, place)| {
-                (place, predicate)
-            })
-            .is_ok()
+    /// Returns the predicate entries for a single place, in predicate order.
+    pub fn for_place(&self, place: ScopedPlaceId) -> &[(ScopedPredicateId, ScopedPlaceId)] {
+        let start = self.0.partition_point(|&(_, target)| target < place);
+        let remaining = &self.0[start..];
+        if remaining.first().is_none_or(|&(_, target)| target != place) {
+            return &[];
+        }
+        let len = remaining.partition_point(|&(_, target)| target == place);
+        &remaining[..len]
     }
 
     /// Returns whether any predicate may narrow `place`.
-    pub fn contains_place(&self, place: ScopedPlaceId) -> bool {
+    fn contains_place(&self, place: ScopedPlaceId) -> bool {
         self.0
             .binary_search_by_key(&place, |&(_, target)| target)
             .is_ok()
@@ -910,8 +930,8 @@ impl ScopeReachability {
 /// identical tables can share storage without sharing the scope-specific data they reference.
 #[derive(Default)]
 pub(super) struct UseDefMapInterner {
-    bindings: FxHashSet<Arc<RetainedBindings>>,
-    declarations: FxHashSet<Arc<RetainedDeclarations>>,
+    bindings: hashbrown::HashTable<(u64, Arc<RetainedBindings>)>,
+    declarations: hashbrown::HashTable<(u64, Arc<RetainedDeclarations>)>,
     stub_layouts: FxHashMap<SmallVec<[bool; 8]>, StubParameterLayout>,
 }
 
@@ -1018,15 +1038,22 @@ impl UseDefMapInterner {
         Arc::new(map)
     }
 
+    /// Hash each scope's table once, even when the interner grows.
     fn intern_table<T: Eq + std::hash::Hash>(
-        values: &mut FxHashSet<Arc<T>>,
+        values: &mut hashbrown::HashTable<(u64, Arc<T>)>,
         value: Arc<T>,
     ) -> Arc<T> {
-        if let Some(existing) = values.get(value.as_ref()) {
-            Arc::clone(existing)
-        } else {
-            values.insert(Arc::clone(&value));
-            value
+        let hash = FxBuildHasher.hash_one(value.as_ref());
+        match values.entry(
+            hash,
+            |(stored_hash, existing)| *stored_hash == hash && *existing == value,
+            |(stored_hash, _)| *stored_hash,
+        ) {
+            Entry::Occupied(entry) => Arc::clone(&entry.get().1),
+            Entry::Vacant(entry) => {
+                entry.insert((hash, Arc::clone(&value)));
+                value
+            }
         }
     }
 }
@@ -1854,17 +1881,27 @@ struct NarrowingPrefix {
     constraint: ScopedNarrowingConstraint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingNarrowing {
+    Constraint(ScopedNarrowingConstraint),
+    /// Tips of two paths that start at this node's parent.
+    Join(PendingReachabilityId, PendingReachabilityId),
+}
+
+impl PendingNarrowing {
+    const ALWAYS_TRUE: Self = Self::Constraint(ScopedNarrowingConstraint::ALWAYS_TRUE);
+}
+
 #[derive(Debug)]
 struct PendingReachabilityConstraint {
     parent: PendingReachabilityId,
     kind: PendingNodeKind,
     narrowing_prefix: Option<NarrowingPrefix>,
     reachability_constraint: ScopedReachabilityConstraintId,
-    narrowing_constraint: ScopedNarrowingConstraint,
+    narrowing_constraint: PendingNarrowing,
     scope_reachability: ScopedReachabilityConstraintId,
-    /// Oldest ancestor from which applying the intervening pending constraints to its stored
-    /// scope reachability produces this node's scope reachability. Node IDs increase along paths.
-    path_start: PendingReachabilityId,
+    /// Gates through the last merge are visible even to reads of unchanged places.
+    last_join: PendingReachabilityId,
 }
 
 /// An append-only tree of scope-wide reachability constraints and narrowing gates.
@@ -1873,6 +1910,9 @@ struct PendingReachabilityConstraint {
 /// snapshots can share place states and defer applying subsequent constraints until needed.
 #[derive(Debug)]
 struct PendingReachability {
+    /// Bindings with the same narrowing constraint at a fork share the result of its join.
+    join_cache:
+        FxHashMap<(PendingReachabilityId, ScopedNarrowingConstraint), ScopedNarrowingConstraint>,
     constraints: IndexVec<PendingReachabilityId, PendingReachabilityConstraint>,
     current: PendingReachabilityId,
 }
@@ -1886,12 +1926,13 @@ impl Default for PendingReachability {
             kind: PendingNodeKind::Linear,
             narrowing_prefix: None,
             reachability_constraint: ScopedReachabilityConstraintId::ALWAYS_TRUE,
-            narrowing_constraint: ScopedNarrowingConstraint::ALWAYS_TRUE,
+            narrowing_constraint: PendingNarrowing::ALWAYS_TRUE,
             scope_reachability: ScopedReachabilityConstraintId::ALWAYS_TRUE,
-            path_start: root,
+            last_join: root,
         });
         Self {
             constraints,
+            join_cache: FxHashMap::default(),
             current: root,
         }
     }
@@ -1907,25 +1948,17 @@ impl PendingReachability {
         &mut self,
         reachability_constraint: ScopedReachabilityConstraintId,
         narrowing_constraint: ScopedNarrowingConstraint,
-        previous_scope_reachability: ScopedReachabilityConstraintId,
         scope_reachability: ScopedReachabilityConstraintId,
     ) {
         let parent = &self.constraints[self.current];
-        // A merge may change scope reachability without moving the pending cursor. Its saved
-        // prefix then no longer describes the scope, so the next node begins a new path.
-        let path_start = if parent.scope_reachability == previous_scope_reachability {
-            parent.path_start
-        } else {
-            self.constraints.next_index()
-        };
         self.current = self.constraints.push(PendingReachabilityConstraint {
             parent: self.current,
             kind: PendingNodeKind::Linear,
             narrowing_prefix: None,
             reachability_constraint,
-            narrowing_constraint,
+            narrowing_constraint: PendingNarrowing::Constraint(narrowing_constraint),
             scope_reachability,
-            path_start,
+            last_join: parent.last_join,
         });
     }
 
@@ -1934,7 +1967,7 @@ impl PendingReachability {
     /// The place's node must be an ancestor of `target`. After materialization, the place is
     /// uniquely owned for mutation and records `target` as its last applied node.
     fn materialize<'a>(
-        &self,
+        &mut self,
         pending: &'a mut PendingPlaceState,
         target: PendingReachabilityId,
         narrowing_constraints: &mut NarrowingConstraintsBuilder,
@@ -1947,18 +1980,18 @@ impl PendingReachability {
     }
 
     fn materialize_narrowing(
-        &self,
+        &mut self,
         pending: &mut PendingPlaceState,
         target: PendingReachabilityId,
         narrowing_constraints: &mut NarrowingConstraintsBuilder,
     ) {
         if pending.narrowing != target {
-            let mut unapplied = SmallVec::<[ScopedNarrowingConstraint; 4]>::new();
+            let mut unapplied = SmallVec::<[PendingReachabilityId; 4]>::new();
             let mut current = target;
             while current != pending.narrowing {
                 let event = &self.constraints[current];
-                if event.narrowing_constraint != ScopedNarrowingConstraint::ALWAYS_TRUE {
-                    unapplied.push(event.narrowing_constraint);
+                if event.narrowing_constraint != PendingNarrowing::ALWAYS_TRUE {
+                    unapplied.push(current);
                 }
                 assert_ne!(
                     current, event.parent,
@@ -1970,7 +2003,14 @@ impl PendingReachability {
             if !unapplied.is_empty() {
                 let state = Rc::make_mut(&mut pending.state);
                 for constraint in unapplied.into_iter().rev() {
-                    state.record_narrowing_constraint(narrowing_constraints, constraint);
+                    match self.constraints[constraint].narrowing_constraint {
+                        PendingNarrowing::Constraint(gate) => {
+                            state.record_narrowing_constraint(narrowing_constraints, gate);
+                        }
+                        PendingNarrowing::Join(..) => state.map_narrowing_constraints(|prefix| {
+                            self.apply_join(constraint, prefix, narrowing_constraints)
+                        }),
+                    }
                 }
             }
             pending.narrowing = target;
@@ -1991,15 +2031,12 @@ impl PendingReachability {
         let previous = pending.reachability;
         pending.reachability = target;
         let target_event = &self.constraints[target];
-        // The place cursor is an ancestor of `target`. Within this uninterrupted path, a
-        // matching initial reachability yields the exact same AND operations, in the same
-        // order, as the scope prefix, including when the constraint arena reaches its limit.
-        if previous.index() >= target_event.path_start.index()
-            && state.try_replace_reachability(
-                self.constraints[previous].scope_reachability,
-                target_event.scope_reachability,
-            )
-        {
+        // At each step the scope and a place with the same reachability follow
+        // the same path, including across merges.
+        if state.try_replace_reachability(
+            self.constraints[previous].scope_reachability,
+            target_event.scope_reachability,
+        ) {
             return state;
         }
 
@@ -2007,7 +2044,9 @@ impl PendingReachability {
         let mut current = target;
         while current != previous {
             let event = &self.constraints[current];
-            unapplied.push(event.reachability_constraint);
+            if event.reachability_constraint != ScopedReachabilityConstraintId::ALWAYS_TRUE {
+                unapplied.push(event.reachability_constraint);
+            }
             assert_ne!(
                 current, event.parent,
                 "pending reachability must be an ancestor"
@@ -2026,7 +2065,7 @@ impl PendingReachability {
     /// constraints are already materialized, this preserves the shared [`Rc`] instead of making
     /// the state uniquely owned.
     fn materialize_ref<'a>(
-        &self,
+        &mut self,
         pending: &'a mut PendingPlaceState,
         target: PendingReachabilityId,
         narrowing_constraints: &mut NarrowingConstraintsBuilder,
@@ -2045,52 +2084,33 @@ impl PendingReachability {
 
     /// Returns the place state needed to resolve a use.
     ///
-    /// Pending narrowing gates are only needed to preserve path correlations across a later place
-    /// change or merge, so they are not materialized here.
+    /// Materialize narrowing through the last merge, but leave subsequent gates pending
+    /// until the next place change or merge.
     fn materialize_ref_at_use<'a>(
-        &self,
+        &mut self,
         pending: &'a mut PendingPlaceState,
         target: PendingReachabilityId,
+        narrowing_constraints: &mut NarrowingConstraintsBuilder,
         reachability_constraints: &mut ReachabilityConstraintsBuilder,
     ) -> &'a PlaceState {
         self.materialize_reachability(pending, target, reachability_constraints);
-        &pending.state
-    }
-
-    /// Combines the constraints after `ancestor` through `target` into a single constraint.
-    ///
-    /// `ancestor` must be an ancestor of `target`.
-    fn constraint_between(
-        &self,
-        ancestor: PendingReachabilityId,
-        target: PendingReachabilityId,
-        reachability_constraints: &mut ReachabilityConstraintsBuilder,
-    ) -> ScopedReachabilityConstraintId {
-        let mut constraint = ScopedReachabilityConstraintId::ALWAYS_TRUE;
-        let mut current = target;
-        while current != ancestor {
-            let event = &self.constraints[current];
-            constraint = reachability_constraints
-                .add_and_constraint(constraint, event.reachability_constraint);
-            assert_ne!(
-                current, event.parent,
-                "pending reachability must be an ancestor"
-            );
-            current = event.parent;
+        let joined = self.constraints[target].last_join;
+        if pending.narrowing.index() < joined.index() {
+            self.materialize_narrowing(pending, joined, narrowing_constraints);
         }
-        constraint
+        &pending.state
     }
 
     /// Combines the narrowing gates after `ancestor` through `target` into one constraint.
     ///
     /// `ancestor` must be an ancestor of `target`.
     fn narrowing_constraint_between(
-        &self,
+        &mut self,
         ancestor: PendingReachabilityId,
         target: PendingReachabilityId,
         narrowing_constraints: &mut NarrowingConstraintsBuilder,
     ) -> ScopedNarrowingConstraint {
-        let mut unapplied = SmallVec::<[ScopedNarrowingConstraint; 4]>::new();
+        let mut unapplied = SmallVec::<[PendingReachabilityId; 4]>::new();
         let mut current = target;
         let mut constraint = ScopedNarrowingConstraint::ALWAYS_TRUE;
         let prefix = self.constraints[ancestor].narrowing_prefix;
@@ -2104,8 +2124,8 @@ impl PendingReachability {
                 break;
             }
             let event = &self.constraints[current];
-            if event.narrowing_constraint != ScopedNarrowingConstraint::ALWAYS_TRUE {
-                unapplied.push(event.narrowing_constraint);
+            if event.narrowing_constraint != PendingNarrowing::ALWAYS_TRUE {
+                unapplied.push(current);
             }
             assert_ne!(
                 current, event.parent,
@@ -2115,25 +2135,118 @@ impl PendingReachability {
         }
 
         for pending in unapplied.into_iter().rev() {
-            constraint = narrowing_constraints.add_and_constraint(constraint, pending);
+            constraint = match self.constraints[pending].narrowing_constraint {
+                PendingNarrowing::Constraint(gate) => {
+                    narrowing_constraints.add_and_constraint(constraint, gate)
+                }
+                PendingNarrowing::Join(..) => {
+                    self.apply_join(pending, constraint, narrowing_constraints)
+                }
+            };
         }
         constraint
     }
 
-    /// Returns the lowest common ancestor of two nodes in the pending-constraint tree.
+    /// Narrows along both paths starting from the same prefix before taking their union.
+    ///
+    /// A flat `if`/`elif` chain can produce deeply nested joins, so use an explicit stack.
+    fn apply_join(
+        &mut self,
+        join: PendingReachabilityId,
+        prefix: ScopedNarrowingConstraint,
+        constraints: &mut NarrowingConstraintsBuilder,
+    ) -> ScopedNarrowingConstraint {
+        enum Step {
+            Apply(PendingReachabilityId),
+            Right {
+                join: PendingReachabilityId,
+                tip: PendingReachabilityId,
+                input: ScopedNarrowingConstraint,
+            },
+            Merge {
+                join: PendingReachabilityId,
+                input: ScopedNarrowingConstraint,
+                left: ScopedNarrowingConstraint,
+            },
+        }
+
+        if let Some(&result) = self.join_cache.get(&(join, prefix)) {
+            return result;
+        }
+
+        let mut steps = SmallVec::<[Step; 8]>::new();
+        steps.push(Step::Apply(join));
+        // Each Right step saves the input while we evaluate the left path.
+        // Each Merge step saves that result while we evaluate the right path.
+        let mut value = prefix;
+        while let Some(step) = steps.pop() {
+            let (fork, mut tip) = match step {
+                Step::Apply(id) => {
+                    let node = &self.constraints[id];
+                    match node.narrowing_constraint {
+                        PendingNarrowing::Constraint(gate) => {
+                            value = constraints.add_and_constraint(value, gate);
+                            continue;
+                        }
+                        PendingNarrowing::Join(left, right) => {
+                            if let Some(&result) = self.join_cache.get(&(id, value)) {
+                                value = result;
+                                continue;
+                            }
+                            steps.push(Step::Right {
+                                join: id,
+                                tip: right,
+                                input: value,
+                            });
+                            (node.parent, left)
+                        }
+                    }
+                }
+                Step::Right { join, tip, input } => {
+                    steps.push(Step::Merge {
+                        join,
+                        input,
+                        left: value,
+                    });
+                    value = input;
+                    (self.constraints[join].parent, tip)
+                }
+                Step::Merge { join, input, left } => {
+                    value = constraints.add_or_constraint(left, value);
+                    self.join_cache.insert((join, input), value);
+                    continue;
+                }
+            };
+            // Push gates backwards so they apply in source order.
+            while tip != fork {
+                let node = &self.constraints[tip];
+                if node.narrowing_constraint != PendingNarrowing::ALWAYS_TRUE {
+                    steps.push(Step::Apply(tip));
+                }
+                tip = node.parent;
+            }
+        }
+        value
+    }
+
+    /// Returns the lowest common ancestor and whether either path applies narrowing after it.
     fn common_ancestor(
         &self,
         mut left: PendingReachabilityId,
         mut right: PendingReachabilityId,
-    ) -> PendingReachabilityId {
+    ) -> (PendingReachabilityId, bool) {
+        let mut has_narrowing = false;
         while left != right {
-            if left.index() > right.index() {
-                left = self.constraints[left].parent;
+            let cursor = if left.index() > right.index() {
+                &mut left
             } else {
-                right = self.constraints[right].parent;
-            }
+                &mut right
+            };
+            let event = &self.constraints[*cursor];
+            has_narrowing |= event.narrowing_constraint != PendingNarrowing::ALWAYS_TRUE;
+            *cursor = event.parent;
         }
-        left
+        (left, has_narrowing)
     }
 }
 
@@ -2170,24 +2283,72 @@ fn pending_place_state_mut<'a>(
 #[derive(Clone, Copy)]
 struct PendingBranch {
     tip: PendingReachabilityId,
-    common_ancestor: PendingReachabilityId,
+    joined: PendingReachabilityId,
     last_fork: PendingReachabilityId,
 }
 
 impl PendingReachability {
-    /// Finds where the incoming branch diverged from the current path. Later alternatives
-    /// can share more of this branch, up to its last fork.
-    fn branch_to_merge(&self, tip: PendingReachabilityId) -> PendingBranch {
-        let common_ancestor = self.common_ancestor(self.current, tip);
+    /// Creates the pending path after a merge and locates the last fork of the incoming path.
+    fn branch_to_merge(
+        &mut self,
+        tip: PendingReachabilityId,
+        scope_reachability: ScopedReachabilityConstraintId,
+        narrowing: &mut NarrowingConstraintsBuilder,
+    ) -> PendingBranch {
+        let (common_ancestor, has_narrowing) = self.common_ancestor(self.current, tip);
         let mut last_fork = tip;
         while last_fork != common_ancestor
             && self.constraints[last_fork].kind != PendingNodeKind::Fork
         {
             last_fork = self.constraints[last_fork].parent;
         }
+        // Keep the common prefix shared. Changed places are merged eagerly and resume
+        // at the join. Unchanged places apply the prefix and the joined gates on demand.
+        let joined = if self.current == tip {
+            tip
+        } else {
+            let narrowing_constraint = if !has_narrowing
+                || common_ancestor == self.current
+                || common_ancestor == tip
+            {
+                PendingNarrowing::ALWAYS_TRUE
+            } else if self.constraints[self.current].last_join != self.constraints[tip].last_join {
+                // At least one path crosses a merge after the fork. Eager narrowing
+                // would have applied the binding's prefix there, giving us
+                // (prefix & left) | (prefix & right). Simplifying left | right first
+                // can remove a test of a Never value, even though neither outcome
+                // of that test is possible.
+                PendingNarrowing::Join(self.current, tip)
+            } else {
+                let current =
+                    self.narrowing_constraint_between(common_ancestor, self.current, narrowing);
+                let incoming = self.narrowing_constraint_between(common_ancestor, tip, narrowing);
+                PendingNarrowing::Constraint(narrowing.add_or_constraint(current, incoming))
+            };
+            let parent = &self.constraints[common_ancestor];
+            // Every binding and declaration reaching the fork already requires the
+            // common prefix. The merged scope therefore supplies the remaining guard
+            // without rebuilding either path relative to the fork.
+            let reachability_constraint = if scope_reachability == parent.scope_reachability {
+                ScopedReachabilityConstraintId::ALWAYS_TRUE
+            } else {
+                scope_reachability
+            };
+            // Keep a distinct last_join even when both constraints cancel. An outer
+            // merge still needs to know that this path went through a merge.
+            self.constraints.push(PendingReachabilityConstraint {
+                parent: common_ancestor,
+                kind: PendingNodeKind::Linear,
+                narrowing_prefix: None,
+                reachability_constraint,
+                narrowing_constraint,
+                scope_reachability,
+                last_join: self.constraints.next_index(),
+            })
+        };
         PendingBranch {
             tip,
-            common_ancestor,
+            joined,
             last_fork,
         }
     }
@@ -2241,81 +2402,32 @@ impl PendingReachability {
         narrowing_constraints: &mut NarrowingConstraintsBuilder,
         reachability_constraints: &mut ReachabilityConstraintsBuilder,
     ) {
-        let branch_ancestor = branch.common_ancestor;
-        let current_narrowing =
-            self.narrowing_constraint_between(branch_ancestor, self.current, narrowing_constraints);
-        let branch_narrowing =
-            self.narrowing_constraint_between(branch_ancestor, branch.tip, narrowing_constraints);
-        let merged_narrowing =
-            narrowing_constraints.add_or_constraint(current_narrowing, branch_narrowing);
-        // Consecutive places often share their last applied reachability node, so their
-        // merged path constraint can be reused even when they have distinct place states.
-        let mut last_merged_reachability = None;
         let mut last_singleton_merge = None;
         let mut branch_states = branch_states.into_iter();
         for current in current_states {
             let Some(mut branch_state) = branch_states.next() else {
-                let current = self.materialize(
+                let state = self.materialize(
                     current,
                     self.current,
                     narrowing_constraints,
                     reachability_constraints,
                 );
-                current.merge(
+                state.merge(
                     &PlaceState::undefined(branch_reachability),
                     narrowing_constraints,
                     reachability_constraints,
                 );
+                current.reachability = branch.joined;
+                current.narrowing = branch.joined;
                 continue;
             };
 
-            // If neither branch changed the place itself, merge just the path constraints. The
-            // common case is a truthy/falsy pair whose constraints cancel to `ALWAYS_TRUE`, leaving
-            // the shared state untouched.
+            // Both paths lead to the same place. Its pending gates now
+            // include the joined branch, so its state can remain shared.
             if current.reachability == branch_state.reachability
                 && current.narrowing == branch_state.narrowing
                 && Rc::ptr_eq(&current.state, &branch_state.state)
             {
-                if self.current == branch.tip {
-                    continue;
-                }
-
-                // Preserve gates that precede the branch, then merge gates introduced on the
-                // individual branch paths. If either path has no gate, the merged gate simplifies
-                // to `ALWAYS_TRUE` and can be discarded.
-                self.materialize_narrowing(current, branch_ancestor, narrowing_constraints);
-                if merged_narrowing != ScopedNarrowingConstraint::ALWAYS_TRUE {
-                    Rc::make_mut(&mut current.state)
-                        .record_narrowing_constraint(narrowing_constraints, merged_narrowing);
-                }
-
-                let merged_constraint = match last_merged_reachability {
-                    Some((ancestor, constraint)) if ancestor == current.reachability => constraint,
-                    _ => {
-                        let current_constraint = self.constraint_between(
-                            current.reachability,
-                            self.current,
-                            reachability_constraints,
-                        );
-                        let branch_constraint = self.constraint_between(
-                            current.reachability,
-                            branch.tip,
-                            reachability_constraints,
-                        );
-                        let merged_constraint = reachability_constraints
-                            .add_or_constraint(current_constraint, branch_constraint);
-                        last_merged_reachability = Some((current.reachability, merged_constraint));
-                        merged_constraint
-                    }
-                };
-                if merged_constraint != ScopedReachabilityConstraintId::ALWAYS_TRUE {
-                    Rc::make_mut(&mut current.state).record_reachability_constraint(
-                        reachability_constraints,
-                        merged_constraint,
-                    );
-                }
-                current.reachability = self.current;
-                current.narrowing = self.current;
                 continue;
             }
 
@@ -2338,8 +2450,8 @@ impl PendingReachability {
                 && inputs == previous
             {
                 Rc::make_mut(&mut current.state).set_singleton_constraints(merged);
-                current.reachability = self.current;
-                current.narrowing = self.current;
+                current.reachability = branch.joined;
+                current.narrowing = branch.joined;
                 continue;
             }
 
@@ -2349,26 +2461,28 @@ impl PendingReachability {
                 narrowing_constraints,
                 reachability_constraints,
             );
-            let current = self.materialize(
+            let state = self.materialize(
                 current,
                 self.current,
                 narrowing_constraints,
                 reachability_constraints,
             );
             if let Some(inputs) = inputs {
-                let merged = current.merge_singleton(
+                let merged = state.merge_singleton(
                     branch_state,
                     narrowing_constraints,
                     reachability_constraints,
                 );
                 last_singleton_merge = Some((inputs, merged));
             } else {
-                current.merge(
+                state.merge(
                     branch_state,
                     narrowing_constraints,
                     reachability_constraints,
                 );
             }
+            current.reachability = branch.joined;
+            current.narrowing = branch.joined;
         }
     }
 }
@@ -2981,7 +3095,6 @@ impl<'db> UseDefMapBuilder<'db> {
         self.pending_reachability.push(
             reachability_constraint,
             narrowing_constraint,
-            previous_scope_reachability,
             self.reachability,
         );
     }
@@ -3124,6 +3237,7 @@ impl<'db> UseDefMapBuilder<'db> {
                         .materialize_ref_at_use(
                             state,
                             snapshot.pending_reachability,
+                            &mut self.narrowing_constraints,
                             &mut self.reachability_constraints,
                         )
                         .bindings()
@@ -3139,6 +3253,7 @@ impl<'db> UseDefMapBuilder<'db> {
         let place_state = self.pending_reachability.materialize_ref_at_use(
             place_state,
             pending,
+            &mut self.narrowing_constraints,
             &mut self.reachability_constraints,
         );
         let bindings = place_state.bindings().clone();
@@ -3162,6 +3277,7 @@ impl<'db> UseDefMapBuilder<'db> {
             let place_state = self.pending_reachability.materialize_ref_at_use(
                 place_state,
                 pending,
+                &mut self.narrowing_constraints,
                 &mut self.reachability_constraints,
             );
             let bindings = place_state.bindings().clone();
@@ -3462,9 +3578,14 @@ impl<'db> UseDefMapBuilder<'db> {
         debug_assert!(self.symbol_states.len() >= snapshot.symbol_states.len());
         debug_assert!(self.member_states.len() >= snapshot.member_states.len());
 
-        let branch = self
-            .pending_reachability
-            .branch_to_merge(snapshot.pending_reachability);
+        self.reachability = self
+            .reachability_constraints
+            .add_or_constraint(self.reachability, snapshot.reachability);
+        let branch = self.pending_reachability.branch_to_merge(
+            snapshot.pending_reachability,
+            self.reachability,
+            &mut self.narrowing_constraints,
+        );
         self.pending_reachability.merge_place_states(
             &mut self.symbol_states,
             snapshot.symbol_states,
@@ -3484,9 +3605,7 @@ impl<'db> UseDefMapBuilder<'db> {
             );
         }
 
-        self.reachability = self
-            .reachability_constraints
-            .add_or_constraint(self.reachability, snapshot.reachability);
+        self.pending_reachability.current = branch.joined;
         self.checkpoint_flow = self
             .reachability_constraints
             .add_or_constraint(self.checkpoint_flow, snapshot.checkpoint_flow);
@@ -3531,11 +3650,11 @@ impl<'db> UseDefMapBuilder<'db> {
             .iter_mut()
             .chain(self.member_states.iter_mut())
         {
-            // No later place change or merge can require the path correlation represented by
-            // pending narrowing gates, so only reachability needs to be finalized here.
-            self.pending_reachability.materialize_reachability(
+            // End-of-scope lookups see the same gates as a read after the last merge.
+            self.pending_reachability.materialize_ref_at_use(
                 state,
                 pending,
+                &mut self.narrowing_constraints,
                 &mut self.reachability_constraints,
             );
         }
@@ -3581,23 +3700,22 @@ impl<'db> UseDefMapBuilder<'db> {
                 .map(|(use_id, bindings)| (use_id, place_state_interner.intern_bindings(&bindings)))
                 .collect(),
         );
-        let symbol_states = self
+        let end_of_scope_symbols = self
             .symbol_states
             .into_iter()
-            .map(|state| Rc::unwrap_or_clone(state.state))
+            .map(|pending| {
+                place_state_interner
+                    .retain_place_state(pending.state.bindings(), pending.state.declarations())
+            })
             .collect();
-        let member_states = self
+        let end_of_scope_members = self
             .member_states
             .into_iter()
-            .map(|state| Rc::unwrap_or_clone(state.state))
+            .map(|pending| {
+                place_state_interner
+                    .intern_place_state(pending.state.bindings(), pending.state.declarations())
+            })
             .collect();
-        let end_of_scope_symbols = Self::intern_place_states(
-            symbol_states,
-            PlaceState::into_parts,
-            &mut place_state_interner,
-        );
-        let end_of_scope_members =
-            Self::intern_end_of_scope_members(member_states, &mut place_state_interner);
         let symbol_states = Self::intern_reachable_place_states(
             end_of_scope_symbols,
             self.reachable_symbol_definitions,
@@ -3726,7 +3844,7 @@ impl<'db> UseDefMapBuilder<'db> {
                 {
                     end_of_scope.declarations_id()
                 } else {
-                    place_state_interner.intern_declarations(declarations)
+                    place_state_interner.intern_declarations(&declarations)
                 };
                 RetainedPlaceStates {
                     end_of_scope,
@@ -3768,7 +3886,7 @@ impl<'db> UseDefMapBuilder<'db> {
         {
             let bindings = place_state_interner.intern_bindings(&bindings);
             let declarations = declarations
-                .map(|declarations| place_state_interner.intern_declarations(declarations));
+                .map(|declarations| place_state_interner.intern_declarations(&declarations));
             interned_ids_by_definition.push((
                 definition,
                 DefinitionsAtDefinition {
@@ -3779,49 +3897,6 @@ impl<'db> UseDefMapBuilder<'db> {
         }
 
         FrozenMap::from_entries(interned_ids_by_definition)
-    }
-
-    fn intern_place_states<I: Idx, T>(
-        place_states: IndexVec<I, T>,
-        get_parts: impl Fn(T) -> (Bindings, Declarations),
-        place_state_interner: &mut PlaceStateInterner,
-    ) -> IndexVec<I, InternedPlaceStateId> {
-        let mut interned_ids_by_place = IndexVec::with_capacity(place_states.len());
-
-        for place_state in place_states {
-            let (bindings, declarations) = get_parts(place_state);
-            let interned_id = place_state_interner.retain_place_state(&bindings, declarations);
-            interned_ids_by_place.push(interned_id);
-        }
-
-        interned_ids_by_place
-    }
-
-    fn intern_end_of_scope_members(
-        end_of_scope_members: IndexVec<ScopedMemberId, PlaceState>,
-        place_state_interner: &mut PlaceStateInterner,
-    ) -> IndexVec<ScopedMemberId, InternedPlaceStateId> {
-        let mut interned_ids_by_member = IndexVec::with_capacity(end_of_scope_members.len());
-        let mut interned_ids_by_place_state =
-            FxHashMap::with_capacity_and_hasher(end_of_scope_members.len(), FxBuildHasher);
-
-        for place_state in end_of_scope_members {
-            let interned_id = match interned_ids_by_place_state.entry(place_state) {
-                Entry::Occupied(entry) => *entry.get(),
-                Entry::Vacant(entry) => {
-                    let place_state = entry.key();
-                    let interned_id = place_state_interner.intern_place_state(
-                        place_state.bindings(),
-                        place_state.declarations().clone(),
-                    );
-                    entry.insert(interned_id);
-                    interned_id
-                }
-            };
-            interned_ids_by_member.push(interned_id);
-        }
-
-        interned_ids_by_member
     }
 
     fn intern_enclosing_snapshots(
