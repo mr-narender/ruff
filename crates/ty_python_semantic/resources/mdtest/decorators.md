@@ -164,7 +164,7 @@ from functools import cache
 def f(x: int) -> int:
     return x**2
 
-# revealed: _lru_cache_wrapper[int]
+# revealed: _lru_cache_wrapper[int, Hashable]
 reveal_type(f)
 # revealed: int
 reveal_type(f(1))
@@ -249,7 +249,7 @@ reveal_type(f)  # revealed: Unknown
 ```py
 non_callable = 1
 
-# error: [call-non-callable] "Object of type `Literal[1]` is not callable"
+# error: [not-callable] "Object of type `Literal[1]` is not callable"
 @non_callable
 def f(x): ...
 
@@ -434,7 +434,7 @@ reveal_type(Foo)  # revealed: int
 Using `None` as a decorator is an error:
 
 ```py
-# error: [call-non-callable]
+# error: [not-callable]
 @None
 class Bar: ...
 
@@ -543,7 +543,11 @@ When a class decorator returns `Unknown`, we preserve the current binding. Unann
 have an `Unknown` return type because we do not infer returned classes from decorator bodies:
 
 ```py
-def personify(cls):
+from ty_extensions._internal import Unknown
+
+# TODO: remove this explicit `Unknown` return type when type inference does not expose
+# the internal `Wrapped` class anymore.
+def personify(cls) -> Unknown:
     class Wrapped(cls):
         full_name: str
 
@@ -558,7 +562,7 @@ class Animal: ...
 reveal_type(Animal)  # revealed: <class 'Animal'>
 reveal_type(Animal())  # revealed: Animal
 
-Animal().set_full_name("John")  # error: [unresolved-attribute]
+Animal().set_full_name("John")  # error: [missing-attribute]
 ```
 
 This also applies to unannotated callables that are not function definitions:
@@ -690,6 +694,49 @@ class DeprecatedThenUnannotated: ...
 DeprecatedThenUnannotated()  # error: [deprecated] "use OtherClass"
 ```
 
+## Decorated nested class attributes
+
+A decorator that replaces a nested class produces a normal writable attribute of the decorator's
+return type, even if that return type is a class object.
+
+```py
+def as_int(cls: type) -> int:
+    return 1
+
+def as_int_class(cls: type) -> type[int]:
+    return int
+
+class Outer:
+    @as_int
+    class Number: ...
+
+    @as_int_class
+    class NumberType: ...
+
+reveal_type(Outer().Number)  # revealed: int
+Outer().Number = 2  # ok
+reveal_type(Outer().NumberType)  # revealed: type[int]
+Outer().NumberType = int  # ok
+Outer().NumberType = str  # error: [invalid-assignment]
+```
+
+A decorator that preserves the original nested class also preserves its read-only binding.
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def identity(cls: type[T]) -> type[T]:
+    return cls
+
+class Preserved:
+    @identity
+    class Inner: ...
+
+Preserved().Inner = Preserved.Inner  # error: [invalid-assignment]
+```
+
 ## Unknown return annotations on class decorators
 
 An unresolved return annotation produces `Unknown`. This preserves the class binding and allows
@@ -725,6 +772,16 @@ def decorator(cls: type) -> Any:
 class C: ...
 
 reveal_type(C)  # revealed: Any
+```
+
+A nested class replaced with `Any` also permits instance writes.
+
+```py
+class Outer:
+    @decorator
+    class Inner: ...
+
+Outer().Inner = 1  # ok
 ```
 
 An explicit `type[Any]` return type also replaces the binding:
@@ -814,7 +871,7 @@ class ResourceEnabled(Protocol):
 SchemaT = TypeVar("SchemaT")
 
 def register(cls: type[SchemaT]) -> Intersection[type[SchemaT], ResourceEnabled]:
-    # error: [invalid-return-type] "Return type does not match returned value: expected `type[SchemaT@register] & ResourceEnabled`, found `type[SchemaT@register]`"
+    # error: [invalid-explicit-return] "Return type does not match returned value: expected `type[SchemaT@register] & ResourceEnabled`, found `type[SchemaT@register]`"
     return cls
 
 @register
@@ -844,7 +901,7 @@ class ResourceEnabled(Protocol):
 SchemaT = TypeVar("SchemaT")
 
 def register(cls: type[SchemaT]) -> Intersection[type[SchemaT], ResourceEnabled]:
-    # error: [invalid-return-type] "Return type does not match returned value: expected `type[SchemaT@register] & ResourceEnabled`, found `type[SchemaT@register]`"
+    # error: [invalid-explicit-return] "Return type does not match returned value: expected `type[SchemaT@register] & ResourceEnabled`, found `type[SchemaT@register]`"
     return cls
 
 @dataclass
@@ -875,7 +932,7 @@ class ResourceEnabled(Protocol):
 SchemaT = TypeVar("SchemaT")
 
 def register(cls: type[SchemaT]) -> Intersection[type[SchemaT], ResourceEnabled]:
-    # error: [invalid-return-type] "Return type does not match returned value: expected `type[SchemaT@register] & ResourceEnabled`, found `type[SchemaT@register]`"
+    # error: [invalid-explicit-return] "Return type does not match returned value: expected `type[SchemaT@register] & ResourceEnabled`, found `type[SchemaT@register]`"
     return cls
 
 def identity(cls: type[SchemaT]) -> type[SchemaT]:
@@ -933,7 +990,7 @@ Reporting a dynamic return must not eagerly infer a self-referential default. Ev
 assertion on the same name, the diagnostic identifies the function's signature.
 
 ```py
-def dynamic(function: object):
+def dynamic(function):
     return function
 
 f = lambda: f
@@ -955,8 +1012,8 @@ info[dynamic-function-decorator-return]: Decorator returns `Unknown`
   |
  ::: src/mdtest_snippet.py:1:5
   |
-1 | def dynamic(function: object):
-  |     ------------------------- `dynamic` defined here
+1 | def dynamic(function):
+  |     ----------------- `dynamic` defined here
 help: Add a return type annotation to `dynamic`
 ```
 
@@ -967,7 +1024,7 @@ annotation when that method is unannotated.
 
 ```py
 class CallableDecorator:
-    def __call__(self, function: object):
+    def __call__(self, function):
         return function
 
 # snapshot: dynamic-function-decorator-return
@@ -987,8 +1044,8 @@ info[dynamic-function-decorator-return]: Decorator returns `Unknown`
   |
  ::: src/mdtest_snippet.py:2:9
   |
-2 |     def __call__(self, function: object):
-  |         -------------------------------- `CallableDecorator.__call__` defined here
+2 |     def __call__(self, function):
+  |         ------------------------ `CallableDecorator.__call__` defined here
 help: Add a return type annotation to `CallableDecorator.__call__`
 ```
 
@@ -1025,7 +1082,7 @@ triggered due to a missing return-type annotation, we suggest adding one:
 `decorator.py`:
 
 ```py
-def dynamic(value: object):
+def dynamic(value):
     return value
 ```
 
@@ -1051,8 +1108,8 @@ info[dynamic-function-decorator-return]: Decorator returns `Unknown`
   |
  ::: src/decorator.py:1:5
   |
-1 | def dynamic(value: object):
-  |     ---------------------- `dynamic` defined here
+1 | def dynamic(value):
+  |     -------------- `dynamic` defined here
 help: Add a return type annotation to `dynamic`
 ```
 
@@ -1227,7 +1284,7 @@ python = "/.venv"
 `/.venv/<path-to-site-packages>/dependency.py`:
 
 ```py
-def dynamic(value: object):
+def dynamic(value):
     return value
 ```
 
@@ -1253,8 +1310,8 @@ info[dynamic-function-decorator-return]: Decorator returns `Unknown`
   |
  ::: .venv/<path-to-site-packages>/dependency.py:1:5
   |
-1 | def dynamic(value: object):
-  |     ---------------------- `dynamic` defined here
+1 | def dynamic(value):
+  |     -------------- `dynamic` defined here
 ```
 
 ### Edge case: dynamic decorators defined in non-module scripts
@@ -1267,7 +1324,7 @@ path", but we nonetheless recognise it as a first-party file and offer the sugge
 `typed-script.py`:
 
 ```py
-def dynamic(function: object):
+def dynamic(function):
     return function
 
 # snapshot: dynamic-function-decorator-return
@@ -1287,8 +1344,8 @@ info[dynamic-function-decorator-return]: Decorator returns `Unknown`
   |
  ::: src/typed-script.py:1:5
   |
-1 | def dynamic(function: object):
-  |     ------------------------- `dynamic` defined here
+1 | def dynamic(function):
+  |     ----------------- `dynamic` defined here
 help: Add a return type annotation to `dynamic`
 ```
 
@@ -1304,7 +1361,7 @@ from typing import Any
 def annotated_dynamic(function: Callable[..., object]) -> Any:
     return function
 
-def unannotated_dynamic(function: Callable[..., object]):
+def unannotated_dynamic(function):
     return function
 
 def condition() -> bool:

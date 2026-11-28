@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::mapref::entry::Entry;
-pub use directory::{DirectoryListing, DirectoryListingError, directory_listing};
+pub use directory::{
+    DirectoryListing, DirectoryListingError, directory_listing, system_path_to_directory,
+};
 pub use file_root::{FileRoot, FileRootKind};
 pub use path::FilePath;
 use ruff_notebook::{Notebook, NotebookError};
@@ -137,7 +139,7 @@ impl Files {
 
                 let durability = self.input_durability(
                     self.root(db, &absolute)
-                        .map_or(Durability::default(), |root| root.durability(db)),
+                        .map_or_default(|root| root.durability(db)),
                 );
 
                 let builder = File::builder(FilePath::from(absolute))

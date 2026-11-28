@@ -1,18 +1,18 @@
-use std::ops::Deref;
-
 use ruff_db::PythonFile;
 use ruff_db::files::{File, FileRange};
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_python_ast::find_node::covering_node;
 use ruff_python_ast::name::Name;
+use ruff_python_ast::stmt_if::if_elif_branches;
 use ruff_python_ast::traversal::suite;
-use ruff_python_ast::{self as ast, AnyNodeRef, Expr};
+use ruff_python_ast::{self as ast, AnyNodeRef, Expr, HasNodeIndex};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use smallvec::SmallVec;
 
 use crate::LoopHeaderId;
 use crate::ProgramFile;
 use crate::ast_node_ref::AstNodeRef;
+use crate::builder::environment_check;
 use crate::member::ScopedMemberId;
 use crate::node_key::NodeKey;
 use crate::place::ScopedPlaceId;
@@ -107,6 +107,35 @@ impl<'db> Definition<'db> {
 
     pub fn is_reexported(self, db: &'db dyn Db) -> bool {
         self.place_info(db).is_reexported()
+    }
+
+    /// Whether a bundled stub defines this value under a guard folded during indexing.
+    ///
+    /// Recover the guard from the syntax when needed, since the reachability constraint
+    /// only records the outcome for the configured environment.
+    pub fn has_folded_environment_guard(self, db: &'db dyn Db, module: &ParsedModuleRef) -> bool {
+        let file = self.file(db);
+        if !file.path(db).is_vendored_path() || !file.is_stub(db) {
+            return false;
+        }
+
+        let program = self.program(db);
+        let version = program.python_version(db);
+        let platform = program.python_platform(db);
+        let range = self.kind(db).target_range(module);
+        let scope = self.scope(db).node(db).node_index();
+        let node = covering_node(module.syntax().into(), range);
+        node.ancestors()
+            .take_while(|node| Some(node.node_index().load()) != scope)
+            .any(|node| {
+                let AnyNodeRef::StmtIf(stmt) = node else {
+                    return false;
+                };
+                // An `elif` or `else` also depends on every preceding test in the chain.
+                if_elif_branches(stmt)
+                    .take_while(|branch| branch.test.end() <= range.start())
+                    .any(|branch| environment_check(branch.test, version, platform).is_some())
+            })
     }
 
     pub fn full_range(self, db: &'db dyn Db, module: &ParsedModuleRef) -> FileRange {
@@ -274,39 +303,6 @@ fn attribute_docstring<'a>(
 
     // Only match string literals.
     value.as_string_literal_expr()
-}
-
-/// One or more [`Definition`]s.
-#[derive(Debug, Default, PartialEq, Eq, get_size2::GetSize)]
-pub struct Definitions<'db> {
-    definitions: smallvec::SmallVec<[Definition<'db>; 1]>,
-}
-
-impl<'db> Definitions<'db> {
-    pub(crate) fn push(&mut self, definition: Definition<'db>) {
-        self.definitions.push(definition);
-    }
-
-    pub(crate) fn into_boxed_slice(self) -> Box<[Definition<'db>]> {
-        self.definitions.into_vec().into_boxed_slice()
-    }
-}
-
-impl<'db> Deref for Definitions<'db> {
-    type Target = [Definition<'db>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.definitions
-    }
-}
-
-impl<'a, 'db> IntoIterator for &'a Definitions<'db> {
-    type Item = &'a Definition<'db>;
-    type IntoIter = std::slice::Iter<'a, Definition<'db>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.definitions.iter()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, get_size2::GetSize)]
@@ -592,7 +588,14 @@ pub(crate) enum ParameterDefinitionNodeRef<'ast> {
     Parameter(&'ast ast::ParameterWithDefault),
 }
 
-impl ParameterDefinitionNodeRef<'_> {
+impl<'ast> ParameterDefinitionNodeRef<'ast> {
+    pub(super) fn parameter(self) -> &'ast ast::Parameter {
+        match self {
+            Self::VariadicPositionalParameter(node) | Self::VariadicKeywordParameter(node) => node,
+            Self::Parameter(node) => &node.parameter,
+        }
+    }
+
     fn into_owned(self, parsed: &ParsedModuleRef) -> ParameterDefinitionNodeKind {
         match self {
             Self::VariadicPositionalParameter(parameter) => {
@@ -612,11 +615,7 @@ impl ParameterDefinitionNodeRef<'_> {
     }
 
     fn key(self) -> DefinitionNodeKey {
-        match self {
-            Self::VariadicPositionalParameter(node) => node.into(),
-            Self::VariadicKeywordParameter(node) => node.into(),
-            Self::Parameter(node) => (&node.parameter).into(),
-        }
+        self.parameter().into()
     }
 }
 
@@ -994,7 +993,7 @@ impl<'db> DefinitionKind<'db> {
         matches!(self, DefinitionKind::Assignment(_))
     }
 
-    pub(crate) fn as_unannotated_assignment(&self) -> Option<AssignmentDefinitionKind<'db>> {
+    pub fn as_unannotated_assignment(&self) -> Option<AssignmentDefinitionKind<'db>> {
         match self {
             DefinitionKind::Assignment(assignment) => Some(assignment.clone()),
             _ => None,
@@ -1756,6 +1755,10 @@ pub enum NestedBindingExecution {
 pub struct DefinitionNodeKey(NodeKey);
 
 impl DefinitionNodeKey {
+    pub(super) fn index(self) -> ast::NodeIndex {
+        self.0.index()
+    }
+
     pub(crate) fn from_node_ref(node: ast::AnyNodeRef<'_>) -> Self {
         match node {
             ast::AnyNodeRef::ParameterWithDefault(parameter) => parameter.into(),

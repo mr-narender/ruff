@@ -9,6 +9,7 @@ use std::sync::Arc;
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 
 use ruff_index::{FrozenIndexVec, IndexSlice};
+use ruff_python_ast::name::Name;
 use ruff_python_ast::{HasNodeIndex, NodeIndex};
 use ruff_python_parser::semantic_errors::SemanticSyntaxError;
 use ruff_text_size::{Ranged, TextRange};
@@ -23,8 +24,9 @@ pub use crate::statement::{Statement, StatementNodeKey};
 use ast_ids::AstIds;
 pub use ast_ids::ExpressionNodeKey;
 use builder::SemanticIndexBuilder;
-use definition::{Definition, DefinitionNodeKey, Definitions};
+use definition::{Definition, DefinitionNodeKey};
 use expression::Expression;
+use member::ScopedMemberId;
 use narrowing_constraints::ScopedNarrowingConstraint;
 pub use place::{PlaceExprRef, PlaceTable};
 pub use reachability_constraints::ReachabilityConstraintsBuilder;
@@ -32,10 +34,10 @@ pub use scope::FileScopeId;
 use scope::{NodeWithScopeKey, NodeWithScopeRef, Scope, ScopeId, ScopeKind, ScopeLaziness};
 use symbol::ScopedSymbolId;
 pub use use_def::{
-    ApplicableConstraints, BindingWithConstraints, BindingWithConstraintsIterator,
-    BindingsSnapshotId, DeclarationWithConstraint, DeclarationsIterator, ImportedFinalCandidate,
-    ImportedFinalCandidatesIterator, LiveBinding, LoopHeaderId, NarrowingEvaluator,
-    PredicateNarrowingTargets, ScopedDefinitionId, UseDefMap,
+    ApplicableConstraints, BindingKind, BindingWithConstraints, BindingWithConstraintsIterator,
+    BindingsSnapshotId, DeclarationSources, DeclarationWithConstraint, DeclarationsIterator,
+    ImportedFinalCandidate, ImportedFinalCandidatesIterator, LiveBinding, LoopHeaderId,
+    NarrowingEvaluator, PredicateNarrowingTargets, ScopedDefinitionId, UseDefMap,
 };
 use use_def::{EnclosingSnapshotKey, ScopedEnclosingSnapshotId};
 
@@ -58,6 +60,7 @@ mod re_exports;
 pub mod reachability_constraints;
 pub mod scope;
 pub mod statement;
+pub mod static_dunder_all;
 pub mod symbol;
 pub mod unpack;
 mod use_def;
@@ -91,7 +94,7 @@ pub fn place_table<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> Arc<PlaceTable>
     let program_file = scope.program_file(db);
     let _span = tracing::trace_span!("place_table", scope=?scope.as_id(), ?program_file).entered();
     let index = semantic_index(db, program_file);
-    Arc::clone(&index.place_tables[scope.file_scope_id(db)])
+    index.shared_place_table(scope.file_scope_id(db))
 }
 
 /// Returns the use-def map for a specific `scope`.
@@ -225,6 +228,42 @@ pub fn attribute_scopes<'db>(
         })
 }
 
+/// Receiver attributes in method scopes, grouped by name in scope traversal order.
+#[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
+fn receiver_attribute_locations<'db>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+) -> Box<[(Name, FileScopeId, ScopedMemberId)]> {
+    let index = semantic_index(db, scope.program_file(db));
+    let mut locations = Vec::new();
+    for method in attribute_scopes(db, scope) {
+        for (id, member) in index.place_table(method).members().enumerate() {
+            if let Some(name) = member.as_instance_attribute() {
+                locations.push((Name::new(name), method, ScopedMemberId::from_usize(id)));
+            }
+        }
+    }
+    // Keep the same order as scanning the methods and taking the first matching
+    // member in each scope.
+    locations.sort_by(|a, b| a.0.cmp(&b.0));
+    locations.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    locations.into_boxed_slice()
+}
+
+/// Returns the first matching receiver member in each method scope that uses this name.
+pub fn receiver_attribute_places<'db, 's>(
+    db: &'db dyn Db,
+    scope: ScopeId<'db>,
+    name: &'s str,
+) -> impl Iterator<Item = (FileScopeId, ScopedMemberId)> + use<'s, 'db> {
+    let locations = receiver_attribute_locations(db, scope);
+    let start = locations.partition_point(|(candidate, _, _)| candidate.as_str() < name);
+    locations[start..]
+        .iter()
+        .take_while(move |(candidate, _, _)| candidate.as_str() == name)
+        .map(|&(_, method, member)| (method, member))
+}
+
 /// Returns the module global scope of `file`.
 #[salsa::tracked(returns(copy), heap_size=ruff_memory_usage::heap_size)]
 pub fn global_scope<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> ScopeId<'db> {
@@ -240,47 +279,6 @@ pub enum EnclosingSnapshotResult<'map, 'db> {
     NoLongerInEagerContext,
 }
 
-#[derive(Debug, PartialEq, Eq, get_size2::GetSize, salsa::SalsaValue)]
-struct DefinitionsByNode<'db> {
-    single: FrozenMap<DefinitionNodeKey, Definition<'db>>,
-    non_single: FrozenMap<DefinitionNodeKey, Box<[Definition<'db>]>>,
-}
-
-impl<'db> DefinitionsByNode<'db> {
-    fn from_map(definitions_by_node: FxHashMap<DefinitionNodeKey, Definitions<'db>>) -> Self {
-        let single_count = definitions_by_node
-            .values()
-            .filter(|definitions| definitions.len() == 1)
-            .count();
-        let mut single = Vec::with_capacity(single_count);
-        let mut non_single = Vec::with_capacity(definitions_by_node.len() - single_count);
-
-        #[expect(
-            clippy::iter_over_hash_type,
-            reason = "each node is independently partitioned by definition count"
-        )]
-        for (key, definitions) in definitions_by_node {
-            if definitions.len() == 1 {
-                single.push((key, definitions[0]));
-            } else {
-                non_single.push((key, definitions.into_boxed_slice()));
-            }
-        }
-
-        Self {
-            single: FrozenMap::from_entries(single),
-            non_single: FrozenMap::from_entries(non_single),
-        }
-    }
-
-    fn get(&self, key: DefinitionNodeKey) -> Option<&[Definition<'db>]> {
-        self.single
-            .get(&key)
-            .map(std::slice::from_ref)
-            .or_else(|| self.non_single.get(&key).map(AsRef::as_ref))
-    }
-}
-
 /// The place tables and use-def maps for all scopes in a file.
 #[derive(Debug, get_size2::GetSize, salsa::SalsaValue)]
 pub struct SemanticIndex<'db> {
@@ -289,12 +287,6 @@ pub struct SemanticIndex<'db> {
 
     /// List of all scopes in this file.
     scopes: FrozenIndexVec<FileScopeId, Scope>,
-
-    /// Map expressions to their corresponding scope.
-    scopes_by_expression: ExpressionsScopeMap,
-
-    /// Map from a node creating a definition to its definition.
-    definitions_by_node: DefinitionsByNode<'db>,
 
     /// Map from a standalone expression to its [`Expression`] ingredient.
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
@@ -323,11 +315,11 @@ pub struct SemanticIndex<'db> {
     /// Use-def map for each scope in this file.
     use_def_maps: FrozenIndexVec<FileScopeId, Arc<UseDefMap<'db>>>,
 
-    /// Lookup table to map between node ids and ast nodes.
+    /// Definitions, lexical scopes and scope-local use IDs recorded at source occurrences.
     ///
     /// Note: We should not depend on this map when analysing other files or
     /// changing a file invalidates all dependents.
-    ast_ids: AstIds,
+    ast_ids: AstIds<'db>,
 
     /// The set of modules that are imported anywhere within this file.
     imported_modules: FrozenSet<ModuleName>,
@@ -349,7 +341,7 @@ pub struct SemanticIndex<'db> {
 
     /// Node indices of syntactic annotation roots, sorted in source order. Annotations cannot
     /// contain other syntactic annotations, so their ranges do not overlap. Storing only indices
-    /// avoids duplicating ranges and scopes already available from the AST and expression scope map.
+    /// avoids duplicating ranges and scopes already available from the AST and the recorded expression scopes.
     annotations: Box<[NodeIndex]>,
 
     /// Narrowing alias metadata for predicate leaf names.
@@ -362,6 +354,9 @@ pub struct SemanticIndex<'db> {
 pub struct NarrowingAliasPredicate<'db> {
     /// Aliased expression, e.g., `x is None` in `is_none = x is None`.
     pub expression: Expression<'db>,
+    /// Loop-header definitions for narrowed places that can reach this use from loops entered
+    /// after evaluating the alias.
+    pub intervening_loop_headers: Box<[ScopedDefinitionId]>,
 }
 
 impl<'db> SemanticIndex<'db> {
@@ -373,6 +368,11 @@ impl<'db> SemanticIndex<'db> {
         self.ast_ids.try_use_id(expression)
     }
 
+    /// Returns the [`PlaceUse`](ast_ids::PlaceUse) for an expression that reads an indexed place.
+    pub fn expression_place_use(&self, expr: ast::ExprRef<'_>) -> Option<ast_ids::PlaceUse> {
+        self.ast_ids.place_use(expr)
+    }
+
     /// Returns the place table for a specific scope.
     ///
     /// Use the Salsa cached [`place_table()`] query if you only need the
@@ -380,6 +380,11 @@ impl<'db> SemanticIndex<'db> {
     #[track_caller]
     pub fn place_table(&self, scope_id: FileScopeId) -> &PlaceTable {
         &self.place_tables[scope_id]
+    }
+
+    /// Shares the existing place table with another per-scope query result.
+    pub fn shared_place_table(&self, scope_id: FileScopeId) -> Arc<PlaceTable> {
+        Arc::clone(&self.place_tables[scope_id])
     }
 
     /// Returns alias metadata for an alias Name node in a predicate, if one exists.
@@ -399,17 +404,17 @@ impl<'db> SemanticIndex<'db> {
         &self.use_def_maps[scope_id]
     }
 
-    /// Returns the set of modules that are imported anywhere in this file.
+    /// Returns the modules imported anywhere in this file, including their parent packages.
     ///
     /// This set only considers `import` statements, not `from...import` statements.
     /// See `ModuleLiteralType::available_submodule_attributes` for discussion
     /// of why this analysis is intentionally limited.
-    pub fn imported_modules(&self) -> impl Iterator<Item = &ModuleName> {
-        self.imported_modules.iter()
+    pub fn imported_modules(&self) -> &FrozenSet<ModuleName> {
+        &self.imported_modules
     }
 
     #[track_caller]
-    fn ast_ids(&self) -> &AstIds {
+    fn ast_ids(&self) -> &AstIds<'db> {
         &self.ast_ids
     }
 
@@ -428,7 +433,7 @@ impl<'db> SemanticIndex<'db> {
     where
         E: HasTrackedScope,
     {
-        self.scopes_by_expression.try_get(expression)
+        self.ast_ids.expression_scope(expression)
     }
 
     /// Returns the scope enclosing the syntactic annotation containing `expression`, if any.
@@ -476,6 +481,11 @@ impl<'db> SemanticIndex<'db> {
     #[track_caller]
     pub fn scope(&self, id: FileScopeId) -> &Scope {
         &self.scopes[id]
+    }
+
+    /// Returns the tracked scope for an ID assigned by this index.
+    pub fn scope_id(&self, id: FileScopeId) -> ScopeId<'db> {
+        self.scope_ids_by_scope[id]
     }
 
     pub fn scope_ids(&self) -> impl Iterator<Item = ScopeId<'db>> + '_ {
@@ -648,9 +658,7 @@ impl<'db> SemanticIndex<'db> {
     }
 
     /// Returns an iterator over ancestors of `scope` that are visible for name resolution,
-    /// starting with `scope` itself. This follows Python's lexical scoping rules where
-    /// class scopes are skipped during name resolution (except for the starting scope
-    /// if it happens to be a class scope).
+    /// starting with `scope` itself. An enclosing class is visible through annotation scopes.
     ///
     /// For example, in this code:
     /// ```python
@@ -661,8 +669,11 @@ impl<'db> SemanticIndex<'db> {
     ///         print(x)  # Refers to global x=1, not class x=2
     /// ```
     /// The `method` function can see the global scope but not the class scope.
-    pub fn visible_ancestor_scopes(&self, scope: FileScopeId) -> VisibleAncestorsIter<'_> {
-        VisibleAncestorsIter::new(&self.scopes, scope)
+    pub fn visible_ancestor_scopes(
+        &self,
+        scope: FileScopeId,
+    ) -> impl Iterator<Item = (FileScopeId, &Scope)> {
+        self.ancestor_scopes(scope).visible()
     }
 
     /// Returns the [`definition::Definition`] salsa ingredient(s) for `definition_key`.
@@ -671,8 +682,8 @@ impl<'db> SemanticIndex<'db> {
     /// if the definitions are created by a wildcard (`*`) import.
     #[track_caller]
     pub fn definitions(&self, definition_key: impl Into<DefinitionNodeKey>) -> &[Definition<'db>] {
-        self.definitions_by_node
-            .get(definition_key.into())
+        self.ast_ids
+            .definitions(definition_key.into())
             .expect("definition should be present in the semantic index")
     }
 
@@ -682,7 +693,7 @@ impl<'db> SemanticIndex<'db> {
         definition_node: ast::AnyNodeRef<'_>,
     ) -> Option<&[Definition<'db>]> {
         let definition_key = DefinitionNodeKey::from_node_ref(definition_node);
-        self.definitions_by_node.get(definition_key)
+        self.ast_ids.definitions(definition_key)
     }
 
     /// Returns the [`definition::Definition`] salsa ingredient for `definition_key`.
@@ -715,10 +726,7 @@ impl<'db> SemanticIndex<'db> {
         &self,
         definition_key: impl Into<DefinitionNodeKey>,
     ) -> Option<Definition<'db>> {
-        self.definitions_by_node
-            .single
-            .get(&definition_key.into())
-            .copied()
+        self.ast_ids.definition(definition_key.into()).copied()
     }
 
     /// Returns the [`Expression`] ingredient for an expression node.
@@ -839,6 +847,13 @@ impl<'db> SemanticIndex<'db> {
     }
 }
 
+pub struct AncestorScope<'a> {
+    pub id: FileScopeId,
+    pub scope: &'a Scope,
+    /// Whether lexical name lookup from the starting scope can see names bound in this scope.
+    pub is_lexically_visible: bool,
+}
+
 pub struct AncestorsIter<'a> {
     scopes: &'a IndexSlice<FileScopeId, Scope>,
     next_id: Option<FileScopeId>,
@@ -850,6 +865,28 @@ impl<'a> AncestorsIter<'a> {
             scopes,
             next_id: Some(start),
         }
+    }
+
+    /// Includes the lexical visibility of each scope. A class namespace is visible in the
+    /// class itself and through any intervening annotation scopes (e.g. both the value and
+    /// the type parameters of a generic type alias).
+    pub fn with_lexical_visibility(self) -> impl Iterator<Item = AncestorScope<'a>> {
+        let mut class_visible = true;
+        self.map(move |(id, scope)| {
+            let is_lexically_visible = !scope.kind().is_class() || class_visible;
+            class_visible &= scope.kind().is_annotation();
+            AncestorScope {
+                id,
+                scope,
+                is_lexically_visible,
+            }
+        })
+    }
+
+    fn visible(self) -> impl Iterator<Item = (FileScopeId, &'a Scope)> {
+        self.with_lexical_visibility()
+            .filter(|ancestor| ancestor.is_lexically_visible)
+            .map(|ancestor| (ancestor.id, ancestor.scope))
     }
 }
 
@@ -866,53 +903,6 @@ impl<'a> Iterator for AncestorsIter<'a> {
 }
 
 impl FusedIterator for AncestorsIter<'_> {}
-
-pub struct VisibleAncestorsIter<'a> {
-    inner: AncestorsIter<'a>,
-    starting_scope_kind: ScopeKind,
-    yielded_count: usize,
-}
-
-impl<'a> VisibleAncestorsIter<'a> {
-    fn new(scopes: &'a IndexSlice<FileScopeId, Scope>, start: FileScopeId) -> Self {
-        let starting_scope = &scopes[start];
-        Self {
-            inner: AncestorsIter::new(scopes, start),
-            starting_scope_kind: starting_scope.kind(),
-            yielded_count: 0,
-        }
-    }
-}
-
-impl<'a> Iterator for VisibleAncestorsIter<'a> {
-    type Item = (FileScopeId, &'a Scope);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let (scope_id, scope) = self.inner.next()?;
-            self.yielded_count += 1;
-
-            // Always return the first scope (the starting scope)
-            if self.yielded_count == 1 {
-                return Some((scope_id, scope));
-            }
-
-            // Skip class scopes for subsequent scopes (following Python's lexical scoping rules)
-            // Exception: type parameter scopes can see names defined in an immediately-enclosing class scope
-            if scope.kind() == ScopeKind::Class {
-                // Allow annotation scopes to see their immediately-enclosing class scope exactly once
-                if self.starting_scope_kind.is_annotation() && self.yielded_count == 2 {
-                    return Some((scope_id, scope));
-                }
-                continue;
-            }
-
-            return Some((scope_id, scope));
-        }
-    }
-}
-
-impl FusedIterator for VisibleAncestorsIter<'_> {}
 
 pub(crate) struct DescendantsIter<'a> {
     next_id: FileScopeId,
@@ -978,38 +968,6 @@ impl<'a> Iterator for ChildrenIter<'a> {
 
 impl FusedIterator for ChildrenIter<'_> {}
 
-/// Interval map that maps a range of expression node ids to their corresponding scopes.
-///
-/// Lookups require `O(log n)` time, where `n` is roughly the number of scopes (roughly
-/// because sub-scopes can be interleaved with expressions in the outer scope, e.g. function, some statements, a function).
-#[derive(Eq, PartialEq, Debug, get_size2::GetSize, Default)]
-struct ExpressionsScopeMap(Box<[(std::ops::RangeInclusive<NodeIndex>, FileScopeId)]>);
-
-impl ExpressionsScopeMap {
-    fn try_get<E>(&self, node: &E) -> Option<FileScopeId>
-    where
-        E: HasTrackedScope,
-    {
-        let node_index = node.node_index().load();
-
-        let entry = self
-            .0
-            .binary_search_by_key(&node_index, |(range, _)| *range.start());
-
-        let index = match entry {
-            Ok(index) => index,
-            Err(index) => index.checked_sub(1)?,
-        };
-
-        let (range, scope) = &self.0[index];
-        if range.contains(&node_index) {
-            Some(*scope)
-        } else {
-            None
-        }
-    }
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq, get_size2::GetSize)]
 pub enum Truthiness {
     /// For an object `x`, `bool(x)` will always return `True`
@@ -1018,6 +976,8 @@ pub enum Truthiness {
     AlwaysFalse,
     /// For an object `x`, `bool(x)` could return either `True` or `False`
     Ambiguous,
+    /// No object or boolean outcome is possible, as with a value of type `Never`.
+    Uninhabited,
 }
 
 impl Truthiness {
@@ -1025,16 +985,20 @@ impl Truthiness {
         matches!(self, Truthiness::Ambiguous)
     }
 
+    pub const fn is_uninhabited(self) -> bool {
+        matches!(self, Truthiness::Uninhabited)
+    }
+
     pub const fn is_always_false(self) -> bool {
         matches!(self, Truthiness::AlwaysFalse)
     }
 
     pub const fn may_be_true(self) -> bool {
-        !self.is_always_false()
+        matches!(self, Self::AlwaysTrue | Self::Ambiguous)
     }
 
     pub const fn may_be_false(self) -> bool {
-        !self.is_always_true()
+        matches!(self, Self::AlwaysFalse | Self::Ambiguous)
     }
 
     pub const fn is_always_true(self) -> bool {
@@ -1047,6 +1011,7 @@ impl Truthiness {
             Self::AlwaysTrue => Self::AlwaysFalse,
             Self::AlwaysFalse => Self::AlwaysTrue,
             Self::Ambiguous => Self::Ambiguous,
+            Self::Uninhabited => Self::Uninhabited,
         }
     }
 
@@ -1055,13 +1020,35 @@ impl Truthiness {
         if condition { self.negate() } else { self }
     }
 
+    /// Combine the possible outcomes of alternative paths or types.
+    ///
+    /// For types with truthiness `left` and `right`, `left.union(right)` describes the truthiness
+    /// of their union: a value can come from either type. For example,
+    /// `AlwaysTrue.union(AlwaysFalse)` is `Ambiguous`, since both boolean outcomes are possible.
+    /// In contrast, [`Truthiness::or`] models Python's `or` operator, which can skip its second
+    /// operand: `AlwaysTrue.or(AlwaysFalse)` is `AlwaysTrue`.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Uninhabited, other) | (other, Self::Uninhabited) => other,
+            (left, right) if left == right => left,
+            _ => Self::Ambiguous,
+        }
+    }
+
+    /// Combine conditions using Python's short-circuit `and` semantics.
+    ///
+    /// Short-circuiting makes this operation non-commutative when an operand is `Uninhabited`.
+    /// If `stop()` returns `Never`, `flag and stop()` can complete only when `flag` is false:
+    /// `Ambiguous.and(Uninhabited)` is `AlwaysFalse`. Reversing the operands always evaluates
+    /// `stop()` first, so `Uninhabited.and(Ambiguous)` is `Uninhabited`.
     #[must_use]
     pub fn and(self, other: Self) -> Self {
         match self {
             Truthiness::AlwaysTrue => other,
-            Truthiness::AlwaysFalse => self,
+            Truthiness::AlwaysFalse | Truthiness::Uninhabited => self,
             Truthiness::Ambiguous => match other {
-                Truthiness::AlwaysFalse => Truthiness::AlwaysFalse,
+                Truthiness::AlwaysFalse | Truthiness::Uninhabited => Truthiness::AlwaysFalse,
                 Truthiness::AlwaysTrue | Truthiness::Ambiguous => Truthiness::Ambiguous,
             },
         }
@@ -1071,18 +1058,24 @@ impl Truthiness {
     #[must_use]
     pub fn and_then(self, other: impl FnOnce() -> Self) -> Self {
         match self {
-            Truthiness::AlwaysFalse => self,
+            Truthiness::AlwaysFalse | Truthiness::Uninhabited => self,
             Truthiness::AlwaysTrue | Truthiness::Ambiguous => self.and(other()),
         }
     }
 
+    /// Combine conditions using Python's short-circuit `or` semantics.
+    ///
+    /// Short-circuiting makes this operation non-commutative when an operand is `Uninhabited`.
+    /// If `stop()` returns `Never`, `flag or stop()` can complete only when `flag` is true:
+    /// `Ambiguous.or(Uninhabited)` is `AlwaysTrue`. Reversing the operands always evaluates
+    /// `stop()` first, so `Uninhabited.or(Ambiguous)` is `Uninhabited`.
     #[must_use]
     pub fn or(self, other: Self) -> Self {
         match self {
-            Truthiness::AlwaysTrue => self,
+            Truthiness::AlwaysTrue | Truthiness::Uninhabited => self,
             Truthiness::AlwaysFalse => other,
             Truthiness::Ambiguous => match other {
-                Truthiness::AlwaysTrue => Truthiness::AlwaysTrue,
+                Truthiness::AlwaysTrue | Truthiness::Uninhabited => Truthiness::AlwaysTrue,
                 Truthiness::AlwaysFalse | Truthiness::Ambiguous => Truthiness::Ambiguous,
             },
         }
@@ -1091,12 +1084,8 @@ impl Truthiness {
     #[must_use]
     pub fn or_else(self, other: impl Fn() -> Self) -> Self {
         match self {
-            Truthiness::AlwaysTrue => self,
-            Truthiness::AlwaysFalse => other(),
-            Truthiness::Ambiguous => match other() {
-                Truthiness::AlwaysTrue => Truthiness::AlwaysTrue,
-                Truthiness::AlwaysFalse | Truthiness::Ambiguous => Truthiness::Ambiguous,
-            },
+            Truthiness::AlwaysTrue | Truthiness::Uninhabited => self,
+            Truthiness::AlwaysFalse | Truthiness::Ambiguous => self.or(other()),
         }
     }
 }
@@ -1165,24 +1154,23 @@ impl HasTrackedScope for ast::Expr {}
 impl HasTrackedScope for ast::ExprRef<'_> {}
 impl HasTrackedScope for &ast::ExprRef<'_> {}
 
-// We never explicitly register the scope of an `Identifier`.
-// However, `ExpressionsScopeMap` stores the text ranges of each scope.
-// That allows us to look up the identifier's scope for as long as it's
-// inside an expression (because the ranges overlap).
+// An identifier between expressions in the same scope inherits that scope.
 impl HasTrackedScope for ast::Identifier {}
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches;
+    use std::{assert_matches, cell::Cell};
 
     use ruff_db::{
         files::{File, system_path_to_file},
         parsed::ParsedModuleRef,
+        system::DbWithWritableSystem as _,
     };
     use ruff_python_ast as ast;
     use ruff_text_size::{Ranged, TextRange};
+    use test_case::test_case;
 
-    use super::Truthiness::{AlwaysFalse, AlwaysTrue, Ambiguous};
+    use super::Truthiness::{AlwaysFalse, AlwaysTrue, Ambiguous, Uninhabited};
     use super::*;
 
     use crate::{
@@ -1193,6 +1181,9 @@ mod tests {
             ParameterDefinitionNodeKind,
         },
         program::Program,
+        use_def::{
+            FutureDefinitions, ImportedQualifierAction, PreviousDefinitions, UseDefMapBuilder,
+        },
     };
 
     impl UseDefMap<'_> {
@@ -1236,6 +1227,30 @@ mod tests {
         db.program().program_file(db, file)
     }
 
+    #[test]
+    fn singleton_star_import_interleaved_with_regular_definitions() {
+        // The star import enters the singleton table last, after definitions on later pages.
+        let source = format!("x = 0\nfrom library import *\n{}", "x += 1\n".repeat(64));
+        let db = TestDbBuilder::new()
+            .with_file("/src/test.py", source.as_str())
+            .with_file("/src/library.py", "a = 1")
+            .build()
+            .unwrap();
+        let file = program_file(&db, system_path_to_file(&db, "/src/test.py").unwrap());
+        let index = semantic_index(&db, file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let alias = &module.suite()[1].as_import_from_stmt().unwrap().names[0];
+        let definition = index.try_definition(alias).unwrap();
+        assert_eq!(definition.kind(&db).target_range(&module), alias.range);
+        for stmt in &module.suite()[2..] {
+            let ast::Stmt::AugAssign(assignment) = stmt else {
+                panic!("expected augmented assignment");
+            };
+            let definition = index.try_definition(assignment).unwrap();
+            assert_eq!(definition.kind(&db).full_range(&module), assignment.range);
+        }
+    }
+
     fn names(table: &PlaceTable) -> Vec<String> {
         table
             .symbols()
@@ -1243,33 +1258,63 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn truthiness_and() {
-        for (left, right, expected) in [
-            (AlwaysTrue, AlwaysTrue, AlwaysTrue),
-            (AlwaysTrue, AlwaysFalse, AlwaysFalse),
-            (AlwaysTrue, Ambiguous, Ambiguous),
-            (AlwaysFalse, AlwaysTrue, AlwaysFalse),
-            (AlwaysFalse, AlwaysFalse, AlwaysFalse),
-            (AlwaysFalse, Ambiguous, AlwaysFalse),
-            (Ambiguous, AlwaysTrue, Ambiguous),
-            (Ambiguous, AlwaysFalse, AlwaysFalse),
-            (Ambiguous, Ambiguous, Ambiguous),
-        ] {
-            assert_eq!(left.and(right), expected, "{left:?}.and({right:?})");
+    #[test_case(AlwaysTrue, AlwaysTrue, AlwaysTrue, AlwaysTrue, AlwaysTrue; "true_true")]
+    #[test_case(AlwaysTrue, AlwaysFalse, AlwaysFalse, AlwaysTrue, Ambiguous; "true_false")]
+    #[test_case(AlwaysTrue, Ambiguous, Ambiguous, AlwaysTrue, Ambiguous; "true_ambiguous")]
+    #[test_case(AlwaysTrue, Uninhabited, Uninhabited, AlwaysTrue, AlwaysTrue; "true_uninhabited")]
+    #[test_case(AlwaysFalse, AlwaysTrue, AlwaysFalse, AlwaysTrue, Ambiguous; "false_true")]
+    #[test_case(AlwaysFalse, AlwaysFalse, AlwaysFalse, AlwaysFalse, AlwaysFalse; "false_false")]
+    #[test_case(AlwaysFalse, Ambiguous, AlwaysFalse, Ambiguous, Ambiguous; "false_ambiguous")]
+    #[test_case(AlwaysFalse, Uninhabited, AlwaysFalse, Uninhabited, AlwaysFalse; "false_uninhabited")]
+    #[test_case(Ambiguous, AlwaysTrue, Ambiguous, AlwaysTrue, Ambiguous; "ambiguous_true")]
+    #[test_case(Ambiguous, AlwaysFalse, AlwaysFalse, Ambiguous, Ambiguous; "ambiguous_false")]
+    #[test_case(Ambiguous, Ambiguous, Ambiguous, Ambiguous, Ambiguous; "ambiguous_ambiguous")]
+    #[test_case(Ambiguous, Uninhabited, AlwaysFalse, AlwaysTrue, Ambiguous; "ambiguous_uninhabited")]
+    #[test_case(Uninhabited, AlwaysTrue, Uninhabited, Uninhabited, AlwaysTrue; "uninhabited_true")]
+    #[test_case(Uninhabited, AlwaysFalse, Uninhabited, Uninhabited, AlwaysFalse; "uninhabited_false")]
+    #[test_case(Uninhabited, Ambiguous, Uninhabited, Uninhabited, Ambiguous; "uninhabited_ambiguous")]
+    #[test_case(Uninhabited, Uninhabited, Uninhabited, Uninhabited, Uninhabited; "uninhabited_uninhabited")]
+    fn truthiness_short_circuit(
+        left: Truthiness,
+        right: Truthiness,
+        expected_and: Truthiness,
+        expected_or: Truthiness,
+        expected_union: Truthiness,
+    ) {
+        assert_eq!(left.and(right), expected_and, "{left:?}.and({right:?})");
+        assert_eq!(left.or(right), expected_or, "{left:?}.or({right:?})");
+        assert_eq!(
+            left.union(right),
+            expected_union,
+            "{left:?}.union({right:?})"
+        );
 
-            let mut calls = 0;
-            let lazy_result = left.and_then(|| {
-                calls += 1;
-                right
-            });
-            assert_eq!(lazy_result, expected, "{left:?}.and_then(|| {right:?})");
-            assert_eq!(
-                calls,
-                usize::from(left != AlwaysFalse),
-                "{left:?}.and_then call count"
-            );
-        }
+        let mut calls = 0;
+        let lazy_result = left.and_then(|| {
+            calls += 1;
+            right
+        });
+        assert_eq!(lazy_result, expected_and, "{left:?}.and_then(|| {right:?})");
+        assert_eq!(
+            calls,
+            usize::from(left.may_be_true()),
+            "{left:?}.and_then call count"
+        );
+
+        let calls = Cell::new(0);
+        let lazy_result = left.or_else(|| {
+            calls.set(calls.get() + 1);
+            right
+        });
+        assert_eq!(lazy_result, expected_or, "{left:?}.or_else(|| {right:?})");
+        assert_eq!(calls.get(), usize::from(left.may_be_false()));
+    }
+
+    #[test]
+    fn uninhabited_truthiness() {
+        assert!(!Uninhabited.may_be_true());
+        assert!(!Uninhabited.may_be_false());
+        assert_eq!(Uninhabited.negate(), Uninhabited);
     }
 
     #[test]
@@ -1377,15 +1422,16 @@ mod tests {
                     DefinitionKind::AnnotatedAssignment(_)
                 );
             }
+            let sources = use_def.declaration_sources_at_binding(assignment).unwrap();
             assert_eq!(
-                use_def
-                    .declarations_at_binding(assignment)
+                sources
+                    .declarations()
                     .map(|declaration| declaration.declaration)
                     .collect::<Vec<_>>(),
                 [declaration.map_or(DefinitionState::Undefined, DefinitionState::Defined)]
             );
 
-            let mut candidates = use_def.imported_final_candidates_at_binding(assignment);
+            let mut candidates = sources.imported_final_candidates();
             assert_matches!(
                 candidates
                     .next()
@@ -1414,6 +1460,7 @@ mod tests {
             .first_public_binding(global_table.symbol_id("x").expect("symbol exists"))
             .unwrap();
         assert_matches!(binding.kind(&db), DefinitionKind::Assignment(_));
+        assert!(use_def.declaration_sources_at_binding(binding).is_none());
     }
 
     #[test]
@@ -1562,6 +1609,89 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
     }
 
     #[test]
+    fn stub_layouts_preserve_type_checking_ranges() {
+        let TestCase { db, file } = test_case(
+            "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    def f(): 'doc'; pass; ...\n    def g(): ...; pass\ndef h(): 'doc'",
+        );
+        let file = program_file(&db, file);
+        let index = semantic_index(&db, file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        let ast::Stmt::If(block) = &module.suite()[1] else {
+            panic!("expected a TYPE_CHECKING block");
+        };
+        for (stmt, guarded) in [
+            (&block.body[0], true),
+            (&block.body[1], true),
+            (&module.suite()[2], false),
+        ] {
+            let ast::Stmt::FunctionDef(function) = stmt else {
+                panic!("expected a function");
+            };
+            let scope = index.node_scope(NodeWithScopeRef::Function(function));
+            let mut reference = Box::new(UseDefMapBuilder::new(ScopeKind::Function));
+            for statement in &function.body {
+                reference.record_range_reachability(statement.range(), guarded);
+            }
+            assert_eq!(index.use_def_map(scope), &reference.finish());
+        }
+    }
+
+    #[test]
+    fn stub_parameter_bindings_belong_to_their_own_function() {
+        let TestCase { db, file } = test_case(
+            "def first(a, /, *rest: int, b: str, **options): ...\n\
+             def second(c, /, *values: float, d: bytes, **kwargs): 'doc'; pass",
+        );
+        let file = program_file(&db, file);
+        let index = semantic_index(&db, file);
+        let module = parsed_module(&db, file.python_file(&db)).load(&db);
+        for stmt in module.suite() {
+            let ast::Stmt::FunctionDef(function) = stmt else {
+                panic!("expected a function");
+            };
+            let scope = index.node_scope(NodeWithScopeRef::Function(function));
+            let table = index.place_table(scope);
+            let use_def = index.use_def_map(scope);
+            let mut reference = Box::new(UseDefMapBuilder::new(ScopeKind::Function));
+            for (_, definition, used) in use_def.definitions_with_usage() {
+                assert!(!used);
+                let place = definition.place(&db);
+                reference.add_place(place);
+                let category = definition.kind(&db).category(false, &module);
+                if category.is_declaration() {
+                    reference.record_combined_definition(place, definition, category);
+                } else {
+                    reference.record_binding(
+                        place,
+                        definition,
+                        PreviousDefinitions::AreShadowed,
+                        FutureDefinitions::ShadowThisOne,
+                        ImportedQualifierAction::Preserve,
+                        BindingKind::Default,
+                    );
+                }
+            }
+            assert_eq!(use_def, &reference.finish());
+            for parameter in &function.parameters {
+                let definition = index.expect_single_definition(parameter);
+                let symbol = table.symbol_id(parameter.name()).unwrap();
+                assert_eq!(use_def.first_public_binding(symbol), Some(definition));
+                assert_eq!(
+                    use_def.first_public_declaration(symbol),
+                    parameter.annotation().map(|_| definition),
+                );
+                assert_eq!(
+                    use_def
+                        .reachable_symbol_bindings(symbol)
+                        .filter_map(|binding| binding.binding.definition())
+                        .collect::<Vec<_>>(),
+                    [definition],
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lambda_parameter_symbols() {
         let TestCase { db, file } = test_case("lambda a, b, c=1, *args, d=2, **kwargs: None");
 
@@ -1619,6 +1749,27 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
                 parameter: ParameterDefinitionNodeKind::VariadicKeywordParameter(_)
             })
         );
+    }
+
+    #[test]
+    fn wildcard_import_definitions_track_export_count() {
+        let mut db = TestDbBuilder::new()
+            .with_file("/src/test.py", "from library import *")
+            .with_file("/src/library.py", "")
+            .build()
+            .unwrap();
+        let importer = system_path_to_file(&db, "/src/test.py").unwrap();
+
+        for (source, count) in [("", 0), ("a = 1", 1), ("a = 1\nb = 2", 2), ("b = 2", 1)] {
+            db.write_file("/src/library.py", source).unwrap();
+            let file = program_file(&db, importer);
+            let module = parsed_module(&db, file.python_file(&db)).load(&db);
+            let index = semantic_index(&db, file);
+            let alias = &module.suite()[0].as_import_from_stmt().unwrap().names[0];
+
+            assert_eq!(index.definitions(alias).len(), count);
+            assert_eq!(index.try_definition(alias).is_some(), count == 1);
+        }
     }
 
     /// Test case to validate that the comprehension scope is correctly identified and that the target

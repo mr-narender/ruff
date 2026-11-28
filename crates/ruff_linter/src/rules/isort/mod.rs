@@ -20,7 +20,6 @@ use types::{AliasData, ImportBlock, TrailingComma};
 use crate::Locator;
 use crate::line_width::{LineLength, LineWidthBuilder};
 use crate::package::PackageRoot;
-use crate::settings::types::PreviewMode;
 use ruff_python_ast::PythonVersion;
 
 mod annotate;
@@ -78,7 +77,6 @@ pub(crate) fn format_imports(
     source_type: PySourceType,
     target_version: PythonVersion,
     settings: &Settings,
-    preview: PreviewMode,
     tokens: &Tokens,
 ) -> String {
     let trailer = &block.trailer;
@@ -106,7 +104,6 @@ pub(crate) fn format_imports(
             package,
             target_version,
             settings,
-            preview,
         );
 
         if !block_output.is_empty() && !output.is_empty() {
@@ -163,7 +160,6 @@ fn format_import_block(
     package: Option<PackageRoot<'_>>,
     target_version: PythonVersion,
     settings: &Settings,
-    preview: PreviewMode,
 ) -> String {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     enum LineInsertion {
@@ -293,7 +289,6 @@ fn format_import_block(
                         is_first_statement,
                         settings.split_on_trailing_comma
                             && matches!(trailing_comma, TrailingComma::Present),
-                        preview,
                     ));
 
                     if settings.from_first {
@@ -316,14 +311,14 @@ mod tests {
     use rustc_hash::{FxHashMap, FxHashSet};
     use test_case::test_case;
 
-    use ruff_python_ast::{PySourceType, SourceType};
+    use ruff_python_ast::{PySourceType, PythonVersion, SourceType};
     use ruff_python_semantic::{MemberNameImport, ModuleNameImport, NameImport};
 
     use crate::assert_diagnostics;
     use crate::registry::Rule;
     use crate::rules::isort::categorize::{ImportSection, KnownModules};
     use crate::settings::LinterSettings;
-    use crate::settings::types::{IdentifierPattern, PreviewMode};
+    use crate::settings::types::IdentifierPattern;
     use crate::source_kind::SourceKind;
     use crate::test::{test_contents, test_path, test_resource_path};
 
@@ -399,38 +394,19 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(Path::new("fit_line_length_mixed_pragma.py"))]
-    #[test_case(Path::new("fit_line_length_pragma.py"))]
-    fn preview(path: &Path) -> Result<()> {
-        let snapshot = format!("preview__{}", path.to_string_lossy());
-        let diagnostics = test_path(
-            Path::new("isort").join(path).as_path(),
-            &LinterSettings {
-                preview: PreviewMode::Enabled,
-                src: vec![test_resource_path("fixtures/isort")],
-                ..LinterSettings::for_rule(Rule::UnsortedImports)
-            },
-        )?;
-        assert_diagnostics!(snapshot, diagnostics);
-        Ok(())
-    }
-
     /// Fixing I001 must never leave behind a line that E501 then flags.
     ///
     /// isort excludes pragma comments (e.g., `# noqa: TID251`) from its width computation
     /// per comment, while E501 measures the emitted line's single comment token as a whole.
     /// When isort merges separate comments onto one line (e.g., a statement-level `# explain`
     /// and an alias-level `# noqa`), the two computations could disagree; this test verifies
-    /// that the fix nonetheless converges to output that E501 accepts, in both stable and
-    /// preview modes.
-    #[test_case(PreviewMode::Disabled, "stable")]
-    #[test_case(PreviewMode::Enabled, "preview")]
-    fn no_line_too_long_after_fix(preview: PreviewMode, label: &str) -> Result<()> {
+    /// that the fix nonetheless converges to output that E501 accepts.
+    #[test]
+    fn no_line_too_long_after_fix() -> Result<()> {
         let path = test_resource_path("fixtures").join("isort/fit_line_length_merged_pragma.py");
         let source_type = SourceType::Python(PySourceType::from(&path));
         let source_kind = SourceKind::from_path(&path, source_type)?.expect("valid source");
         let settings = LinterSettings {
-            preview,
             src: vec![test_resource_path("fixtures/isort")],
             ..LinterSettings::for_rules([Rule::UnsortedImports, Rule::LineTooLong])
         };
@@ -438,7 +414,7 @@ mod tests {
         // `test_contents` applies fixes to convergence (and panics if they fail to converge).
         let (_, transformed) = test_contents(&source_kind, &path, &settings);
         insta::assert_snapshot!(
-            format!("fit_line_length_merged_pragma_fixed_{label}"),
+            "fit_line_length_merged_pragma_fixed",
             transformed.source_code()
         );
 
@@ -884,6 +860,7 @@ mod tests {
     #[test_case(Path::new("existing_import.py"))]
     #[test_case(Path::new("multiline_docstring.py"))]
     #[test_case(Path::new("off.py"))]
+    #[test_case(Path::new("relative_future_import.py"))]
     #[test_case(Path::new("whitespace.py"))]
     fn required_import(path: &Path) -> Result<()> {
         let snapshot = format!("required_import_{}", path.to_string_lossy());
@@ -905,6 +882,35 @@ mod tests {
         )?;
         assert_diagnostics!(snapshot, diagnostics);
         Ok(())
+    }
+
+    #[test_case(PythonVersion::PY312; "py312")]
+    #[test_case(PythonVersion::PY313; "py313")]
+    fn required_relative_future_import_in_stub(target_version: PythonVersion) {
+        let source = SourceKind::Python {
+            code: "x: int\n".to_string(),
+            is_stub: true,
+        };
+        let settings = LinterSettings {
+            isort: super::settings::Settings {
+                required_imports: BTreeSet::from([NameImport::ImportFrom(MemberNameImport {
+                    level: 1,
+                    ..MemberNameImport::member("__future__".to_string(), "annotations".to_string())
+                })]),
+                ..super::settings::Settings::default()
+            },
+            ..LinterSettings::for_rules([
+                Rule::MissingRequiredImport,
+                Rule::FutureAnnotationsInStub,
+            ])
+            .with_target_version(target_version)
+        };
+
+        let (_, fixed) = test_contents(&source, Path::new("test.pyi"), &settings);
+        insta::assert_snapshot!(
+            format!("required_relative_future_import_in_stub_{target_version}"),
+            fixed.source_code()
+        );
     }
 
     #[test_case(Path::new("comment.py"))]

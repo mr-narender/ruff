@@ -22,11 +22,12 @@ use ruff_linter::rules::flake8_quotes::settings::Quote;
 use ruff_linter::rules::flake8_tidy_imports::settings::{
     AllImports, ApiBan, ImportSelection, ImportSelector, Strictness,
 };
+use ruff_linter::rules::flake8_type_checking::settings::RuntimeSemantics;
 use ruff_linter::rules::isort::settings::RelativeImportsOrder;
 use ruff_linter::rules::isort::{ImportSection, ImportType};
 use ruff_linter::rules::pep8_naming::settings::IgnoreNames;
 use ruff_linter::rules::pydocstyle::settings::Convention;
-use ruff_linter::rules::pylint::settings::ConstantType;
+use ruff_linter::rules::pylint::settings::{AllowedValue, ConstantType};
 use ruff_linter::rules::{
     flake8_copyright, flake8_errmsg, flake8_gettext, flake8_implicit_str_concat,
     flake8_import_conventions, flake8_pytest_style, flake8_quotes, flake8_self,
@@ -37,7 +38,7 @@ use ruff_linter::settings::types::{
     IdentifierPattern, Language, OutputFormat, PreviewMode, PythonVersion, RequiredVersion,
 };
 use ruff_linter::{UnresolvedRuleSelector, warn_user_once};
-use ruff_macros::{CombineOptions, OptionsMetadata};
+use ruff_macros::{CacheKey, CombineOptions, OptionsMetadata};
 use ruff_options_metadata::{OptionsMetadata, Visit};
 use ruff_python_ast::name::Name;
 use ruff_python_formatter::{DocstringCodeLineWidth, QuoteStyle};
@@ -356,8 +357,8 @@ pub struct Options {
     /// code upgrades, like rewriting type annotations. Ruff will not propose
     /// changes using features that are not available in the given version.
     ///
-    /// For example, to represent supporting Python >=3.11 or ==3.11
-    /// specify `target-version = "py311"`.
+    /// For example, to represent supporting Python >=3.12 or ==3.12
+    /// specify `target-version = "py312"`.
     ///
     /// If you're already using a `pyproject.toml` file, we recommend
     /// `project.requires-python` instead, as it's based on Python packaging
@@ -384,8 +385,8 @@ pub struct Options {
     /// file than it would for an equivalent runtime file with the same target
     /// version.
     #[option(
-        default = r#""py310""#,
-        value_type = r#""py37" | "py38" | "py39" | "py310" | "py311" | "py312" | "py313" | "py314""#,
+        default = r#""py311""#,
+        value_type = r#""py37" | "py38" | "py39" | "py310" | "py311" | "py312" | "py313" | "py314" | "py315""#,
         example = r#"
             # Always generate Python 3.7-compatible code.
             target-version = "py37"
@@ -709,9 +710,10 @@ pub struct LintCommonOptions {
 
     /// A regular expression used to identify "dummy" variables, or those which
     /// should be ignored when enforcing (e.g.) unused-variable rules. The
-    /// default expression matches `_`, `__`, and `_var`, but not `_var_`.
+    /// default expression matches `_`, `__`, `_var`, and `_次`, but not `_var_`
+    /// or `_次_`.
     #[option(
-        default = r#""^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$""#,
+        default = r#""^(_+|(_+[\\p{XID_Continue}]*[\\p{XID_Continue}--_]+?))$""#,
         value_type = "str",
         example = r#"
             # Only ignore variables named "_".
@@ -1344,7 +1346,7 @@ impl Flake8BooleanTrapOptions {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Flake8BugbearOptions {
     /// Additional callable functions to consider "immutable" when evaluating, e.g., the
-    /// `function-call-in-default-argument` rule (`B008`) or `function-call-in-dataclass-defaults`
+    /// `function-call-in-parameter-default` rule (`B008`) or `function-call-in-dataclass-field-default`
     /// rule (`RUF009`).
     ///
     /// Expects to receive a list of fully-qualified names (e.g., `fastapi.Query`, rather than
@@ -1660,17 +1662,28 @@ pub struct Flake8ImportConventionsOptions {
     /// The conventional aliases for imports. These aliases can be extended by
     /// the [`extend-aliases`](#lint_flake8-import-conventions_extend-aliases) option.
     #[option(
-        default = r#"{"altair": "alt", "matplotlib": "mpl", "matplotlib.pyplot": "plt", "numpy": "np", "numpy.typing": "npt", "pandas": "pd", "seaborn": "sns", "tensorflow": "tf", "tkinter":  "tk", "holoviews": "hv", "panel": "pn", "plotly.express": "px", "polars": "pl", "pyarrow": "pa", "xml.etree.ElementTree": "ET"}"#,
+        default = r#"{"altair": "alt", "datetime": "dt", "matplotlib": "mpl", "matplotlib.pyplot": "plt", "networkx": "nx", "numpy": "np", "numpy.typing": "npt", "pandas": "pd", "seaborn": "sns", "tensorflow": "tf", "tkinter":  "tk", "holoviews": "hv", "panel": "pn", "plotly.express": "px", "polars": "pl", "pyarrow": "pa", "xml.etree.ElementTree": "ET"}"#,
         value_type = "dict[str, str]",
         scope = "aliases",
         example = r#"
             # Declare the default aliases.
             altair = "alt"
+            datetime = "dt"
+            matplotlib = "mpl"
             "matplotlib.pyplot" = "plt"
+            networkx = "nx"
             numpy = "np"
+            "numpy.typing" = "npt"
             pandas = "pd"
             seaborn = "sns"
-            scipy = "sp"
+            tensorflow = "tf"
+            tkinter = "tk"
+            holoviews = "hv"
+            panel = "pn"
+            "plotly.express" = "px"
+            polars = "pl"
+            pyarrow = "pa"
+            "xml.etree.ElementTree" = "ET"
         "#
     )]
     aliases: Option<FxHashMap<ModuleName, Alias>>,
@@ -2318,6 +2331,20 @@ fn matches_module_prefix(module: &str, prefix: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, CacheKey)]
+#[serde(untagged)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+enum AnnotationSemanticsSelection {
+    Table(FxHashMap<String, RuntimeSemantics>),
+    List(Vec<String>),
+}
+
+impl Default for AnnotationSemanticsSelection {
+    fn default() -> Self {
+        Self::Table(FxHashMap::default())
+    }
+}
+
 /// Options for the `flake8-type-checking` plugin
 #[derive(
     Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
@@ -2352,21 +2379,49 @@ pub struct Flake8TypeCheckingOptions {
     /// Exempt classes that list any of the enumerated classes as a base class
     /// from needing to be moved into type-checking blocks.
     ///
-    /// Common examples include Pydantic's `pydantic.BaseModel` and SQLAlchemy's
-    /// `sqlalchemy.orm.DeclarativeBase`, but can also support user-defined
-    /// classes that inherit from those base classes. For example, if you define
-    /// a common `DeclarativeBase` subclass that's used throughout your project
-    /// (e.g., `class Base(DeclarativeBase) ...` in `base.py`), you can add it to
-    /// this list (`runtime-evaluated-base-classes = ["base.Base"]`) to exempt
+    /// This can either be configured as a list, if all entries share the same
+    /// runtime semantics of being runtime required. Or a table where each entry
+    /// is assigned to its desired runtime semantics.
+    ///
+    /// A common example for `"runtime"` required semantics is Pydantic's `pydantic.BaseModel`
+    /// but can also support user-defined classes that inherit from those base classes.
+    /// For example, if you define a common `BaseModel` subclass that's used throughout
+    /// your project (e.g., `class Base(BaseModel) ...` in `base.py`), you can add it to
+    /// this list/table (`runtime-evaluated-base-classes = ["base.Base"]`) to exempt
     /// models from being moved into type-checking blocks.
+    ///
+    /// ```toml
+    /// [tool.ruff.lint.flake8-type-checking]
+    /// runtime-evaluated-base-classes = ["pydantic.BaseModel"]
+    /// ```
+    ///
+    /// Or
+    ///
+    /// ```toml
+    /// [tool.ruff.lint.flake8-type-checking.runtime-evaluated-base-classes]
+    /// "pydantic.BaseModel" = "required"
+    /// ```
+    ///
+    /// For some use-cases like SQLAlchemy's `sqlalchemy.orm.DeclarativeBase` it makes more
+    /// sense to mark the class as runtime `"ambiguous"`, since references to other models do
+    /// not need to resolve at runtime. With these semantics ruff will assume the annotations
+    /// already contain all of the correct forward references, and will not attempt to move
+    /// related imports and/or quote annotations.
+    ///
+    /// ```toml
+    /// [tool.ruff.lint.flake8-type-checking.runtime-evaluated-base-classes]
+    /// "sqlalchemy.orm.DeclarativeBase" = "ambiguous"
+    /// ```
     #[option(
-        default = "[]",
-        value_type = "list[str]",
+        default = "{}",
+        value_type = "list[str] | dict[str, \"required\" | \"ambiguous\"]",
+        scope = "runtime-evaluated-base-classes",
         example = r#"
-            runtime-evaluated-base-classes = ["pydantic.BaseModel", "sqlalchemy.orm.DeclarativeBase"]
+            "pydantic.BaseModel" = "required"
+            "sqlalchemy.orm.DeclarativeBase" = "ambiguous"
         "#
     )]
-    runtime_evaluated_base_classes: Option<Vec<String>>,
+    runtime_evaluated_base_classes: Option<AnnotationSemanticsSelection>,
 
     /// Exempt classes and functions decorated with any of the enumerated
     /// decorators from being moved into type-checking blocks.
@@ -2388,14 +2443,19 @@ pub struct Flake8TypeCheckingOptions {
     /// ```
     ///
     /// Here `app.get` will correctly be identified as `fastapi.FastAPI.get`.
+    ///
+    /// Just like with `runtime-evaluated-base-classes` it's possible to mark
+    /// decorators as runtime `"ambiguous"`.
     #[option(
-        default = "[]",
-        value_type = "list[str]",
+        default = "{}",
+        value_type = "list[str] | dict[str, \"required\" | \"ambiguous\"]",
+        scope = "runtime-evaluated-decorators",
         example = r#"
-            runtime-evaluated-decorators = ["pydantic.validate_call", "attrs.define"]
+            "pydantic.validate_call" = "required"
+            "sqlalchemy.orm.declared_attr" = "ambiguous"
         "#
     )]
-    runtime_evaluated_decorators: Option<Vec<String>>,
+    runtime_evaluated_decorators: Option<AnnotationSemanticsSelection>,
 
     /// Whether to add quotes around type annotations, if doing so would allow
     /// the corresponding import to be moved into a type-checking block.
@@ -2457,8 +2517,26 @@ impl Flake8TypeCheckingOptions {
             exempt_modules: self
                 .exempt_modules
                 .unwrap_or_else(|| vec!["typing".to_string()]),
-            runtime_required_base_classes: self.runtime_evaluated_base_classes.unwrap_or_default(),
-            runtime_required_decorators: self.runtime_evaluated_decorators.unwrap_or_default(),
+            runtime_evaluated_base_classes: match self
+                .runtime_evaluated_base_classes
+                .unwrap_or_default()
+            {
+                AnnotationSemanticsSelection::Table(map) => map,
+                AnnotationSemanticsSelection::List(vector) => vector
+                    .into_iter()
+                    .map(|name| (name, RuntimeSemantics::Required))
+                    .collect(),
+            },
+            runtime_evaluated_decorators: match self
+                .runtime_evaluated_decorators
+                .unwrap_or_default()
+            {
+                AnnotationSemanticsSelection::Table(map) => map,
+                AnnotationSemanticsSelection::List(vector) => vector
+                    .into_iter()
+                    .map(|name| (name, RuntimeSemantics::Required))
+                    .collect(),
+            },
             quote_annotations: self.quote_annotations.unwrap_or_default(),
         }
     }
@@ -3416,49 +3494,49 @@ pub struct PydocstyleOptions {
     /// ```
     ///
     /// The PEP 257 convention includes all `D` errors apart from:
-    /// [`D203`](rules/incorrect-blank-line-before-class.md),
-    /// [`D212`](rules/multi-line-summary-first-line.md),
-    /// [`D213`](rules/multi-line-summary-second-line.md),
-    /// [`D214`](rules/overindented-section.md),
-    /// [`D215`](rules/overindented-section-underline.md),
+    /// [`D203`](rules/incorrect-blank-line-before-class-docstring.md),
+    /// [`D212`](rules/multiline-docstring-summary-on-separate-line.md),
+    /// [`D213`](rules/multiline-docstring-summary-on-first-line.md),
+    /// [`D214`](rules/over-indented-docstring-section.md),
+    /// [`D215`](rules/over-indented-docstring-section-underline.md),
     /// [`D404`](rules/docstring-starts-with-this.md),
-    /// [`D405`](rules/non-capitalized-section-name.md),
-    /// [`D406`](rules/missing-new-line-after-section-name.md),
-    /// [`D407`](rules/missing-dashed-underline-after-section.md),
-    /// [`D408`](rules/missing-section-underline-after-name.md),
-    /// [`D409`](rules/mismatched-section-underline-length.md),
-    /// [`D410`](rules/no-blank-line-after-section.md),
-    /// [`D411`](rules/no-blank-line-before-section.md),
-    /// [`D413`](rules/missing-blank-line-after-last-section.md),
-    /// [`D415`](rules/missing-terminal-punctuation.md),
-    /// [`D416`](rules/missing-section-name-colon.md),
-    /// [`D417`](rules/undocumented-param.md), and
-    /// [`D420`](rules/incorrect-section-order.md).
+    /// [`D405`](rules/incorrectly-capitalized-docstring-section-name.md),
+    /// [`D406`](rules/missing-newline-after-docstring-section-name.md),
+    /// [`D407`](rules/missing-docstring-section-underline.md),
+    /// [`D408`](rules/blank-line-before-docstring-section-underline.md),
+    /// [`D409`](rules/incorrect-docstring-section-underline-length.md),
+    /// [`D410`](rules/missing-blank-line-after-docstring-section.md),
+    /// [`D411`](rules/missing-blank-line-before-docstring-section.md),
+    /// [`D413`](rules/missing-blank-line-after-last-docstring-section.md),
+    /// [`D415`](rules/docstring-summary-without-terminal-punctuation.md),
+    /// [`D416`](rules/docstring-section-name-without-colon.md),
+    /// [`D417`](rules/undocumented-parameter.md), and
+    /// [`D420`](rules/incorrect-docstring-section-order.md).
     ///
     /// The NumPy convention includes all `D` errors apart from:
     /// [`D107`](rules/undocumented-public-init.md),
-    /// [`D203`](rules/incorrect-blank-line-before-class.md),
-    /// [`D212`](rules/multi-line-summary-first-line.md),
-    /// [`D213`](rules/multi-line-summary-second-line.md),
+    /// [`D203`](rules/incorrect-blank-line-before-class-docstring.md),
+    /// [`D212`](rules/multiline-docstring-summary-on-separate-line.md),
+    /// [`D213`](rules/multiline-docstring-summary-on-first-line.md),
     /// [`D402`](rules/signature-in-docstring.md),
-    /// [`D413`](rules/missing-blank-line-after-last-section.md),
-    /// [`D415`](rules/missing-terminal-punctuation.md),
-    /// [`D416`](rules/missing-section-name-colon.md), and
-    /// [`D417`](rules/undocumented-param.md).
+    /// [`D413`](rules/missing-blank-line-after-last-docstring-section.md),
+    /// [`D415`](rules/docstring-summary-without-terminal-punctuation.md),
+    /// [`D416`](rules/docstring-section-name-without-colon.md), and
+    /// [`D417`](rules/undocumented-parameter.md).
     ///
     /// The Google convention includes all `D` errors apart from:
-    /// [`D203`](rules/incorrect-blank-line-before-class.md),
-    /// [`D204`](rules/incorrect-blank-line-after-class.md),
-    /// [`D213`](rules/multi-line-summary-second-line.md),
-    /// [`D215`](rules/overindented-section-underline.md),
-    /// [`D400`](rules/missing-trailing-period.md),
-    /// [`D401`](rules/non-imperative-mood.md),
+    /// [`D203`](rules/incorrect-blank-line-before-class-docstring.md),
+    /// [`D204`](rules/incorrect-blank-line-after-class-docstring.md),
+    /// [`D213`](rules/multiline-docstring-summary-on-first-line.md),
+    /// [`D215`](rules/over-indented-docstring-section-underline.md),
+    /// [`D400`](rules/docstring-summary-without-period.md),
+    /// [`D401`](rules/non-imperative-docstring-summary.md),
     /// [`D404`](rules/docstring-starts-with-this.md),
-    /// [`D406`](rules/missing-new-line-after-section-name.md),
-    /// [`D407`](rules/missing-dashed-underline-after-section.md),
-    /// [`D408`](rules/missing-section-underline-after-name.md),
-    /// [`D409`](rules/mismatched-section-underline-length.md), and
-    /// [`D413`](rules/missing-blank-line-after-last-section.md).
+    /// [`D406`](rules/missing-newline-after-docstring-section-name.md),
+    /// [`D407`](rules/missing-docstring-section-underline.md),
+    /// [`D408`](rules/blank-line-before-docstring-section-underline.md),
+    /// [`D409`](rules/incorrect-docstring-section-underline-length.md), and
+    /// [`D413`](rules/missing-blank-line-after-last-docstring-section.md).
     ///
     /// For more information see the [FAQ](faq.md#does-ruff-support-numpy-or-google-style-docstrings) entry.
     ///
@@ -3630,6 +3708,27 @@ pub struct PylintOptions {
     )]
     allow_magic_value_types: Option<Vec<ConstantType>>,
 
+    /// Specific literal values to ignore when used as "magic values" (see `PLR2004`).
+    #[option(
+        default = r#"[0, 1, -1, 0.0, 1.0, -1.0, "", "__main__"]"#,
+        value_type = r#"list[str | int | float]"#,
+        example = r#"
+            allow-magic-values = [42, 3.14, "special"]
+        "#
+    )]
+    allow_magic_values: Option<Vec<AllowedValue>>,
+
+    /// Literal values to ignore when used as "magic values" (see `PLR2004`),
+    /// in addition to those included in [`allow-magic-values`](#lint_pylint_allow-magic-values).
+    #[option(
+        default = r#"[]"#,
+        value_type = r#"list[str | int | float]"#,
+        example = r#"
+            extend-allow-magic-values = [42, 3.14, "magic"]
+        "#
+    )]
+    extend_allow_magic_values: Option<Vec<AllowedValue>>,
+
     /// Dunder methods name to allow, in addition to the default set from the
     /// Python standard library (see `PLW3201`).
     #[option(
@@ -3708,10 +3807,17 @@ pub struct PylintOptions {
 impl PylintOptions {
     pub(crate) fn into_settings(self) -> pylint::settings::Settings {
         let defaults = pylint::settings::Settings::default();
+        let mut allow_magic_values = self
+            .allow_magic_values
+            .unwrap_or(defaults.allow_magic_values);
+        if let Some(extend) = self.extend_allow_magic_values {
+            allow_magic_values.extend(extend);
+        }
         pylint::settings::Settings {
             allow_magic_value_types: self
                 .allow_magic_value_types
                 .unwrap_or(defaults.allow_magic_value_types),
+            allow_magic_values,
             allow_dunder_method_names: self.allow_dunder_method_names.unwrap_or_default(),
             max_args: self.max_args.unwrap_or(defaults.max_args),
             max_positional_args: self
@@ -3863,12 +3969,12 @@ pub struct RuffOptions {
     )]
     allowed_markup_calls: Option<Vec<String>>,
     /// Whether to require `__init__.py` files to contain no code at all, including imports and
-    /// docstrings (see `RUF067`).
+    /// `__all__` assignments (see `RUF067`). Module and attribute docstrings are still allowed.
     #[option(
         default = r#"false"#,
         value_type = "bool",
         example = r#"
-        # Make it a violation to include any code, including imports and docstrings in `__init__.py`
+        # Make it a violation to include any code, including imports, in `__init__.py`
         strictly-empty-init-modules = true
         "#
     )]

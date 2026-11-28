@@ -1,42 +1,47 @@
 //! Instance types: both nominal and structural.
 
 use crate::ProgramEnvironment;
+use ruff_python_ast::name::Name;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::debug_assert_matches;
 use std::marker::PhantomData;
 
+use itertools::Itertools;
+
+use super::class::ClassInstanceFlags;
 use super::protocol_class::{ProtocolInterface, ProtocolInterfaceView, StructuralMemberPriority};
 use super::{
     BoundTypeVarIdentity, BoundTypeVarInstance, ClassType, DivergentType, KnownClass,
-    MaterializationKind, SubclassOfType, Type, TypeAliasType,
+    MaterializationKind, SubclassOfType, Type, TypeAliasType, TypeVarVariance,
 };
 use crate::place::PlaceAndQualifiers;
+use crate::types::constraints::projection::ProjectionError;
 use crate::types::constraints::{
     ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, OwnedConstraintSet,
 };
 use crate::types::cyclic::{ActiveRecursionDetector, TypeIdentity};
 use crate::types::enums::is_single_member_enum;
-use crate::types::generics::walk_specialization;
+use crate::types::generics::{walk_specialization, walk_specialization_types};
 use crate::types::protocol_class::{
     ProtocolClass, has_all_protocol_members_defined, walk_protocol_instance_member,
     walk_protocol_interface,
 };
 use crate::types::relation::{
     DisjointnessChecker, HasRelationToVisitor, IsDisjointVisitor, TypeRelation,
-    TypeRelationChecker, TypeVarEvaluation,
+    TypeRelationChecker, try_constraint,
 };
 use crate::types::signatures::SignatureRelationVisitor;
 use crate::types::tuple::{TupleSpec, TupleType, walk_tuple_type};
-use crate::types::typevar::TypeVarSet;
+use crate::types::typevar::{TypeVarBoundOrConstraints, TypeVarSet};
 use crate::types::visitor::{
-    TypeCollector, TypeVisitor, any_over_type_expanding_aliases, materialization_is_noop,
-    walk_type_with_recursion_guard,
+    DynamicContentMode, TypeCollector, TypeVisitor, any_over_type, any_over_type_expanding_aliases,
+    dynamic_content_impl, walk_type_with_recursion_guard,
 };
 use crate::types::{
     ApplyTypeMappingVisitor, CallableType, ClassBase, ClassLiteral, ErrorContext,
-    FindLegacyTypeVarsVisitor, LiteralValueTypeKind, TypeContext, TypeMapping, VarianceInferable,
-    VarianceTerm,
+    FindLegacyTypeVarsVisitor, LiteralValueTypeKind, RecursiveTypeNormalizer, TypeContext,
+    TypeMapping, VarianceInferable, VarianceTerm,
 };
 use crate::{Db, FxOrderSet};
 pub(super) use synthesized_protocol::SynthesizedProtocolType;
@@ -63,40 +68,46 @@ impl<'db> Type<'db> {
         env: &ProgramEnvironment<'db>,
         class: ClassType<'db>,
     ) -> Self {
-        match class.class_literal(db) {
+        let literal = class.class_literal(db);
+        match literal {
             // Dynamic classes created via `type()` don't have special instance types.
             ClassLiteral::Dynamic(_)
             | ClassLiteral::DynamicNamedTuple(_)
-            | ClassLiteral::DynamicEnum(_) => {
-                Type::NominalInstance(NominalInstanceType::from_class(db, class))
-            }
+            | ClassLiteral::DynamicEnum(_) => Type::NominalInstance(
+                NominalInstanceType::from_class(db, class, literal.instance_flags(db)),
+            ),
             // Functional TypedDicts return a TypedDict instance type.
             ClassLiteral::DynamicTypedDict(_) => Type::typed_dict(class),
             ClassLiteral::Static(class_literal) => {
-                let specialization = class.into_generic_alias().map(|g| g.specialization(db));
-                match class_literal.known(db) {
-                    Some(KnownClass::Tuple) => Type::tuple(TupleType::new(
-                        db,
-                        env,
-                        specialization
-                            .and_then(|spec| Some(Cow::Borrowed(spec.tuple(db)?)))
-                            .unwrap_or_else(|| Cow::Owned(TupleSpec::homogeneous(Type::unknown())))
-                            .as_ref(),
-                    )),
+                let header = class_literal.header(db);
+                match header.known {
+                    Some(KnownClass::Tuple) => {
+                        Type::tuple(TupleType::new(db, env, &builtin_tuple_spec(db, class)))
+                    }
                     Some(KnownClass::Object) => Type::object(),
-                    _ => class_literal
-                        .is_typed_dict(db)
-                        .then(|| Type::typed_dict(class))
-                        .or_else(|| {
-                            class.into_protocol_class(db).map(|protocol_class| {
-                                Self::ProtocolInstance(ProtocolInstanceType::from_class(
-                                    protocol_class,
-                                ))
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            Type::NominalInstance(NominalInstanceType::from_class(db, class))
-                        }),
+                    // Known classes declare their classification, and classes without bases
+                    // cannot inherit from Any, Protocol or TypedDict.
+                    known
+                        if known.map_or(!header.has_explicit_bases, |known| {
+                            !known.is_protocol() && !known.is_typed_dict_subclass()
+                        }) =>
+                    {
+                        Type::NominalInstance(NominalInstanceType::from_class(
+                            db,
+                            class,
+                            ClassInstanceFlags::empty(),
+                        ))
+                    }
+                    _ => {
+                        let flags = class_literal.classification_flags(db, header);
+                        if flags.contains(ClassInstanceFlags::TYPED_DICT) {
+                            Type::typed_dict(class)
+                        } else if let Some(protocol_class) = class.into_protocol_class(db) {
+                            Self::ProtocolInstance(ProtocolInstanceType::from_class(protocol_class))
+                        } else {
+                            Type::NominalInstance(NominalInstanceType::from_class(db, class, flags))
+                        }
+                    }
                 }
             }
         }
@@ -230,10 +241,28 @@ pub(super) fn walk_nominal_instance_type<'db, V: super::visitor::TypeVisitor<'db
     }
 }
 
+/// Whether the unspecialized MRO rules out `target` as a proper base of `source`.
+///
+/// Specialization changes the arguments of a base, not its class identity. If the
+/// MRO is invalid or incomplete, leave the decision to the full relation.
+fn excludes_ancestor<'db>(
+    db: &'db dyn Db,
+    source: super::StaticClassLiteral<'db>,
+    target: super::StaticClassLiteral<'db>,
+) -> bool {
+    source.try_mro_ancestors(db, None).is_ok_and(|bases| {
+        bases.iter().all(|base| match base {
+            ClassBase::Class(class) => class.class_literal(db) != ClassLiteral::Static(target),
+            ClassBase::Any | ClassBase::Dynamic(_) | ClassBase::Divergent(_) => false,
+            ClassBase::Generic | ClassBase::Protocol | ClassBase::TypedDict(_) => true,
+        })
+    })
+}
+
 impl<'db> NominalInstanceType<'db> {
-    fn from_class(db: &'db dyn Db, class: ClassType<'db>) -> Self {
+    fn from_class(db: &'db dyn Db, class: ClassType<'db>, flags: ClassInstanceFlags) -> Self {
         Self(NominalInstanceInner::NonTuple(
-            NominalInstanceClass::from_class(db, class),
+            NominalInstanceClass::from_class(db, class, flags),
         ))
     }
 
@@ -256,6 +285,33 @@ impl<'db> NominalInstanceType<'db> {
         }
     }
 
+    /// Can neither instance be redundant with the other in a union, regardless of
+    /// their type arguments? Only ordinary instances are decided by class ancestry.
+    ///
+    /// For a pair of ordinary nominal instances, [`TypeRelationChecker::check_class_pair`]
+    /// requires the target class to appear in the source MRO before it compares type
+    /// arguments or tries alternate inheritance paths. This is not an assignability
+    /// check: an unknown base does not make an instance redundant in a union.
+    /// Object and exact tuples have dedicated rules and are excluded here.
+    pub(super) fn has_unrelated_class(self, db: &'db dyn Db, other: Self) -> bool {
+        let (NominalInstanceInner::NonTuple(left), NominalInstanceInner::NonTuple(right)) =
+            (self.0, other.0)
+        else {
+            return false;
+        };
+        let (Some(left), Some(right)) = (
+            left.class(db).class_literal(db).as_static(),
+            right.class(db).class_literal(db).as_static(),
+        ) else {
+            return false;
+        };
+        if left == right {
+            return false;
+        }
+
+        excludes_ancestor(db, left, right) && excludes_ancestor(db, right, left)
+    }
+
     /// Returns the class literal for this instance.
     pub(super) fn class_literal(
         &self,
@@ -274,6 +330,10 @@ impl<'db> NominalInstanceType<'db> {
             NominalInstanceInner::SysVersionInfo => Some(KnownClass::VersionInfo),
             NominalInstanceInner::Object => Some(KnownClass::Object),
         }
+    }
+
+    pub(super) const fn is_exact_tuple(self) -> bool {
+        matches!(self.0, NominalInstanceInner::ExactTuple(_))
     }
 
     pub(super) const fn is_sys_version_info(self) -> bool {
@@ -312,19 +372,8 @@ impl<'db> NominalInstanceType<'db> {
                 class
                     .iter_mro(db)
                     .filter_map(ClassBase::into_class)
-                    .find_map(|class| match class.known(db)? {
-                        KnownClass::Tuple => Some(
-                            class
-                                .into_generic_alias()
-                                .and_then(|alias| {
-                                    Some(Cow::Borrowed(alias.specialization(db).tuple(db)?))
-                                })
-                                .unwrap_or_else(|| {
-                                    Cow::Owned(TupleSpec::homogeneous(Type::unknown()))
-                                }),
-                        ),
-                        _ => None,
-                    })
+                    .find(|class| class.known(db) == Some(KnownClass::Tuple))
+                    .map(|class| builtin_tuple_spec(db, class))
             }
         }
     }
@@ -402,17 +451,16 @@ impl<'db> NominalInstanceType<'db> {
         })
     }
 
-    pub(super) fn recursive_type_normalized_impl(
+    pub(super) fn normalize_recursive(
         self,
         db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        div: Type<'db>,
+        normalizer: &mut RecursiveTypeNormalizer<'_, 'db>,
         nested: bool,
     ) -> Option<Self> {
         match self.0 {
             NominalInstanceInner::ExactTuple(tuple) => {
                 Some(Self(NominalInstanceInner::ExactTuple(
-                    tuple.recursive_type_normalized_impl(db, env, div, nested)?,
+                    tuple.normalize_recursive(db, normalizer, nested)?,
                 )))
             }
             NominalInstanceInner::SysVersionInfo => {
@@ -422,7 +470,7 @@ impl<'db> NominalInstanceType<'db> {
             NominalInstanceInner::NonTuple(class) => {
                 let transformed = class
                     .class(db)
-                    .recursive_type_normalized_impl(db, env, div, nested)?;
+                    .normalize_recursive(db, normalizer, nested)?;
                 Some(Self(NominalInstanceInner::NonTuple(
                     class.with_class(db, transformed),
                 )))
@@ -502,10 +550,337 @@ impl<'db> NominalInstanceType<'db> {
     }
 }
 
+/// Returns the tuple shape for a specialization of the built-in `tuple` class.
+fn builtin_tuple_spec<'db>(db: &'db dyn Db, class: ClassType<'db>) -> Cow<'db, TupleSpec<'db>> {
+    let specialization = class
+        .into_generic_alias()
+        .map(|alias| alias.specialization(db));
+    if let Some(tuple) = specialization.and_then(|spec| spec.tuple(db)) {
+        return Cow::Borrowed(tuple);
+    }
+
+    // Generic call inference can specialize the class's element type without constructing
+    // an explicit tuple shape, for example when `tuple` is passed as a callback.
+    Cow::Owned(match specialization.map(|spec| spec.types(db)) {
+        Some([Type::Never]) => TupleSpec::heterogeneous([]),
+        Some([element]) => TupleSpec::homogeneous(*element),
+        _ => TupleSpec::homogeneous(Type::unknown()),
+    })
+}
+
 impl<'db> From<NominalInstanceType<'db>> for Type<'db> {
     fn from(value: NominalInstanceType<'db>) -> Self {
         Self::NominalInstance(value)
     }
+}
+
+/// Conservatively prove that materialization leaves a protocol's requirements unchanged.
+///
+/// A `true` result permits ignoring materialization when comparing this protocol. A `false`
+/// result can mean that inspection was incomplete, even if materialization is a no-op.
+///
+/// First inspect the specialized interface directly. If that is inconclusive, inspect the
+/// interface using the protocol's own type parameters to handle growing specializations.
+///
+/// The interface must be read inside this query. If a dependency is provisional during Salsa cycle
+/// recovery, `cycle_result` prevents an incomplete interface from being used as a proof; the
+/// structural comparison remains available as a fallback.
+#[salsa::tracked(
+    returns(copy),
+    cycle_result=|_, _, _, _| false,
+    heap_size=ruff_memory_usage::heap_size,
+)]
+fn protocol_materialization_is_noop<'db>(
+    db: &'db dyn Db,
+    program: crate::Program<'db>,
+    class: ProtocolClass<'db>,
+) -> bool {
+    let env = ProgramEnvironment::from_program(program);
+    protocol_materialization_is_noop_by_inspection(
+        db,
+        &env,
+        ProtocolInstanceType::from_class(class),
+    ) || protocol_materialization_is_noop_with_type_parameters(db, &env, class)
+}
+
+/// Prove by inspecting its member types that materialization leaves `protocol` unchanged.
+///
+/// The inspection accounts for callable signatures and the wrapped callable of a partial. It
+/// returns false when a lazily inferred signature cannot be inspected safely. It ignores metadata
+/// such as parameter-default types, which do not affect callable compatibility.
+///
+/// Inspecting a concrete specialization can prove cases that the type-parameter proof below cannot:
+///
+/// ```python
+/// from __future__ import annotations
+/// from typing import Any, Protocol
+///
+/// class P[T](Protocol):
+///     def value(self) -> T | Any: ...
+///     def child(self) -> P[T]: ...
+/// ```
+///
+/// For `P[object]`, the return type of `value` simplifies from `object | Any` to `object`.
+/// The return type of `child` is the same `P[object]` already being inspected, so its recursive
+/// reference adds no new requirements. Materialization therefore leaves `P[object]` unchanged.
+/// The type-parameter proof instead inspects `P[T]`, where `T | Any` is still gradual. It cannot
+/// establish the same result for arbitrary static arguments: `P[int]`, for example, retains
+/// the gradual return type `int | Any`.
+fn protocol_materialization_is_noop_by_inspection<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    protocol: ProtocolInstanceType<'db>,
+) -> bool {
+    dynamic_content_impl(
+        db,
+        env,
+        Type::ProtocolInstance(protocol),
+        DynamicContentMode::Materialization,
+    )
+    .is_absent()
+}
+
+/// Prove that materialization leaves a protocol specialization unchanged by inspecting its
+/// interface with type parameters as placeholders and checking its concrete type arguments.
+///
+/// A `true` result guarantees that its requirements are unchanged. A `false` result may mean that
+/// the proof could not establish this, even if materialization is a no-op.
+///
+/// For example, consider a protocol whose recursive type argument grows with each `child` call:
+///
+/// ```python
+/// class P[T](Protocol):
+///     def value(self) -> T: ...
+///     def child(self) -> P[list[T]]: ...
+/// ```
+///
+/// Inspecting every specialization reachable from `P[int]` would require visiting `P[list[int]]`,
+/// `P[list[list[int]]]`, and so on. Instead, inspect the interface of `P[T]` once, treating `T`
+/// as a placeholder for a fully static type, and separately check that the initial argument `int`
+/// is fully static. At the recursive reference `P[list[T]]`, check that `list[T]` stays fully
+/// static when `T` is fully static, without inspecting another specialized interface. Each
+/// recursive step therefore preserves fully static arguments, and neither member introduces
+/// any gradual types, so materialization leaves all these specializations unchanged.
+///
+/// If `child` instead returned `P[list[Any]]`, the recursive argument check would fail: a static
+/// initial argument does not prevent a later specialization from introducing gradual types.
+///
+/// The proof accepts ordinary properties and instance methods. Explicit receiver
+/// annotations must be direct, unmaterialized specializations of the same protocol, and are only
+/// supported for method-only interfaces. Other cases fall back to structural comparison.
+///
+/// This must be called from `protocol_materialization_is_noop` so that `cycle_result`
+/// rejects provisional interface results.
+fn protocol_materialization_is_noop_with_type_parameters<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    class: ProtocolClass<'db>,
+) -> bool {
+    struct ParameterVisitor<'a, 'db> {
+        env: &'a ProgramEnvironment<'db>,
+        origin: ClassLiteral<'db>,
+        class_context: Option<crate::types::generics::GenericContext<'db>>,
+        invalid: Cell<bool>,
+        recursion_guard: TypeCollector<'db>,
+    }
+
+    impl<'db> TypeVisitor<'db> for ParameterVisitor<'_, 'db> {
+        fn program_environment(&self) -> &ProgramEnvironment<'db> {
+            self.env
+        }
+
+        fn should_visit_lazy_type_attributes(&self) -> bool {
+            false
+        }
+
+        fn visit_bound_type_var_type(&self, db: &'db dyn Db, variable: BoundTypeVarInstance<'db>) {
+            // Signature generic contexts are visited even for unused parameters, so this also
+            // rejects method-scoped type variables absent from parameter and return types.
+            if !variable.typevar(db).is_self(db)
+                && self
+                    .class_context
+                    .is_none_or(|context| !context.contains(db, variable.identity(db)))
+            {
+                self.invalid.set(true);
+            }
+        }
+
+        fn visit_generic_alias_type(
+            &self,
+            db: &'db dyn Db,
+            alias: crate::types::GenericAlias<'db>,
+        ) {
+            let specialization = alias.specialization(db);
+            if specialization.materialization_kind(db).is_some() {
+                self.invalid.set(true);
+            } else {
+                walk_specialization_types(db, specialization, self);
+            }
+        }
+
+        fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+            if self.invalid.get() {
+                return;
+            }
+            match ty {
+                Type::ProtocolInstance(protocol) => {
+                    if protocol.materialization_kind(db).is_some() {
+                        self.invalid.set(true);
+                        return;
+                    }
+                    let Some(class) = protocol.class_origin(db) else {
+                        self.invalid.set(true);
+                        return;
+                    };
+                    if class.class_literal(db) != self.origin {
+                        self.invalid.set(true);
+                    } else if let Some((_, Some(specialization))) = class.static_class_literal(db) {
+                        // Type variables in a recursive specialization are expected, but an
+                        // embedded gradual or unresolved type can change under materialization.
+                        self.invalid.set(
+                            specialization.materialization_kind(db).is_some()
+                                || specialization.tuple(db).is_some()
+                                || specialization.types(db).iter().any(|ty| {
+                                    if matches!(ty, Type::ProtocolInstance(_)) {
+                                        self.visit_type(db, *ty);
+                                        self.invalid.get()
+                                    } else {
+                                        !specialization_argument_is_static(
+                                            db,
+                                            self.env,
+                                            *ty,
+                                            self.class_context,
+                                        )
+                                    }
+                                }),
+                        );
+                    }
+                }
+                Type::TypeVar(variable)
+                    if self
+                        .class_context
+                        .is_some_and(|context| context.contains(db, variable.identity(db))) => {}
+                Type::Never
+                | Type::Callable(_)
+                | Type::ClassLiteral(_)
+                | Type::GenericAlias(_)
+                | Type::NominalInstance(_)
+                | Type::Union(_)
+                | Type::Intersection(_)
+                | Type::LiteralValue(_) => {
+                    walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+                }
+                _ => self.invalid.set(true),
+            }
+        }
+    }
+
+    let Some((origin, specialization)) = class.static_class_literal(db) else {
+        return false;
+    };
+    if specialization
+        .is_some_and(|specialization| specialization.materialization_kind(db).is_some())
+    {
+        return false;
+    }
+    let interface = ProtocolInterfaceView::new(class.interface(db), None);
+    let Some(template) = origin.identity_specialization(db).into_protocol_class(db) else {
+        return false;
+    };
+    let template_view = ProtocolInterfaceView::new(template.interface(db), None);
+    let class_context = origin.generic_context(db);
+    if interface.member_count(db) != template_view.member_count(db) {
+        return false;
+    }
+
+    if class_context.is_some_and(|context| {
+        context.variables(db).any(|variable| {
+            variable.is_paramspec(db)
+                || variable.is_typevartuple(db)
+                || variable
+                    .typevar(db)
+                    .bound_or_constraints(db, env)
+                    .is_some_and(|bounds| match bounds {
+                        TypeVarBoundOrConstraints::UpperBound(bound) => {
+                            !specialization_argument_is_static(db, env, bound, None)
+                        }
+                        TypeVarBoundOrConstraints::Constraints(constraints) => {
+                            // Check each constraint: their union could hide a gradual type,
+                            // as with `(object, Any)`.
+                            constraints.elements(db).iter().any(|constraint| {
+                                !specialization_argument_is_static(db, env, *constraint, None)
+                            })
+                        }
+                    })
+                || variable.typevar(db).default_type(db, env).is_some()
+        })
+    }) {
+        return false;
+    }
+    if let Some(specialization) = specialization
+        && (specialization.tuple(db).is_some()
+            || specialization
+                .types(db)
+                .iter()
+                .any(|ty| !specialization_argument_is_static(db, env, *ty, None)))
+    {
+        return false;
+    }
+    let visitor = ParameterVisitor {
+        env,
+        origin: origin.into(),
+        class_context,
+        invalid: Cell::new(false),
+        recursion_guard: TypeCollector::default(),
+    };
+    let receiver = Type::ProtocolInstance(ProtocolInstanceType::from_class(template));
+    let mut has_property = false;
+    let mut has_explicit_receiver = false;
+    for (member, template_member) in interface.members(db).zip(template_view.members(db)) {
+        if member.name() != template_member.name()
+            || !member.supports_type_parameter_materialization_proof(db, env, origin.into())
+            || !template_member.supports_type_parameter_materialization_proof(
+                db,
+                env,
+                origin.into(),
+            )
+        {
+            return false;
+        }
+        has_property |= !template_member.is_method();
+        has_explicit_receiver |= template_member.has_explicit_receiver_annotation(db);
+        if has_property && has_explicit_receiver {
+            return false;
+        }
+        walk_protocol_instance_member(db, &template_member, receiver, &visitor);
+        if visitor.invalid.get() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check only closed, directly inspectable types. Recursive substitutions may additionally use
+/// the protocol's own parameters, whose bounds and defaults are checked separately.
+fn specialization_argument_is_static<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    ty: Type<'db>,
+    class_context: Option<crate::types::generics::GenericContext<'db>>,
+) -> bool {
+    !any_over_type(db, env, ty, false, |nested| match nested {
+        Type::Never
+        | Type::ClassLiteral(_)
+        | Type::NominalInstance(_)
+        | Type::Union(_)
+        | Type::Intersection(_)
+        | Type::LiteralValue(_) => false,
+        Type::GenericAlias(alias) => alias.specialization(db).materialization_kind(db).is_some(),
+        Type::TypeVar(variable) => {
+            class_context.is_none_or(|context| !context.contains(db, variable.identity(db)))
+        }
+        _ => true,
+    })
 }
 
 impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
@@ -514,6 +889,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         &self,
         db: &'db dyn Db,
         ty: Type<'db>,
+        receiver: Type<'db>,
         protocol: ProtocolInstanceType<'db>,
     ) -> ConstraintSet<'db, 'c> {
         // Explicit protocol inheritance establishes subtyping even when a subclass overrides
@@ -521,25 +897,73 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let mut result = self.never();
         let source_protocol = ty.as_protocol_instance();
 
-        // Every gradual type lies between its bottom and top materializations. Comparing the
-        // exact same class specialization can therefore settle these directions without expanding
-        // a recursive protocol's members or confusing opposite materialization requirements.
+        // Every gradual type lies between its bottom and top materializations, and is assignable
+        // to and from either one. Each materialization is a subtype of itself. For the same class
+        // specialization, we can check these relations without expanding recursive members.
         if let Some(source) = source_protocol
-            && matches!(
-                (
-                    source.materialization_kind(db),
-                    protocol.materialization_kind(db)
-                ),
-                (
-                    None | Some(MaterializationKind::Bottom),
-                    Some(MaterializationKind::Top)
-                ) | (Some(MaterializationKind::Bottom), None)
-            )
             && let (Some(source_origin), Some(target_origin)) =
                 (source.class_origin(db), protocol.class_origin(db))
             && source_origin == target_origin
+            && (match (
+                source.materialization_kind(db),
+                protocol.materialization_kind(db),
+            ) {
+                (_, Some(MaterializationKind::Top)) | (Some(MaterializationKind::Bottom), _) => {
+                    true
+                }
+                (Some(MaterializationKind::Top), None)
+                | (None, Some(MaterializationKind::Bottom))
+                    if self.relation.is_assignability() =>
+                {
+                    // A specialization may already carry a separate materialization marker.
+                    // For example, materializing `Box[Any]`, where `Box[T]` has an invariant
+                    // `P[T]` member, can put `Top` on the `P[Any]` specialization. A separate
+                    // `Bottom` protocol wrapper then has that top-materialized specialization
+                    // as its origin, not the original gradual `P[Any]`.
+                    source_origin
+                        .static_class_literal(db)
+                        .is_some_and(|(_, specialization)| {
+                            specialization.is_none_or(|specialization| {
+                                specialization.materialization_kind(db).is_none()
+                            })
+                        })
+                }
+                _ => false,
+            })
         {
             return self.always();
+        }
+
+        // If both instances share a protocol class, a proof that materialization is a no-op can
+        // simplify their comparison.
+        if let Some(source) = source_protocol
+            && (source.materialization_kind(db).is_some()
+                || protocol.materialization_kind(db).is_some())
+            && let (Some(source_origin), Some(target_origin)) =
+                (source.class_origin(db), protocol.class_origin(db))
+            && source_origin.class_literal(db) == target_origin.class_literal(db)
+        {
+            // For the same specialization, unchanged requirements settle the relationship.
+            if source != protocol
+                && source_origin == target_origin
+                && protocol_materialization_is_noop(db, self.env.program(db), source_origin)
+            {
+                return self.always();
+            }
+
+            // A no-op source materialization can be removed before comparing method-only
+            // interfaces. For recursive properties and attributes, keep the wrapper: removing
+            // it can make the cycle guard reject distinct specializations that stabilize.
+            if source.materialization_kind(db).is_some()
+                && source.interface(db).has_only_methods(db)
+                && protocol_materialization_is_noop(db, self.env.program(db), source_origin)
+            {
+                return self.check_type_pair(
+                    db,
+                    Type::ProtocolInstance(ProtocolInstanceType::from_class(source_origin)),
+                    Type::ProtocolInstance(protocol),
+                );
+            }
         }
 
         let source_protocol_as_nominal =
@@ -578,17 +1002,18 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             // Check that inexpensive case first: comparing every requirement of an unrelated
             // recursive protocol can expand its interface before structural member ordering gets
             // a chance to reject an incompatible finite member.
-            let can_use_nominal_result_directly = nominally_satisfied.is_never_satisfied(db, env)
-                || ((protocol.materialization_kind(db) == Some(MaterializationKind::Top)
-                    || !protocol.materialization_changes_requirements(db, env, protocol))
-                    && !source_protocol.is_some_and(|source| {
-                        source.materialization_changes_requirements(db, env, protocol)
-                    }));
+            let can_use_nominal_result_directly =
+                try_constraint!(self.try_is_never_satisfied(db, nominally_satisfied))
+                    || ((protocol.materialization_kind(db) == Some(MaterializationKind::Top)
+                        || !protocol.materialization_changes_requirements(db, env, protocol))
+                        && !source_protocol.is_some_and(|source| {
+                            source.materialization_changes_requirements(db, env, protocol)
+                        }));
 
             if can_use_nominal_result_directly
                 && result
                     .union(db, self.constraints, nominally_satisfied)
-                    .is_trivially_always_satisfied()
+                    .short_circuits_or()
             {
                 return result;
             }
@@ -612,7 +1037,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             //
             // Eager finite checks can only reject. Lazy comparisons can also contribute
             // structural solutions, so try them before using the nominal fallback.
-            if (self.typevar_evaluation == TypeVarEvaluation::Lazy || !can_use_nominal_redundancy)
+            if (self.typevar_evaluation.is_lazy() || !can_use_nominal_redundancy)
                 && let Some(structurally_satisfied) = self.try_check_non_recursive_protocol_members(
                     db,
                     ty,
@@ -643,7 +1068,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let structurally_satisfied = if let Type::ProtocolInstance(source_protocol) = ty {
             self.check_protocol_interface_pair(
                 db,
-                ty,
+                receiver,
                 source_protocol.interface(db),
                 protocol.interface(db),
             )
@@ -652,15 +1077,18 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         {
             structurally_satisfied
         } else {
+            // A finite mismatch can reject the implementation before recursive receivers expand
+            // the protocol again, just as in protocol-to-protocol comparisons.
             protocol
                 .interface(db)
                 .members(db)
+                .sorted_by_cached_key(|member| member.structural_member_priority(db, env))
                 .when_all(db, self.constraints, |member| {
-                    self.type_satisfies_protocol_member(db, ty, &member)
+                    self.type_satisfies_protocol_member(db, receiver, &member)
                 })
         };
         if let Some(context) = self.report_context()
-            && structurally_satisfied.is_never_satisfied(db, env)
+            && structurally_satisfied.is_never_satisfied(db, env, self.inferable)
         {
             context.push(ErrorContext::TypeNotCompatibleWithProtocol {
                 ty,
@@ -696,11 +1124,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // `Any` member. Only use the nominal proof when the pending wrappers are harmless.
         for protocol in [source, target] {
             if let Some(origin) = protocol.materialized_origin(db)
-                && !materialization_is_noop(
-                    db,
-                    self.env,
-                    Type::ProtocolInstance(ProtocolInstanceType::from_class(origin)),
-                )
+                && !protocol_materialization_is_noop(db, self.env.program(db), origin)
             {
                 return None;
             }
@@ -721,7 +1145,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         protocol: ProtocolInstanceType<'db>,
         nominally_satisfied: ConstraintSet<'db, 'c>,
     ) -> Option<ConstraintSet<'db, 'c>> {
-        if self.typevar_evaluation != TypeVarEvaluation::Lazy
+        if !self.typevar_evaluation.is_lazy()
             || self.is_context_collection_enabled()
             || nominally_satisfied.is_trivially_never_satisfied()
         {
@@ -734,13 +1158,14 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         let source_alias = source_class.into_generic_alias()?;
 
         let source_arguments = source_alias.specialization(db).types(db);
+        let nominal = try_constraint!(nominally_satisfied.diagram());
         // Nested variables, such as `T` in `Concrete[T | Iterable[T]]`, can also be
         // constrained by the nominal relation. Only variables absent from that relation
         // require structural inference that the nominal proof cannot account for.
         if source_arguments.iter().any(|argument| {
             any_over_type_expanding_aliases(db, env, *argument, |nested| {
                 matches!(nested, Type::TypeVar(typevar)
-                    if !nominally_satisfied.mentions_typevar(typevar))
+                    if !nominal.mentions_typevar(typevar))
             })
         }) {
             return None;
@@ -786,10 +1211,10 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                     self.type_satisfies_protocol_member(db, ty, member)
                 });
         for (_, member) in recursive_members {
-            if structurally_satisfied
-                .implies(db, self.constraints, || nominally_satisfied)
-                .is_always_satisfied(db, env)
-            {
+            if try_constraint!(self.try_is_always_satisfied(
+                db,
+                structurally_satisfied.implies(db, self.constraints, || nominally_satisfied)
+            )) {
                 break;
             }
             structurally_satisfied = structurally_satisfied.and(db, self.constraints, || {
@@ -888,7 +1313,7 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             {
                 return None;
             }
-            _ if self.typevar_evaluation == TypeVarEvaluation::Lazy
+            _ if self.typevar_evaluation.is_lazy()
                 && (self.relation.is_assignability() || self.relation.is_subtyping()) =>
             {
                 true
@@ -930,6 +1355,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
             ),
         );
 
+        let structural = try_constraint!(structurally_satisfied.diagram());
+
         // A skipped member can be the only source of information about a type variable. In this
         // example, `marker: Any` ensures materialization changes the interface for static arguments:
         //
@@ -968,12 +1395,13 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 .any(|argument| {
                     any_over_type_expanding_aliases(db, env, *argument, |nested| {
                         matches!(nested, Type::TypeVar(typevar)
-                            if !structurally_satisfied.mentions_typevar(typevar))
+                            if !structural.mentions_typevar(typevar))
                     })
                 })
-                || !structurally_satisfied
-                    .implies(db, self.constraints, || nominally_satisfied)
-                    .is_always_satisfied(db, env))
+                || !try_constraint!(self.try_is_always_satisfied(
+                    db,
+                    structurally_satisfied.implies(db, self.constraints, || nominally_satisfied)
+                )))
         {
             return None;
         }
@@ -981,8 +1409,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
         // We run the eager comparison to reject incompatible finite requirements before
         // expanding recursive members. If it cannot reject, the caller checks the full
         // interface instead.
-        (self.typevar_evaluation == TypeVarEvaluation::Lazy
-            || structurally_satisfied.is_never_satisfied(db, env))
+        (self.typevar_evaluation.is_lazy()
+            || try_constraint!(self.try_is_never_satisfied(db, structurally_satisfied)))
         .then_some(structurally_satisfied)
     }
 
@@ -1026,6 +1454,17 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
                 NominalInstanceInner::ExactTuple(source_tuple),
                 NominalInstanceInner::ExactTuple(target_tuple),
             ) => self.check_tuple_type_pair(db, source_tuple, target_tuple),
+            (NominalInstanceInner::ExactTuple(tuple), NominalInstanceInner::NonTuple(class))
+                if let Some(target) = class.class(db).class_literal(db).as_static()
+                    && let Some(source) = KnownClass::Tuple.try_to_class_literal(
+                        db,
+                        &ProgramEnvironment::from_program(tuple.program(db)),
+                    )
+                    && source != target
+                    && excludes_ancestor(db, source, target) =>
+            {
+                self.never()
+            }
             _ => {
                 let env = self.env;
                 self.check_class_pair(db, source.class(db, env), target.class(db, env))
@@ -1117,24 +1556,26 @@ fn non_recursive_protocol_interface<'db>(
 /// checked separately after generic inference.
 #[salsa::tracked(
     returns(ref),
-    cycle_initial = |_, _, _, _| OwnedConstraintSet::always(),
+    cycle_initial = |_, _, _, _, _, _| Some(OwnedConstraintSet::always()),
     heap_size = ruff_memory_usage::heap_size,
 )]
 fn non_recursive_protocol_constraints<'db>(
     db: &'db dyn Db,
     source: ProtocolInstanceType<'db>,
     target: ProtocolInterfaceView<'db>,
-) -> OwnedConstraintSet<'db> {
+    inferable: TypeVarSet<'db>,
+) -> Option<OwnedConstraintSet<'db>> {
     let env = ProgramEnvironment::from_program(target.base().program(db));
     let constraints = ConstraintSetBuilder::new();
-    constraints.into_owned(|constraints| {
-        let relation_visitor = HasRelationToVisitor::default(constraints);
-        let disjointness_visitor = IsDisjointVisitor::default(constraints);
+    constraints.try_into_owned(|constraints| {
+        let relation_visitor = HasRelationToVisitor::default(constraints.builder);
+        let disjointness_visitor = IsDisjointVisitor::default(constraints.builder);
         let signature_relation_visitor = SignatureRelationVisitor::default();
         let materialization_visitor = ApplyTypeMappingVisitor::new(&env);
         let checker = TypeRelationChecker::constraint_set_assignability(
             &env,
             constraints,
+            inferable,
             &relation_visitor,
             &disjointness_visitor,
             &signature_relation_visitor,
@@ -1180,24 +1621,17 @@ impl<'c, 'db> DisjointnessChecker<'_, 'c, 'db> {
             let compatible = self.check_tuple_spec_pair(db, &left_spec, &right_spec);
             if result
                 .union(db, self.constraints, compatible)
-                .is_trivially_always_satisfied()
+                .short_circuits_or()
             {
                 return result;
             }
         }
 
         result.or(db, self.constraints, || {
-            ConstraintSet::from_bool(
-                self.constraints,
-                !left
-                    .class(db, env)
-                    .could_coexist_in_mro_with_disjointness_checker(
-                        db,
-                        env,
-                        right.class(db, env),
-                        self,
-                    ),
-            )
+            self.when(!try_constraint!(
+                left.class(db, env)
+                    .try_could_coexist_in_mro_with(db, right.class(db, env), self)
+            ))
         })
     }
 }
@@ -1223,8 +1657,8 @@ enum NominalInstanceClass<'db> {
 }
 
 impl<'db> NominalInstanceClass<'db> {
-    fn from_class(db: &'db dyn Db, class: ClassType<'db>) -> Self {
-        if class.class_literal(db).inherits_from_explicit_any(db) {
+    fn from_class(db: &'db dyn Db, class: ClassType<'db>, flags: ClassInstanceFlags) -> Self {
+        if flags.contains(ClassInstanceFlags::INHERITS_FROM_EXPLICIT_ANY) {
             Self::InheritsFromExplicitAny(ExplicitAnyInstanceClass::new(db, class))
         } else {
             Self::Plain(class)
@@ -1235,6 +1669,8 @@ impl<'db> NominalInstanceClass<'db> {
         matches!(self, Self::InheritsFromExplicitAny(_))
     }
 
+    // Most protocol member annotations take the plain-class path when checking for `Self`.
+    #[inline]
     fn class(self, db: &'db dyn Db) -> ClassType<'db> {
         match self {
             Self::Plain(class) => class,
@@ -1526,7 +1962,7 @@ impl<'db> ProtocolInstanceType<'db> {
     /// Such a protocol is therefore an equivalent type to `object`, which would in fact be
     /// normalised to `object`.
     pub(super) fn is_equivalent_to_object(self, db: &'db dyn Db) -> bool {
-        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, ()| true, heap_size=ruff_memory_usage::heap_size)]
+        #[salsa::tracked(returns(copy), cycle_initial=|_, _, _, _, ()| true, heap_size=ruff_memory_usage::heap_size)]
         fn is_equivalent_to_object_inner<'db>(
             db: &'db dyn Db,
             protocol: ProtocolInstanceType<'db>,
@@ -1544,6 +1980,16 @@ impl<'db> ProtocolInstanceType<'db> {
             }
 
             let env = ProgramEnvironment::from_program(interface.base().program(db));
+            // A protocol equivalent to `object` must be satisfied by every possible receiver type.
+            // Use an unconstrained type variable so `Self` remains specific to the receiver:
+            // `object.__class__` accepts `type[Self]`, and a concrete return type cannot satisfy
+            // a promise to return `Self` for every receiver.
+            let receiver = Type::TypeVar(BoundTypeVarInstance::synthetic(
+                db,
+                &env,
+                Name::new_static("ProtocolSelf"),
+                TypeVarVariance::Invariant,
+            ));
             let constraints = ConstraintSetBuilder::new();
             let relation_visitor = HasRelationToVisitor::default(&constraints);
             let disjointness_visitor = IsDisjointVisitor::default(&constraints);
@@ -1551,7 +1997,7 @@ impl<'db> ProtocolInstanceType<'db> {
             let materialization_visitor = ApplyTypeMappingVisitor::new(&env);
             let checker = TypeRelationChecker::subtyping(
                 &env,
-                &constraints,
+                constraints.unlimited(),
                 TypeVarSet::None,
                 &relation_visitor,
                 &disjointness_visitor,
@@ -1559,8 +2005,8 @@ impl<'db> ProtocolInstanceType<'db> {
                 &materialization_visitor,
             );
             checker
-                .check_type_satisfies_protocol(db, Type::object(), protocol)
-                .is_always_satisfied(db, &env)
+                .check_type_satisfies_protocol(db, receiver, receiver, protocol)
+                .is_always_satisfied(db, &env, TypeVarSet::None)
         }
 
         is_equivalent_to_object_inner(db, self, ())
@@ -1689,8 +2135,11 @@ impl<'db> ProtocolInstanceType<'db> {
         self,
         db: &'db dyn Db,
         target: Self,
-    ) -> Option<&'db OwnedConstraintSet<'db>> {
-        let origin = target.class_origin(db)?;
+        inferable: TypeVarSet<'db>,
+    ) -> Result<Option<&'db OwnedConstraintSet<'db>>, ProjectionError> {
+        let Some(origin) = target.class_origin(db) else {
+            return Ok(None);
+        };
         let interface = target.interface(db);
         let non_recursive = non_recursive_protocol_interface(
             db,
@@ -1700,10 +2149,13 @@ impl<'db> ProtocolInstanceType<'db> {
         );
         let target = ProtocolInterfaceView::new(non_recursive, interface.materialization_kind());
         if target.member_count(db) == 0 {
-            return None;
+            return Ok(None);
         }
 
-        Some(non_recursive_protocol_constraints(db, self, target))
+        non_recursive_protocol_constraints(db, self, target, inferable)
+            .as_ref()
+            .map(Some)
+            .ok_or(ProjectionError::ConstructionBudgetExceeded)
     }
 }
 
@@ -1870,5 +2322,83 @@ mod synthesized_protocol {
         ) -> VarianceTerm<'db> {
             self.0.variance_of(db, env, typevar)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::system::DbWithWritableSystem as _;
+    use ty_python_core::ProgramFile;
+
+    use crate::db::tests::setup_db;
+    use crate::place::global_symbol;
+    use crate::types::{CallableType, Parameter, Parameters, Signature, Type};
+
+    use super::protocol_materialization_is_noop_by_inspection;
+
+    #[test]
+    fn protocol_materialization_noop_checks_synthesized_types() -> anyhow::Result<()> {
+        let mut db = setup_db();
+        db.write_dedented(
+            "/src/a.py",
+            r#"
+            from __future__ import annotations
+            from typing import Any, Protocol, TypedDict
+            from ty_extensions._internal import TypeOf
+
+            class FunctionalTypedDict(Protocol):
+                def payload(self) -> TypeOf[TypedDict("Payload", {"value": int})(value=1)]: ...
+
+            class GradualFunctionalTypedDict(Protocol):
+                def payload(self) -> TypeOf[TypedDict("Payload", {"value": Any})(value=1)]: ...
+
+            functional_typed_dict: FunctionalTypedDict
+            gradual_functional_typed_dict: GradualFunctionalTypedDict
+            "#,
+        )?;
+        let env = db.program_environment();
+        let file = system_path_to_file(&db, "/src/a.py")?;
+        let module = ProgramFile::new(&db, file, env.program(&db));
+        for (name, expected) in [
+            ("functional_typed_dict", true),
+            ("gradual_functional_typed_dict", false),
+        ] {
+            let protocol = global_symbol(&db, module, name)
+                .place
+                .expect_type()
+                .as_protocol_instance()
+                .context("expected a protocol instance")?;
+            assert_eq!(
+                protocol_materialization_is_noop_by_inspection(&db, &env, protocol),
+                expected,
+                "{name}"
+            );
+        }
+
+        for (ty, expected) in [(Type::object(), true), (Type::any(), false)] {
+            let synthesized = Type::protocol_with_readonly_members(&db, &env, [("value", ty)])
+                .as_protocol_instance()
+                .context("expected a synthesized protocol")?;
+            assert_eq!(
+                protocol_materialization_is_noop_by_inspection(&db, &env, synthesized),
+                expected
+            );
+
+            let callable = CallableType::single(
+                &db,
+                Signature::new(Parameters::standard([Parameter::positional_only(None)]), ty),
+            );
+            let synthesized = Type::protocol_with_methods(&db, &env, [("method", callable)])
+                .as_protocol_instance()
+                .context("expected a synthesized protocol")?;
+            assert_eq!(
+                protocol_materialization_is_noop_by_inspection(&db, &env, synthesized),
+                expected
+            );
+        }
+
+        Ok(())
     }
 }

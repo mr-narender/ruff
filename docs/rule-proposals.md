@@ -30,7 +30,7 @@ A design for a new lint rule in Ruff should include the following components:
     - "See also": if there are other similar or synergistic rules, list them
     - "References": if there are any relevant external references to Python or other documentation, list them
 
-    A few examples of great rule documentation include [`mutable-argument-default` (`B006`)][b006],
+    A few examples of great rule documentation include [`mutable-parameter-default` (`B006`)][b006],
     [`quoted-annotation` (`UP037`)][up037], and [`used-dummy-variable` (`RUF052`)][ruf052].
 
 - An example diagnostic including the proposed name, primary message, and fix title (if applicable)
@@ -126,15 +126,15 @@ detecting code that is incorrect, the options narrow to `correctness` or `suspic
 `correctness` category typically cause immediate issues like syntax or runtime errors, or silently
 do something the user didn't intend. Similarly, `suspicious` lints flag the same kind of code, but
 in cases where Ruff can't be sure what the user intended. A perfect example of a `suspicious` rule
-is `mutable-argument-default` (`B006`). This classic footgun is almost always a mistake, but in some
+is `mutable-parameter-default` (`B006`). This classic footgun is almost always a mistake, but in some
 cases, it may be intentional, in which case a `noqa` or `ruff: ignore` comment should be used. Such
 suppression comments should essentially never be reasonable for a `correctness` lint but are fine
 for `suspicious` lints. The `suspicious` category also includes deprecations, which aren't incorrect
 today but will cause errors in the future.
 
-The final branch of the flow chart deals with stylistic lints, which are again somewhat subjective
-to differentiate between changes that make code simpler often also make the code faster and
-more idiomatic. Thus, the question prompts you to consider the _primary_ improvement. Rules that
+The final branch of the flow chart deals with stylistic lints. These can be subjective to categorize:
+changes that make code simpler often also make it faster and more idiomatic. The question therefore
+prompts you to consider the _primary_ improvement. Rules that
 primarily make code simpler are `complexity` lints, those that primarily make code faster or use
 less memory are `performance` lints, and those that primarily make code more idiomatic are `style`.
 
@@ -183,7 +183,7 @@ additional things to watch out for are:
     hold rules that are controversial or niche, but very niche rules may still not be good fits for
     Ruff.
 
-[b006]: https://docs.astral.sh/ruff/rules/mutable-argument-default/
+[b006]: https://docs.astral.sh/ruff/rules/mutable-parameter-default/
 [formatter]: https://play.ruff.rs/1265904d-f03c-4d22-aa87-1e6ca16708c2?secondary=Format
 [linter]: https://play.ruff.rs/1265904d-f03c-4d22-aa87-1e6ca16708c2
 [ruf052]: https://docs.astral.sh/ruff/rules/used-dummy-variable/

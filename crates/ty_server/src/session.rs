@@ -19,14 +19,14 @@ use lsp_types::{
 use lsp_types::{ExitNotification, Notification};
 use ruff_db::Db;
 use ruff_db::files::{File, system_path_to_file, vendored_path_to_file};
-use ruff_db::system::{System, SystemPath, SystemPathBuf};
+use ruff_db::system::{System, SystemPath, SystemPathBuf, SystemVirtualPath};
 use ruff_python_ast::PySourceType;
 use ty_combine::Combine;
 use ty_project::metadata::Options;
-use ty_project::watch::ChangeEvent;
+use ty_project::watch::{ChangeEvent, DeletedKind};
 use ty_project::{
     ChangeResult, Db as _, ProjectDatabase, ProjectMetadata, ProjectReloadResult,
-    ScriptEnvironmentAvailability, UseUv, UvSyncChanges,
+    ScriptEnvironmentAvailability, UvSyncChanges, UvWorkspace,
 };
 
 use index::DocumentError;
@@ -91,9 +91,6 @@ pub(crate) struct Session {
 
     /// Initialization options that were provided by the client during server initialization.
     initialization_options: InitializationOptions,
-
-    /// The uv integrations enabled for the lifetime of this server.
-    use_uv: UseUv,
 
     /// Shares one progress indicator while script synchronization requests are outstanding.
     script_progress: ScriptProgress,
@@ -184,8 +181,6 @@ impl Session {
             workspaces.register(uri)?;
         }
 
-        let use_uv = initialization_options.use_uv(&*native_system);
-
         Ok(Self {
             native_system,
             position_encoding,
@@ -194,7 +189,6 @@ impl Session {
             deferred_messages: VecDeque::new(),
             index: Some(index),
             initialization_options,
-            use_uv,
             script_progress: ScriptProgress::default(),
             global_settings: Arc::new(GlobalSettings::default()),
             projects: BTreeMap::new(),
@@ -296,13 +290,10 @@ impl Session {
         let db = &mut project.db;
         let environments = db.uv_environments().clone();
         let changes = environments.poll_sync(db);
-        if matches!(
-            changes.project,
-            Some(ProjectReloadResult::Changed {
-                files_changed: true,
-            })
-        ) {
-            let scripts: Vec<_> = db.project().script_files(db).iter().collect();
+        if self.global_settings.diagnostic_mode().is_workspace()
+            && matches!(changes.project, Some(ProjectReloadResult::Changed { .. }))
+        {
+            let scripts = db.project().scripts_to_synchronize(db);
             Self::synchronize_closed_scripts(
                 db,
                 &scripts,
@@ -368,6 +359,9 @@ impl Session {
         for &file in scripts {
             // Open and save handle editor documents separately. Their metadata may contain
             // unsaved changes, including overlays that are not in the diagnostic open-file set.
+            // If a project reload selects uv for an open script, we accept that
+            // a user must save or reopen the document to request a sync. This avoids rereading open scripts
+            // on reload to check whether their inline metadata matches what uv will read from disk.
             if db.document(file).is_some() {
                 continue;
             }
@@ -556,13 +550,15 @@ impl Session {
 
         let capabilities = self.resolved_client_capabilities;
         let script_progress = self.script_progress.clone();
+        let workspace_diagnostics = self.global_settings.diagnostic_mode().is_workspace();
         let db = self.project_db_mut(path);
         let result = db.apply_changes(changes);
         if let Some(project_path) = result.project_sync_path() {
             db.uv_environments()
                 .request_project_sync(db, project_path, &|db, project| {
-                    Some(Box::new(LazyWorkDoneProgress::new_on_main_loop(
+                    Some(Box::new(LazyWorkDoneProgress::new(
                         client,
+                        None,
                         WorkDoneProgressBegin {
                             title: format!("Refreshing {} metadata", project.name(db)),
                             cancellable: Some(false),
@@ -573,8 +569,10 @@ impl Session {
                     )))
                 });
         }
-        let scripts = result.scripts_to_synchronize(db);
-        Self::synchronize_closed_scripts(db, &scripts, client, capabilities, &script_progress);
+        if workspace_diagnostics {
+            let scripts = result.scripts_to_synchronize(db);
+            Self::synchronize_closed_scripts(db, &scripts, client, capabilities, &script_progress);
+        }
         self.update_file_watcher(client);
         result
     }
@@ -675,9 +673,22 @@ impl Session {
             let global_settings = global_options.into_settings();
             self.global_settings = Arc::new(global_settings);
         }
-        if let Some(check_mode) = self.global_settings.diagnostic_mode().to_check_mode() {
+        let diagnostic_mode = self.global_settings.diagnostic_mode();
+        if let Some(check_mode) = diagnostic_mode.to_check_mode() {
             for project in self.projects.values_mut() {
-                project.db.set_check_mode(check_mode);
+                let db = &mut project.db;
+                db.set_check_mode(check_mode);
+                // A new folder's settings can enable workspace diagnostics for existing projects.
+                if diagnostic_mode.is_workspace() {
+                    let scripts = db.project().scripts_to_synchronize(db);
+                    Self::synchronize_closed_scripts(
+                        db,
+                        &scripts,
+                        client,
+                        self.resolved_client_capabilities,
+                        &self.script_progress,
+                    );
+                }
             }
         }
 
@@ -776,10 +787,9 @@ impl Session {
                 configuration_file.clone(),
                 workspace_directory,
                 &system,
-                self.use_uv,
             )
         } else {
-            ProjectMetadata::discover_with_uv(workspace_directory, &system, self.use_uv)
+            ProjectMetadata::discover(workspace_directory, &system)
         };
 
         let (mut metadata, discovery_result) =
@@ -792,7 +802,7 @@ impl Session {
                         None,
                         &UseDefaultStrategy,
                     );
-                    (metadata.with_use_uv(self.use_uv), Err(err))
+                    (metadata, Err(err))
                 }
             };
 
@@ -800,8 +810,21 @@ impl Session {
             metadata.set_fallback_options(fallback_options.clone());
         }
 
-        if let Some(override_options) = workspace.settings.override_options() {
-            metadata.set_override_options(override_options.clone());
+        // Untrusted workspaces disable uv. In trusted workspaces, `TY_UV` takes precedence
+        // over editor and project configuration. The editor's `project-manager` settings take
+        // precedence over the legacy `experimental.useUv` option.
+        let uv_override = self.initialization_options.uv_override(&system);
+        let legacy_uv = self.initialization_options.experimental_use_uv();
+        let editor_options = workspace
+            .settings
+            .override_options()
+            .cloned()
+            .unwrap_or_default();
+        let overrides = Options::from_uv_mode(uv_override)
+            .combine(editor_options)
+            .combine(Options::from_uv_mode(legacy_uv));
+        if overrides != Options::default() {
+            metadata.set_override_options(overrides);
         }
 
         // Load user configuration even if project discovery failed.
@@ -811,9 +834,17 @@ impl Session {
                     .apply_configuration_files(&system)
                     .context("Failed to apply configuration files"),
             )
-            .and_then(|()| ProjectDatabase::fallible(metadata.clone(), system.clone()));
+            .and_then(|()| {
+                if metadata.project_uses_uv() {
+                    let workspace = UvWorkspace::discover(workspace_directory, &system);
+                    metadata
+                        .apply_uv_workspace(&system, workspace)
+                        .context("Failed to discover uv workspace")?;
+                }
+                ProjectDatabase::fallible(metadata.clone(), system.clone())
+            });
 
-        let mut db = project.unwrap_or_else(|err| {
+        let db = project.unwrap_or_else(|err| {
             tracing::error!(
                 "Failed to load project for workspace `{uri}`: {err:#}. \
                  Continuing with valid settings"
@@ -827,17 +858,8 @@ impl Session {
 
         // Carry forward diagnostic state if any exists
         let previous = self.projects.remove(&root);
-        let untracked = previous
-            .map(|state| state.untracked_files_with_pushed_diagnostics)
-            .unwrap_or_default();
-        let scripts: Vec<_> = db.project().script_files(&db).iter().collect();
-        Self::synchronize_closed_scripts(
-            &mut db,
-            &scripts,
-            client,
-            self.resolved_client_capabilities,
-            &self.script_progress,
-        );
+        let untracked =
+            previous.map_or_default(|state| state.untracked_files_with_pushed_diagnostics);
         self.projects.insert(
             root.clone(),
             ProjectState {
@@ -1230,6 +1252,19 @@ impl Session {
         })
     }
 
+    /// Returns whether client settings permit import updates for a rename of `path`.
+    pub(crate) fn allows_file_rename_edits(&self, path: &SystemPath) -> bool {
+        match self.workspaces.for_path(path) {
+            Some(workspace) => !workspace.settings().is_language_services_disabled(),
+            None => !self
+                .initialization_options
+                .options
+                .workspace
+                .disable_language_services
+                .unwrap_or_default(),
+        }
+    }
+
     /// Selects an open document or a supported closed document for a request.
     fn document_target(&self, uri: &Uri) -> Result<DocumentRequestTarget, DocumentError> {
         match self.index().open_document_handle(uri) {
@@ -1337,8 +1372,7 @@ impl Session {
         // Request synchronization before installing the editor contents because uv reads the
         // script from disk. This ensures both use the saved metadata, so saving changed metadata
         // requests another synchronization.
-        if self.use_uv != UseUv::Off
-            && language_id == LanguageId::Python
+        if language_id == LanguageId::Python
             && document.notebook().is_none()
             && let DocumentKey::File(system_path) = DocumentKey::from_uri(document.uri())
         {
@@ -1346,19 +1380,21 @@ impl Session {
             let script_progress = self.script_progress.clone();
             let db = self.project_db_mut(&AnySystemPath::System(system_path.clone()));
 
-            // Refresh any cached disk revision before reading the script tag. A filesystem
-            // change may not have reached the watcher yet, and the later open event will
-            // refresh the file from the editor contents instead.
-            File::sync_path(db, &system_path);
-            if let Ok(file) = system_path_to_file(db, &system_path) {
-                Self::request_script_sync(
-                    db,
-                    file,
-                    client,
-                    capabilities,
-                    ScriptEnvironmentAvailability::Pending,
-                    &script_progress,
-                );
+            if db.project().metadata(db).script_uv_override() != Some(false) {
+                // Refresh any cached disk revision before reading the script tag. A filesystem
+                // change may not have reached the watcher yet, and the later open event will
+                // refresh the file from the editor contents instead.
+                File::sync_path(db, &system_path);
+                if let Ok(file) = system_path_to_file(db, &system_path) {
+                    Self::request_script_sync(
+                        db,
+                        file,
+                        client,
+                        capabilities,
+                        ScriptEnvironmentAvailability::Pending,
+                        &script_progress,
+                    );
+                }
             }
         }
         let handle = self.index_mut().open_text_document(document);
@@ -1958,7 +1994,6 @@ impl OpenDocumentHandle {
         }
     }
 
-    #[expect(unused)]
     fn file_path(&self) -> Option<&AnySystemPath> {
         match self {
             Self::Text { path, .. } | Self::Notebook { path, .. } => Some(path),
@@ -2084,21 +2119,29 @@ impl OpenDocumentHandle {
     }
 
     fn update_in_databases(&self, session: &mut Session, client: &Client) {
-        let path = self.notebook_or_file_path();
-        let (containing_workspace, is_virtual, changes) = match path {
-            AnySystemPath::System(system_path) => (
-                session.workspaces().for_path(system_path),
-                false,
-                [ChangeEvent::file_content_changed(system_path.clone())],
-            ),
-            AnySystemPath::SystemVirtual(virtual_path) => (
-                None,
-                true,
-                [ChangeEvent::ChangedVirtual(virtual_path.clone())],
-            ),
+        let change = match self.notebook_or_file_path() {
+            AnySystemPath::System(system_path) => {
+                ChangeEvent::file_content_changed(system_path.clone())
+            }
+            AnySystemPath::SystemVirtual(virtual_path) => {
+                ChangeEvent::ChangedVirtual(virtual_path.clone())
+            }
         };
+        self.apply_change_in_databases(session, client, change);
+    }
 
-        if containing_workspace.is_some() || is_virtual {
+    fn apply_change_in_databases(
+        &self,
+        session: &mut Session,
+        client: &Client,
+        change: ChangeEvent,
+    ) {
+        let path = self.notebook_or_file_path();
+        let changes = [change];
+        let is_external = matches!(path, AnySystemPath::System(system_path)
+            if session.workspaces().for_path(system_path).is_none());
+
+        if !is_external {
             // A containing workspace determines the project for a system file, while virtual
             // documents select a single, arbitrary project. Neither selection depends on import
             // search paths, so update only the selected database.
@@ -2135,80 +2178,114 @@ impl OpenDocumentHandle {
     /// This can return an error when the document does not exist in the
     /// session index.
     pub(crate) fn close(&self, session: &mut Session, client: &Client) -> crate::Result<bool> {
-        let is_cell = self.is_cell();
-        let path = self.notebook_or_file_path();
-
         let removed_document = session.index_mut().close_document(&self.key())?;
 
-        // Close the text or notebook file in the database but skip this
-        // step for cells because closing a cell doesn't close its notebook.
-        let requires_clear_diagnostics = if is_cell {
-            true
-        } else {
-            let db = session.project_db_mut(path);
+        let should_clear_diagnostics = match self.file_path() {
+            // Closing a notebook cell clears its diagnostics but leaves its notebook open.
+            None => true,
+            Some(AnySystemPath::System(path)) => {
+                let is_deleted = self.close_system_file(session, client, path, &removed_document);
 
-            match path {
-                AnySystemPath::System(system_path) => {
-                    if let Some(file) = db.files().try_system(db, system_path) {
-                        db.project().close_file(db, file);
+                // For non-virtual files, we clear diagnostics if:
+                //
+                // 1. The file was deleted before it was closed
+                // 2. The file does not belong to any workspace e.g., opening a random file from
+                //    outside the workspace because closing it acts like the file doesn't exist
+                // 3. The diagnostic mode is set to open-files only
+                is_deleted
+                    || session.workspaces().for_path(path).is_none()
+                    || session
+                        .global_settings()
+                        .diagnostic_mode()
+                        .is_open_files_only()
+            }
+            Some(AnySystemPath::SystemVirtual(path)) => {
+                self.close_virtual_file(session, path);
 
-                        // In case we preferred the language given by the Client
-                        // over the one detected by the file extension, remove the file
-                        // from the project to handle cases where a user changes the language
-                        // of a file (which results in a didClose and didOpen for the same path but with different languages).
-                        if removed_document.language_id().is_some()
-                            && system_path
-                                .extension()
-                                .and_then(PySourceType::try_from_extension)
-                                .is_none()
-                        {
-                            db.project().remove_file(db, file);
-                        }
-
-                        // Restore file and script membership from the saved contents. Discarding
-                        // unsaved script metadata can bring a file back into the project when
-                        // `exclude-scripts` is enabled. Also request synchronization for saved
-                        // metadata changes that were skipped while the editor overlay was present.
-                        self.update_in_databases(session, client);
-                    } else {
-                        // This can only fail when the path is a directory or it doesn't exists but the
-                        // file should exists for this handler in this branch. This is because every
-                        // close call is preceded by an open call, which ensures that the file is
-                        // interned in the lookup table (`Files`).
-                        tracing::warn!("Salsa file does not exists for {}", system_path);
-                    }
-
-                    // For non-virtual files, we clear diagnostics if:
-                    //
-                    // 1. The file does not belong to any workspace e.g., opening a random file from
-                    //    outside the workspace because closing it acts like the file doesn't exists
-                    // 2. The diagnostic mode is set to open-files only
-                    session.workspaces().for_path(system_path).is_none()
-                        || session
-                            .global_settings()
-                            .diagnostic_mode()
-                            .is_open_files_only()
-                }
-                AnySystemPath::SystemVirtual(virtual_path) => {
-                    if let Some(virtual_file) = db.files().try_virtual_file(virtual_path) {
-                        db.project().close_file(db, virtual_file.file());
-                        virtual_file.close(db);
-                        // Bump the file's revision back to using the file system's revision.
-                        virtual_file.sync(db);
-                    } else {
-                        tracing::warn!("Salsa virtual file does not exists for {}", virtual_path);
-                    }
-
-                    // Always clear diagnostics for virtual files, as they don't really exist on disk
-                    // which means closing them is like deleting the file.
-                    true
-                }
+                // Always clear diagnostics for virtual files, as they don't really exist on disk
+                // which means closing them is like deleting the file.
+                true
             }
         };
 
         session.bump_revision();
 
-        Ok(requires_clear_diagnostics)
+        Ok(should_clear_diagnostics)
+    }
+
+    /// Closes a system file and returns whether it was deleted from disk.
+    fn close_system_file(
+        &self,
+        session: &mut Session,
+        client: &Client,
+        system_path: &SystemPath,
+        removed_document: &Document,
+    ) -> bool {
+        let db = session.project_db_mut(self.notebook_or_file_path());
+
+        // The editor can delete the file before closing it and before its watcher
+        // reports the deletion. Check disk state after removing the editor overlay.
+        let is_deleted = db
+            .system()
+            .path_metadata(system_path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+
+        if let Some(file) = db.files().try_system(db, system_path) {
+            db.project().close_file(db, file);
+
+            // In case we preferred the language given by the Client
+            // over the one detected by the file extension, remove the file
+            // from the project to handle cases where a user changes the language
+            // of a file (which results in a didClose and didOpen for the same path but with different languages).
+            if removed_document.language_id().is_some()
+                && system_path
+                    .extension()
+                    .and_then(PySourceType::try_from_extension)
+                    .is_none()
+            {
+                db.project().remove_file(db, file);
+            }
+
+            if is_deleted {
+                // A content change leaves missing files in the project index, allowing
+                // workspace diagnostics to report an I/O error until the watcher fires.
+                self.apply_change_in_databases(
+                    session,
+                    client,
+                    ChangeEvent::Deleted {
+                        path: system_path.to_path_buf(),
+                        kind: DeletedKind::File,
+                    },
+                );
+            } else {
+                // Restore file and script membership from the saved contents. Discarding
+                // unsaved script metadata can bring a file back into the project when
+                // `exclude-scripts` is enabled. In workspace mode, this also synchronizes
+                // saved metadata changes skipped while the editor overlay was present.
+                self.update_in_databases(session, client);
+            }
+        } else {
+            // This can only fail when the path is a directory or it doesn't exists but the
+            // file should exists for this handler in this branch. This is because every
+            // close call is preceded by an open call, which ensures that the file is
+            // interned in the lookup table (`Files`).
+            tracing::warn!("Salsa file does not exists for {}", system_path);
+        }
+
+        is_deleted
+    }
+
+    fn close_virtual_file(&self, session: &mut Session, virtual_path: &SystemVirtualPath) {
+        let db = session.project_db_mut(self.notebook_or_file_path());
+
+        if let Some(virtual_file) = db.files().try_virtual_file(virtual_path) {
+            db.project().close_file(db, virtual_file.file());
+            virtual_file.close(db);
+            // Bump the file's revision back to using the file system's revision.
+            virtual_file.sync(db);
+        } else {
+            tracing::warn!("Salsa virtual file does not exists for {}", virtual_path);
+        }
     }
 }
 
