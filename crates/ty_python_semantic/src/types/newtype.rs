@@ -55,7 +55,7 @@ impl<'db> NewType<'db> {
 
     #[salsa::tracked(
         returns(copy),
-        cycle_initial=|db, _, self_: NewType<'db>| NewTypeBase::ClassType(ClassType::object(
+        cycle_initial=|db, _, _, self_: NewType<'db>| NewTypeBase::ClassType(ClassType::object(
             db,
             &ProgramEnvironment::from_definition(self_.definition(db)),
         )),
@@ -272,6 +272,18 @@ pub(crate) fn walk_newtype_instance_type<'db, V: visitor::TypeVisitor<'db> + ?Si
     if let Some(base) = base {
         visitor.visit_type(db, base.instance_type(db, visitor.program_environment()));
     }
+}
+
+/// Evaluate and visit the instance type of a newtype's base.
+///
+/// The caller must guard against recursive newtypes.
+pub(super) fn walk_newtype_base<'db, V: visitor::TypeVisitor<'db> + ?Sized>(
+    db: &'db dyn Db,
+    newtype: NewType<'db>,
+    visitor: &V,
+) {
+    let base = newtype.base(db);
+    visitor.visit_type(db, base.instance_type(db, visitor.program_environment()));
 }
 
 /// `typing.NewType` typically wraps a class type, but it can also wrap another newtype.

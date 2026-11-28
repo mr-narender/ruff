@@ -7,10 +7,10 @@ use std::cmp::Ordering;
 use ruff_index::Idx;
 use rustc_hash::FxHashMap;
 
-use crate::interned_nodes::InternedNodes;
+use crate::interned_nodes::{BinaryConstraintCache, ConstraintId, InternedNodes};
 use crate::narrowing_constraints::{NarrowingConstraintsBuilder, ScopedNarrowingConstraint};
 use crate::predicate::ScopedPredicateId;
-use crate::rank::{RankBitBox, RankBitBoxVec};
+use crate::rank::RankBitBox;
 
 /// A ternary formula that defines under what conditions a binding is visible. (A ternary formula
 /// is just like a boolean formula, but with `Ambiguous` as a third potential result. See the
@@ -111,6 +111,15 @@ impl ScopedReachabilityConstraintId {
     }
 }
 
+impl ConstraintId for ScopedReachabilityConstraintId {
+    const EMPTY: Self = ALWAYS_TRUE;
+
+    fn cache_key(a: Self, b: Self) -> (Self, Self) {
+        // AMBIGUOUS sorts after every interior node and never has an arena index.
+        if b == AMBIGUOUS { (a, b) } else { (b, a) }
+    }
+}
+
 impl Idx for ScopedReachabilityConstraintId {
     #[inline]
     fn new(value: usize) -> Self {
@@ -176,22 +185,9 @@ impl ReachabilityConstraints {
 #[derive(Debug, Default)]
 pub struct ReachabilityConstraintsBuilder {
     interiors: InternedNodes<ScopedReachabilityConstraintId, InteriorNode>,
-    interior_used: RankBitBoxVec,
     not_cache: FxHashMap<ScopedReachabilityConstraintId, ScopedReachabilityConstraintId>,
-    and_cache: FxHashMap<
-        (
-            ScopedReachabilityConstraintId,
-            ScopedReachabilityConstraintId,
-        ),
-        ScopedReachabilityConstraintId,
-    >,
-    or_cache: FxHashMap<
-        (
-            ScopedReachabilityConstraintId,
-            ScopedReachabilityConstraintId,
-        ),
-        ScopedReachabilityConstraintId,
-    >,
+    and_cache: BinaryConstraintCache<ScopedReachabilityConstraintId>,
+    or_cache: BinaryConstraintCache<ScopedReachabilityConstraintId>,
 }
 
 impl ReachabilityConstraintsBuilder {
@@ -200,24 +196,22 @@ impl ReachabilityConstraintsBuilder {
         self.interiors.len() >= MAX_INTERIOR_NODES
     }
 
-    pub(crate) fn build(self) -> ReachabilityConstraints {
-        if self.interior_used.first_zero().is_none() {
-            ReachabilityConstraints {
-                used_interiors: self.interiors.into_nodes_boxed_slice(),
-                used_indices: None,
+    pub(crate) fn build(mut self) -> ReachabilityConstraints {
+        // Children are interned before their parent. Visiting parents in reverse ID order
+        // propagates the retained roots to every descendant before compaction.
+        for index in (0..self.interiors.len()).rev() {
+            let id = ScopedReachabilityConstraintId::new(index);
+            if self.interiors.is_used(id) {
+                let node = self.interiors[id];
+                self.mark_used(node.if_true);
+                self.mark_used(node.if_ambiguous);
+                self.mark_used(node.if_false);
             }
-        } else {
-            let used_interiors = self
-                .interiors
-                .into_node_iterator()
-                .zip(&self.interior_used)
-                .filter_map(|(interior, used)| used.then_some(interior))
-                .collect();
-            let used_indices = RankBitBox::from_bits(self.interior_used);
-            ReachabilityConstraints {
-                used_interiors,
-                used_indices: Some(used_indices),
-            }
+        }
+        let (used_interiors, used_indices) = self.interiors.into_used_nodes();
+        ReachabilityConstraints {
+            used_interiors,
+            used_indices,
         }
     }
 
@@ -225,12 +219,8 @@ impl ReachabilityConstraintsBuilder {
     /// only calculated for intermediate values, and which don't need to be included in the final
     /// built result.
     pub(crate) fn mark_used(&mut self, node: ScopedReachabilityConstraintId) {
-        if !node.is_terminal() && !self.interior_used[node.index()] {
-            self.interior_used.set(node.index(), true);
-            let node = self.interiors[node];
-            self.mark_used(node.if_true);
-            self.mark_used(node.if_ambiguous);
-            self.mark_used(node.if_false);
+        if !node.is_terminal() {
+            self.interiors.mark_used(node);
         }
     }
 
@@ -353,11 +343,7 @@ impl ReachabilityConstraintsBuilder {
             return node.if_true;
         }
 
-        let (id, inserted) = self.interiors.intern(node);
-        if inserted {
-            self.interior_used.push(false);
-        }
-        id
+        self.interiors.intern(node)
     }
 
     /// Adds a new reachability constraint that checks a single [`super::predicate::Predicate`].
@@ -425,6 +411,7 @@ impl ReachabilityConstraintsBuilder {
     }
 
     /// Adds a new reachability constraint that is the ternary OR of two existing ones.
+    #[inline]
     pub(crate) fn add_or_constraint(
         &mut self,
         a: ScopedReachabilityConstraintId,
@@ -439,10 +426,20 @@ impl ReachabilityConstraintsBuilder {
 
         // OR is commutative, which lets us halve the cache requirements
         let (a, b) = if b.0 < a.0 { (b, a) } else { (a, b) };
-        if let Some(cached) = self.or_cache.get(&(a, b)) {
-            return *cached;
+        if let Some(cached) = self.or_cache.get(a, b) {
+            return cached;
         }
 
+        self.or_uncached(a, b)
+    }
+
+    /// Compute the disjunction on a cache miss with the operands in ascending ID order.
+    /// The first operand is an interior node and the second can be `AMBIGUOUS`.
+    fn or_uncached(
+        &mut self,
+        a: ScopedReachabilityConstraintId,
+        b: ScopedReachabilityConstraintId,
+    ) -> ScopedReachabilityConstraintId {
         if self.interiors.len() >= MAX_INTERIOR_NODES {
             return AMBIGUOUS;
         }
@@ -490,11 +487,12 @@ impl ReachabilityConstraintsBuilder {
             if_ambiguous,
             if_false,
         });
-        self.or_cache.insert((a, b), result);
+        self.or_cache.insert(a, b, result);
         result
     }
 
     /// Adds a new reachability constraint that is the ternary AND of two existing ones.
+    #[inline]
     pub(crate) fn add_and_constraint(
         &mut self,
         a: ScopedReachabilityConstraintId,
@@ -509,10 +507,20 @@ impl ReachabilityConstraintsBuilder {
 
         // AND is commutative, which lets us halve the cache requirements
         let (a, b) = if b.0 < a.0 { (b, a) } else { (a, b) };
-        if let Some(cached) = self.and_cache.get(&(a, b)) {
-            return *cached;
+        if let Some(cached) = self.and_cache.get(a, b) {
+            return cached;
         }
 
+        self.and_uncached(a, b)
+    }
+
+    /// Compute the conjunction on a cache miss with the operands in ascending ID order.
+    /// The first operand is an interior node and the second can be `AMBIGUOUS`.
+    fn and_uncached(
+        &mut self,
+        a: ScopedReachabilityConstraintId,
+        b: ScopedReachabilityConstraintId,
+    ) -> ScopedReachabilityConstraintId {
         if self.interiors.len() >= MAX_INTERIOR_NODES {
             return AMBIGUOUS;
         }
@@ -560,7 +568,43 @@ impl ReachabilityConstraintsBuilder {
             if_ambiguous,
             if_false,
         });
-        self.and_cache.insert((a, b), result);
+        self.and_cache.insert(a, b, result);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_retains_descendants_in_all_three_branches() {
+        let mut builder = ReachabilityConstraintsBuilder::default();
+        let [unused, a, b, c, d] =
+            [0, 1, 2, 3, 4].map(|i| builder.add_atom(ScopedPredicateId::new(i)));
+        // Put the parent and its children in different words of the used-node bitset.
+        for i in 7..7 + crate::rank::CHUNK_SIZE {
+            builder.add_atom(ScopedPredicateId::new(i));
+        }
+        let branch = builder.add_interior(InteriorNode {
+            atom: ScopedPredicateId::new(5),
+            if_true: a,
+            if_ambiguous: b,
+            if_false: c,
+        });
+        let root = builder.add_interior(InteriorNode {
+            atom: ScopedPredicateId::new(6),
+            if_true: d,
+            if_ambiguous: branch,
+            if_false: a,
+        });
+        let retained = [a, b, c, d, branch, root];
+        let expected = retained.map(|id| builder.interiors[id]);
+        builder.mark_used(root);
+
+        let graph = builder.build();
+        assert_eq!(graph.used_interiors.len(), retained.len());
+        assert_eq!(retained.map(|id| graph.get_interior_node(id)), expected);
+        assert!(!graph.used_indices.unwrap().get_bit(unused.index()).unwrap());
     }
 }

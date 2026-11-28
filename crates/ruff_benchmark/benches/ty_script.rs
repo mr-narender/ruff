@@ -4,6 +4,8 @@ use std::time::Duration;
 use divan::{Bencher, bench};
 use rayon::ThreadPoolBuilder;
 use ruff_db::system::{OsSystem, System, SystemPath, TestSystem};
+use ruff_ranged_value::RangedValue;
+use ty_project::metadata::options::{Options, ProjectManagerOptions, ScriptProjectManager};
 use ty_project::{
     Db, ProjectDatabase, ProjectMetadata, ScriptEnvironmentAvailability, uv_test_env_vars,
 };
@@ -13,10 +15,16 @@ fn setup_iteration(root: &SystemPath, uv: &SystemPath) -> ProjectDatabase {
     let system = TestSystem::new(OsSystem::new(root));
     system.clear_env_vars();
     system.set_env_vars(uv_test_env_vars());
-    system.set_env_var(EnvVars::TY_UV, "scripts");
     system.set_env_var(EnvVars::UV, uv.as_str());
 
-    let metadata = ProjectMetadata::discover(root, &system).unwrap();
+    let mut metadata = ProjectMetadata::discover(root, &system).unwrap();
+    metadata.set_override_options(Options {
+        project_manager: Some(ProjectManagerOptions {
+            script: Some(RangedValue::cli(ScriptProjectManager::Uv)),
+            ..ProjectManagerOptions::default()
+        }),
+        ..Options::default()
+    });
     ProjectDatabase::fallible(metadata, system).unwrap()
 }
 

@@ -1,11 +1,10 @@
 use std::ops::Deref;
 
-use ruff_python_trivia::CommentRanges;
+use ruff_python_trivia::{CommentRanges, find_trailing_pragma_offset};
 use ruff_source_file::Line;
 use ruff_text_size::{TextLen, TextRange};
 
-use crate::line_width::{IndentWidth, LineLength, LineWidthBuilder, pragma_offset_for_line_length};
-use crate::settings::types::PreviewMode;
+use crate::line_width::{IndentWidth, LineLength, LineWidthBuilder};
 
 #[derive(Debug)]
 pub(super) struct Overlong {
@@ -22,13 +21,10 @@ impl Overlong {
         limit: LineLength,
         task_tags: &[String],
         tab_size: IndentWidth,
-        preview: PreviewMode,
     ) -> Option<Self> {
-        // The maximum width of the line is the number of bytes multiplied by the tab size (the
-        // worst-case scenario is that the line is all tabs). If the maximum width is less than the
-        // limit, then the line is not overlong.
-        let max_width = line.len() * tab_size.as_usize();
-        if max_width < limit.value() as usize {
+        // A tab can span several columns. For a line without tabs, the byte length
+        // alone bounds its display width.
+        if line.len() <= usize::from(limit.value()) && !line.as_bytes().contains(&b'\t') {
             return None;
         }
 
@@ -39,7 +35,7 @@ impl Overlong {
         }
 
         // Strip trailing comments and re-measure the line, if needed.
-        let line = StrippedLine::from_line(line, comment_ranges, task_tags, preview);
+        let line = StrippedLine::from_line(line, comment_ranges, task_tags);
         let width = match &line {
             StrippedLine::WithoutPragma(line) => {
                 let width = measure(line.as_str(), tab_size);
@@ -118,12 +114,7 @@ enum StrippedLine<'a> {
 impl<'a> StrippedLine<'a> {
     /// Strip trailing comments from a [`Line`], if the line ends with a pragma comment (like
     /// `# type: ignore`) or, if necessary, a task comment (like `# TODO`).
-    fn from_line(
-        line: &'a Line<'a>,
-        comment_ranges: &CommentRanges,
-        task_tags: &[String],
-        preview: PreviewMode,
-    ) -> Self {
+    fn from_line(line: &'a Line<'a>, comment_ranges: &CommentRanges, task_tags: &[String]) -> Self {
         let [comment_range] = comment_ranges.comments_in_range(line.range()) else {
             return Self::Unchanged(line);
         };
@@ -132,8 +123,8 @@ impl<'a> StrippedLine<'a> {
         let comment_range = comment_range - line.start();
         let comment = &line.as_str()[comment_range];
 
-        // Ex) `# type: ignore` or (in preview) `# some comment # noqa: F401`
-        if let Some(offset) = pragma_offset_for_line_length(comment, preview) {
+        // Ex) `# type: ignore` or `# some comment # noqa: F401`
+        if let Some(offset) = find_trailing_pragma_offset(comment) {
             // Strip the pragma from the line, preserving any preceding non-pragma comment text.
             let pragma_start = usize::from(comment_range.start()) + offset;
             let prefix = line[..pragma_start].trim_end();

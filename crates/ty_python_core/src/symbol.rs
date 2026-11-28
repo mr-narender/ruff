@@ -3,13 +3,9 @@ use hashbrown::hash_table::Entry;
 use ruff_index::{IndexVec, newtype_index};
 use ruff_python_ast::name::Name;
 use rustc_hash::FxHasher;
+use std::borrow::Cow;
 use std::hash::{Hash as _, Hasher as _};
 use std::ops::{Deref, DerefMut};
-
-// Selected using performance and memory profiling across the 162-project ecosystem corpus.
-// Symbol-name equality is cheap enough that raising the cutoff from 8 to 16 reduced retained
-// memory without a measurable performance regression.
-const LINEAR_SEARCH_THRESHOLD: usize = 16;
 
 /// Uniquely identifies a symbol in a given scope.
 #[newtype_index]
@@ -17,7 +13,7 @@ const LINEAR_SEARCH_THRESHOLD: usize = 16;
 pub struct ScopedSymbolId;
 
 /// A symbol in a given scope.
-#[derive(Debug, Clone, PartialEq, Eq, get_size2::GetSize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, get_size2::GetSize)]
 pub struct Symbol {
     name: Name,
     flags: SymbolFlags,
@@ -34,7 +30,7 @@ bitflags! {
     ///
     /// See the doc-comment at the top of [`super::use_def`] for explanations of what it
     /// means for a symbol to be *bound* as opposed to *declared*.
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
     struct SymbolFlags: u8 {
         const IS_USED               = 1 << 0;
         const IS_BOUND              = 1 << 1;
@@ -44,6 +40,7 @@ bitflags! {
         /// true if the symbol is assigned more than once, or if it is assigned even though it is already in use
         const IS_REASSIGNED         = 1 << 5;
         const IS_PARAMETER          = 1 << 6;
+        const HAS_SCOPE_DECLARATION = 1 << 7;
     }
 }
 
@@ -84,6 +81,11 @@ impl Symbol {
     /// Is the symbol `nonlocal` its containing scope?
     pub fn is_nonlocal(&self) -> bool {
         self.flags.contains(SymbolFlags::MARKED_NONLOCAL)
+    }
+
+    /// Returns whether a `global` or `nonlocal` statement makes this symbol refer to another scope.
+    pub fn has_scope_declaration(&self) -> bool {
+        self.flags.contains(SymbolFlags::HAS_SCOPE_DECLARATION)
     }
 
     /// Is the symbol defined in this scope, vs referring to some enclosing scope?
@@ -134,6 +136,10 @@ impl Symbol {
         self.insert_flags(SymbolFlags::MARKED_NONLOCAL);
     }
 
+    pub(super) fn mark_scope_declaration(&mut self) {
+        self.insert_flags(SymbolFlags::HAS_SCOPE_DECLARATION);
+    }
+
     pub(super) fn mark_bound(&mut self) {
         if self.is_bound() || self.is_used() {
             self.insert_flags(SymbolFlags::IS_REASSIGNED);
@@ -179,11 +185,11 @@ impl SymbolReverseTable {
     fn entry<'a>(
         &'a mut self,
         symbols: &IndexVec<ScopedSymbolId, Symbol>,
-        symbol: &Symbol,
+        name: &Name,
     ) -> Entry<'a, ScopedSymbolId> {
         self.0.entry(
-            Self::hash_name(symbol.name()),
-            |id| &symbols[*id].name == symbol.name(),
+            Self::hash_name(name),
+            |id| &symbols[*id].name == name,
             |id| Self::hash_name(&symbols[*id].name),
         )
     }
@@ -200,14 +206,53 @@ impl SymbolReverseTable {
     }
 }
 
+/// Small scopes need no hash table. Each bucket holds a bitmap of the IDs
+/// that might match, so a collision only costs an extra name comparison.
+#[derive(Debug, Default, get_size2::GetSize)]
+struct SmallSymbolIndex([u16; 8]);
+
+impl SmallSymbolIndex {
+    fn bucket(name: &str) -> usize {
+        (SymbolReverseTable::hash_name(name) % 8) as usize
+    }
+
+    fn symbol_id(
+        &self,
+        symbols: &IndexVec<ScopedSymbolId, Symbol>,
+        name: &str,
+        bucket: usize,
+    ) -> Option<ScopedSymbolId> {
+        let mut candidates = self.0[bucket];
+        while candidates != 0 {
+            let id = ScopedSymbolId::from_u32(candidates.trailing_zeros());
+            if symbols[id].name == name {
+                return Some(id);
+            }
+            candidates &= candidates - 1;
+        }
+        None
+    }
+}
+
+#[derive(Debug, get_size2::GetSize)]
+enum SymbolIndex {
+    Small(SmallSymbolIndex),
+    Large(Box<SymbolReverseTable>),
+}
+
+impl Default for SymbolIndex {
+    fn default() -> Self {
+        Self::Small(SmallSymbolIndex::default())
+    }
+}
+
 /// The symbols of a given scope.
 ///
 /// Allows lookup by name and a symbol's ID.
 #[derive(Default, get_size2::GetSize)]
 pub(super) struct SymbolTable {
     symbols: IndexVec<ScopedSymbolId, Symbol>,
-    /// Reverse lookup retained only when linear search would be expensive.
-    reverse: Option<Box<SymbolReverseTable>>,
+    reverse: SymbolIndex,
 }
 
 impl SymbolTable {
@@ -231,13 +276,12 @@ impl SymbolTable {
 
     /// Look up the ID of a symbol by its name.
     pub(crate) fn symbol_id(&self, name: &str) -> Option<ScopedSymbolId> {
-        if let Some(reverse) = self.reverse.as_deref() {
-            return reverse.symbol_id(&self.symbols, name);
+        match &self.reverse {
+            SymbolIndex::Small(index) => {
+                index.symbol_id(&self.symbols, name, SmallSymbolIndex::bucket(name))
+            }
+            SymbolIndex::Large(index) => index.symbol_id(&self.symbols, name),
         }
-
-        self.symbols
-            .iter_enumerated()
-            .find_map(|(id, symbol)| (symbol.name == name).then_some(id))
     }
 
     /// Iterate over the symbols in this symbol table.
@@ -264,30 +308,60 @@ impl std::fmt::Debug for SymbolTable {
 #[derive(Debug, Default)]
 pub(super) struct SymbolTableBuilder {
     table: SymbolTable,
-    reverse: SymbolReverseTable,
 }
 
 impl SymbolTableBuilder {
-    pub(super) fn symbol_id(&self, name: &str) -> Option<ScopedSymbolId> {
-        self.reverse.symbol_id(&self.table.symbols, name)
+    /// Reuse an existing symbol without allocating or copying its name.
+    pub(super) fn add_name(&mut self, name: &Name) -> (ScopedSymbolId, bool) {
+        self.insert(Cow::Borrowed(name), SymbolFlags::empty())
     }
 
-    /// Add a new symbol to this scope or update the flags if a symbol with the same name already exists.
+    /// Add a new symbol to this scope or update the flags of an existing symbol.
     pub(super) fn add(&mut self, symbol: Symbol) -> (ScopedSymbolId, bool) {
-        let entry = self.reverse.entry(&self.table.symbols, &symbol);
+        self.insert(Cow::Owned(symbol.name), symbol.flags)
+    }
 
-        match entry {
-            Entry::Occupied(entry) => {
-                let id = *entry.get();
-
-                if !symbol.flags.is_empty() {
-                    self.symbols[id].flags.insert(symbol.flags);
+    fn insert(&mut self, name: Cow<'_, Name>, flags: SymbolFlags) -> (ScopedSymbolId, bool) {
+        let SymbolTable { symbols, reverse } = &mut self.table;
+        let table = match reverse {
+            SymbolIndex::Small(index) => {
+                let bucket = SmallSymbolIndex::bucket(name.as_str());
+                if let Some(id) = index.symbol_id(symbols, name.as_str(), bucket) {
+                    symbols[id].flags.insert(flags);
+                    return (id, false);
                 }
 
+                if symbols.len() < u16::BITS as usize {
+                    let id = symbols.push(Symbol {
+                        name: name.into_owned(),
+                        flags,
+                    });
+                    index.0[bucket] |= 1 << id.as_u32();
+                    return (id, true);
+                }
+
+                let mut table = hashbrown::HashTable::with_capacity(symbols.len() + 1);
+                let hash = |id: &ScopedSymbolId| SymbolReverseTable::hash_name(&symbols[*id].name);
+                for (id, _) in symbols.iter_enumerated() {
+                    table.insert_unique(hash(&id), id, hash);
+                }
+                *reverse = SymbolIndex::Large(Box::new(SymbolReverseTable(table)));
+                return self.insert(name, flags);
+            }
+            SymbolIndex::Large(table) => table,
+        };
+
+        match table.entry(symbols, &name) {
+            Entry::Occupied(entry) => {
+                let id = *entry.get();
+                symbols[id].flags.insert(flags);
                 (id, false)
             }
             Entry::Vacant(entry) => {
-                let id = self.table.symbols.push(symbol);
+                let id = symbols.push(Symbol {
+                    name: name.into_owned(),
+                    flags,
+                });
                 entry.insert(id);
                 (id, true)
             }
@@ -295,17 +369,11 @@ impl SymbolTableBuilder {
     }
 
     pub(super) fn build(self) -> SymbolTable {
-        let Self {
-            mut table,
-            mut reverse,
-        } = self;
+        let mut table = self.table;
         table.symbols.shrink_to_fit();
-
-        if table.symbols.len() > LINEAR_SEARCH_THRESHOLD {
+        if let SymbolIndex::Large(reverse) = &mut table.reverse {
             reverse.shrink_to_fit(&table.symbols);
-            table.reverse = Some(Box::new(reverse));
         }
-
         table
     }
 }
@@ -321,5 +389,42 @@ impl Deref for SymbolTableBuilder {
 impl DerefMut for SymbolTableBuilder {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.table
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Name, Symbol, SymbolFlags, SymbolTableBuilder};
+
+    #[test]
+    fn symbol_ids_survive_collisions_and_growth() {
+        for count in [16, 17] {
+            let mut table = SymbolTableBuilder::default();
+            // Both sets exceed eight buckets, so at least two names collide.
+            let names: Vec<_> = (0..count)
+                .map(|n| Name::from(format!("α{n:02}").as_str()))
+                .collect();
+            let ids: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    let (id, added) = table.add_name(name);
+                    assert!(added);
+                    id
+                })
+                .collect();
+
+            for (name, &id) in names.iter().zip(&ids) {
+                let mut symbol = Symbol::new(name.clone());
+                symbol.mark_parameter();
+                assert_eq!(table.add(symbol), (id, false));
+            }
+
+            let table = table.build();
+            assert_eq!(table.symbol_id("α99"), None);
+            for (name, id) in names.iter().zip(ids) {
+                assert_eq!(table.symbol_id(name), Some(id));
+                assert!(table.symbol(id).flags.contains(SymbolFlags::IS_PARAMETER));
+            }
+        }
     }
 }

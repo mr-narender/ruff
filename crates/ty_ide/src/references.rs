@@ -32,7 +32,7 @@ use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, ScopeKind};
 use ty_python_semantic::{
     Db as SemanticDb, FixtureExposure, FixtureNameSource, ImportAliasResolution,
     ResolvedDefinition, SemanticModel, fixture_bindings_for_parameter,
-    fixture_exposures_for_definition, pytest_global_plugin_files,
+    fixture_exposures_for_definition, pytest_global_plugin_files, pytest_registered_plugin_files,
 };
 
 /// Salsa snapshots coordinate clone and drop through shared state. For cached files that don't
@@ -167,6 +167,13 @@ fn references_for_search(
                     .iter()
                     .map(|file| file.file(db)),
             );
+            // Fixtures in plugins registered through `pytest_plugins` can request the target
+            // fixture, and those plugins can be outside the project.
+            files.extend(
+                pytest_registered_plugin_files(db, file)
+                    .iter()
+                    .map(|plugin| plugin.file(db)),
+            );
             files.remove(&source_file);
             files.into_iter().collect()
         } else {
@@ -252,7 +259,9 @@ fn references_for_keyword_arguments_in_file(
     );
 
     let parsed = parsed_module(db, file.python_file(db));
-    let module = parsed.load(db);
+    // Reference and rename searches can scan the whole project, so release closed files' ASTs
+    // as we go.
+    let module = parsed.load_then_clear_on_drop(db);
     let model = SemanticModel::new(db, file);
     let mut references = Vec::new();
 
@@ -305,7 +314,9 @@ fn references_for_file(
     mode: ReferencesMode,
 ) -> Vec<ReferenceTarget> {
     let parsed = parsed_module(db, file.python_file(db));
-    let module = parsed.load(db);
+    // Reference and rename searches can scan the whole project, so release closed files' ASTs
+    // as we go.
+    let module = parsed.load_then_clear_on_drop(db);
     let model = SemanticModel::new(db, file);
     let mut references = Vec::new();
 
